@@ -1,15 +1,73 @@
 # zka
 
-`zka` is a planned companion layer for `zmx`, `zmosh`, kitty, and coding-agent
-workflows.
+`zka` is a companion layer for `zmx`, kitty, and coding-agent workflows.
 
 The core idea: kitty windows should be disposable views onto persistent
-`zmx`/`zmosh` sessions. `zka` owns the plumbing around those views: restoring
-kitty layout, moving views between local and remote clients, tracking which
-agent needs attention, and routing notifications back to the right kitty tab or
-split.
+`zmx` sessions. `zka` owns the plumbing around those views: restoring kitty
+layout, moving views between local and remote clients, tracking which agent
+needs attention, and routing notifications back to the right kitty tab or
+split. Remote views use SSH over the existing private network network to attach to
+`zmx` on another host.
 
-Status: design draft. There is no implementation yet.
+Status: MVP implementation. The Go CLI/daemon, zmx-backed views, kitty
+snapshot/restore, Codex lifecycle hooks, and kitty/ntfy notifications are
+implemented. The remainder of this document records the design and future
+direction.
+
+## Quick Start
+
+Enable the NixOS module and supply `zmx` plus the host's `ntfy-send` package in
+the service PATH:
+
+```nix
+{
+  imports = [ inputs.zka.nixosModules.default ];
+
+  services.zka = {
+    enable = true;
+    zmxPackage = pkgs.zmx;
+    extraPackages = [ ntfy-send-package ];
+  };
+}
+```
+
+The module installs a systemd user service and owns
+`/etc/codex/requirements.toml` so the Codex lifecycle hooks are enabled as
+managed hooks. Put any other system Codex requirements in
+`services.zka.codex.extraRequirements`; zka deliberately does not disable user
+or project hooks.
+
+After rebuilding, verify the integration and launch a session:
+
+```sh
+zka doctor
+zka launch --name reviewer -- codex
+zka status
+zka explain reviewer
+zka snapshot daily
+zka restore daily
+```
+
+Kitty must have socket remote control enabled and expose its endpoint through
+`KITTY_LISTEN_ON` (or pass `--to` to commands). `zka doctor` reports this,
+missing `zmx`, an unavailable daemon, missing managed hooks, and an unavailable
+`ntfy-send` helper before the first session is launched.
+
+`zka restore` reuses sessions already attached to the target kitty. Pass
+`--duplicate` to deliberately create another zmx client. State is stored below
+`$XDG_STATE_HOME/zka`, and the daemon socket is
+`$XDG_RUNTIME_DIR/zka/zka.sock`.
+
+`zka` calls `ntfy-send` for every `blocked` or `error` transition and for
+`done` only when no kitty view is attached. It relies on the helper's existing
+authenticated configuration, never reads or forwards the token itself, and
+records delivery failures in `zka explain`. Attached, unfocused sessions also
+receive an actionable kitty notification whose activation focuses the managed
+window.
+
+`zmx` is the only session backend. The current implementation attaches to local
+sessions; SSH-over-private network transport for remote `zmx` sessions is next on the
+roadmap.
 
 ## Why
 
@@ -22,10 +80,12 @@ there are many of them. A useful system should answer questions like:
 - Can I click a notification and land on the exact kitty split that needs me?
 - Can I detach from one machine and reattach the same work somewhere else?
 
-`zmx` and `zmosh` solve the hard process/session side: the shell or agent lives
-outside the terminal view and can survive local detach, remote reconnect, and
-roaming. Kitty already solves the terminal UI side: OS windows, tabs, splits,
-layouts, titles, bells, notifications, and remote control.
+`zmx` solves the hard process/session side: the shell or agent lives outside the
+terminal view and survives detach and reconnect. SSH supplies the remote
+terminal transport, while private network supplies private reachability, stable host
+identity, and path changes between networks. Kitty already solves the terminal
+UI side: OS windows, tabs, splits, layouts, titles, bells, notifications, and
+remote control.
 
 `zka` is the missing glue between those pieces.
 
@@ -47,9 +107,10 @@ kitty.
 
 - Do not sit between the PTY and the terminal.
 - Do not reimplement kitty's tabs, windows, splits, or rendering.
-- Do not replace `zmx` or `zmosh` as the persistent session owner.
+- Do not replace `zmx` as the persistent session owner.
 - Use kitty as the terminal UI.
-- Use `zmx`/`zmosh` as the process/session layer.
+- Use `zmx` as the process/session layer.
+- Use SSH over private network as the remote transport.
 - Add only the orchestration that neither side owns.
 
 The useful Herdr ideas to borrow are agent awareness, a small state model,
@@ -79,21 +140,62 @@ Each kitty split launches an attach command:
 zmx attach "$session_id"
 ```
 
-or, for a remote session:
+For a remote session, the kitty split creates an SSH client and attaches to the
+`zmx` daemon on that host:
 
 ```sh
-zmosh attach "$remote_session_ref"
+ssh -t "$host" zmx attach "$session_id"
 ```
 
-The process belongs to the `zmx`/`zmosh` daemon. Kitty owns only the view. Moving
-work from one kitty instance to another means:
+`autossh` can wrap that command when automatic reconnection is wanted:
+
+```sh
+autossh -M 0 -q -t "$host" zmx attach "$session_id"
+```
+
+The process belongs to the `zmx` daemon on the selected host. Kitty and SSH own
+only the view and transport. Moving work from one kitty instance to another
+means:
 
 1. Snapshot the current kitty view layout.
 2. Close or detach the old views if desired.
 3. Recreate new kitty windows/tabs/splits.
-4. Run `zmx attach` or `zmosh attach` in each recreated split.
+4. Run the appropriate local or SSH `zmx attach` in each recreated split.
 
-The processes never move. The views are rebuilt around them.
+The processes never move. For a remote view, a failed SSH connection is replaced
+with a new connection that reattaches to the same remote `zmx` daemon. The views
+are rebuilt around the persistent sessions.
+
+### Remote Sessions Over SSH And private network
+
+Remote support deliberately composes existing tools instead of adding another
+session protocol:
+
+```text
+local:  kitty -> zka view -> local zmx
+remote: kitty -> zka view -> SSH over private network -> remote zmx
+```
+
+The responsibilities stay separate:
+
+- private network provides private connectivity, MagicDNS names, ACLs, and fast path
+  changes when the client switches networks. `zka` does not manage the network.
+- OpenSSH provides authentication, terminal transport, and connection
+  multiplexing. `autossh` is an optional reconnection supervisor.
+- `zmx` remains the only PTY and persistent-session owner.
+- `zkad` runs on each host. Remote Codex hooks and `ntfy-send` report to the
+  daemon beside the agent, so detached alerts do not depend on the laptop being
+  connected.
+- The local daemon mirrors remote state over SSH for kitty titles, focus, and
+  actionable local notifications.
+
+A remote session is identified by both its SSH host alias and its remote `zmx`
+reference. Snapshots will persist those identifiers and transport metadata, but
+never SSH keys, private network credentials, or other authentication material.
+
+Remote views must attach directly through SSH to remote `zmx`; they must not
+create a nested local `zmx` session around the SSH command. The remote `zmx`
+daemon already provides the persistence that the outer session would duplicate.
 
 ### Stable Window Mapping
 
@@ -257,29 +359,49 @@ local notification daemon or a small watcher process.
 The first useful UI can be simple: title prefixes, bell/urgency, and desktop
 notifications. Custom coloring can come later.
 
-## Possible Components
+## Implementation Shape
 
-Names are placeholders.
+The project ships one static `zka` binary. Its `daemon` subcommand is installed
+as the `zkad` systemd user service; the same binary provides the public CLI,
+internal view/process wrappers, kitty adapter, Codex hook receiver, and
+notification bridge. Keeping those roles in one binary makes Nix packaging and
+managed hook paths deterministic without introducing shell wrappers.
 
-- `zkad`: background daemon that stores view/session/agent state.
-- `zka`: CLI for launch, attach, snapshot, restore, status, and debug commands.
-- `zka-kitty`: kitty adapter for snapshot/restore/focus/title/user-var changes.
-- `zka-agent`: agent-state collector and detector engine.
-- `zka-notify`: notification bridge for kitty, Sway/Wayland notification daemons,
-  and detached-session fallback alerts.
-- `zka explain`: debug command that shows why a session has its current state.
-
-Example command shape:
+Examples:
 
 ```sh
 zka launch --name reviewer -- codex
-zka launch --name impl -- claude
-zka snapshot > zka-session.json
-zka restore zka-session.json --to "$KITTY_LISTEN_ON"
+zka attach reviewer
+zka snapshot --output zka-session.json daily
+zka restore --to "$KITTY_LISTEN_ON" zka-session.json
 zka status --json
 zka seen "$session_id"
 zka explain "$session_id"
 ```
+
+## Roadmap
+
+The local `zmx` MVP is implemented. Remote support will extend the view
+transport without introducing another backend:
+
+1. **Transport model:** add `local` and `ssh` transports to session and snapshot
+   schemas. An SSH transport records a host alias and the remote `zmx` reference;
+   the backend remains `zmx` in both cases.
+2. **Remote lifecycle:** create, inspect, attach, and reconnect remote sessions
+   through argument-safe SSH commands. Use the user's SSH configuration for
+   TTY, private network MagicDNS aliases, ControlMaster, and server-alive settings;
+   keep `autossh` as an optional wrapper.
+3. **Remote state relay:** keep the remote `zkad` authoritative for agent hooks,
+   process state, and detached `ntfy-send` delivery. Mirror its event stream to
+   the local daemon over an authenticated SSH channel.
+4. **Kitty integration:** tag remote windows with transport and host identity,
+   reflect mirrored state in titles, and focus the correct local split from an
+   actionable notification.
+5. **Snapshot and restore:** recreate local and remote views from one managed
+   kitty snapshot, reuse existing views by default, and diagnose unreachable
+   hosts without disturbing their persistent sessions.
+6. **Additional agents:** evaluate OpenCode, Claude Code, and ACP integrations
+   after remote Codex sessions work end to end.
 
 ## Target Environment
 
@@ -290,7 +412,8 @@ Initial target:
 - Wayland/Sway
 - kitty
 - `zmx`
-- `zmosh`
+- private network and OpenSSH for remote hosts
+- optional `autossh` for reconnect supervision
 - desktop notification daemon such as `swaync` or `mako`
 
 The design should keep the core daemon mostly independent from Sway. Sway mainly
@@ -308,22 +431,25 @@ matters for focus behavior, urgency styling, and notification review UX.
 - No promise to recover arbitrary in-terminal visual state after a detached
   session with no active client.
 
-## Open Questions
+## Future Questions
 
-- Implementation language: Rust, Go, or a small shell/Python prototype first.
-- State store format and location.
-- Whether ACP should be a first-class launch path from day one.
-- How much of kitty restore should be session-file generation versus imperative
-  remote-control replay.
+- Whether ACP should become the next first-class launch path.
 - Whether custom kitty tab/window title rendering belongs in this repo or should
   stay as user config examples.
-- Which agent gets the first complete native integration.
+- Whether OpenCode or Claude Code should receive the next native integration.
+- Whether remote state mirroring should use a long-lived SSH event stream or
+  short polling with opportunistic connection reuse.
+- Whether `autossh` should remain entirely in user SSH configuration or become
+  an optional transport command selected by `zka`.
 
 ## References
 
 - Kitty remote control: https://sw.kovidgoyal.net/kitty/remote-control/
 - Kitty notify kitten: https://sw.kovidgoyal.net/kitty/kittens/notify/
 - Kitty desktop notifications: https://sw.kovidgoyal.net/kitty/desktop-notifications/
+- zmx SSH workflow: https://github.com/neurosnap/zmx#ssh-workflow
+- SSH over private network: https://private network.com/docs/reference/ssh-over-private network
+- autossh: https://www.harding.motd.ca/autossh/
 - Agent Client Protocol: https://agentclientprotocol.com/
 - OpenCode server: https://opencode.ai/docs/server/
 - Codex app-server: https://developers.openai.com/codex/app-server
