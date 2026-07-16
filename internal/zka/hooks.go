@@ -25,8 +25,9 @@ func runHook(args []string, paths Paths, stdin io.Reader, stdout io.Writer) (int
 	if len(args) != 1 || args[0] != "codex" {
 		return 2, fmt.Errorf("hook supports only: zka hook codex")
 	}
-	zkaSessionID := os.Getenv("ZKA_SESSION_ID")
-	if zkaSessionID == "" {
+	workspaceID := os.Getenv("ZKA_WORKSPACE_ID")
+	paneID := os.Getenv("ZKA_PANE_ID")
+	if workspaceID == "" || paneID == "" {
 		return hookSuccess(stdout)
 	}
 	var input codexHookInput
@@ -58,7 +59,7 @@ func runHook(args []string, paths Paths, stdin io.Reader, stdout io.Writer) (int
 	if kind == "stop" && input.LastAssistantMessage != "" {
 		detail = summarize(input.LastAssistantMessage, 180)
 	}
-	event := Event{SessionID: zkaSessionID, Kind: kind, Source: "codex-hook", TurnID: input.TurnID, Detail: detail, View: viewFromEnv()}
+	event := Event{WorkspaceID: workspaceID, PaneID: paneID, Kind: kind, Source: "codex-hook", TurnID: input.TurnID, Detail: detail}
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	api := NewAPI(paths)

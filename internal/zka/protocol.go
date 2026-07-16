@@ -43,7 +43,13 @@ func (c Client) Call(ctx context.Context, op string, payload, out any) error {
 		return fmt.Errorf("connect to zkad at %s: %w", c.Socket, err)
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
+	deadline := time.Now().Add(timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok {
+		deadline = contextDeadline
+	}
+	_ = conn.SetDeadline(deadline)
 	var raw json.RawMessage
 	if payload != nil {
 		raw, err = json.Marshal(payload)
@@ -92,6 +98,35 @@ func listenUnix(path string) (net.Listener, error) {
 		return nil, fmt.Errorf("secure daemon socket: %w", err)
 	}
 	return ln, nil
+}
+
+func listenUnixgram(path string) (*net.UnixConn, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create runtime directory: %w", err)
+	}
+	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("secure runtime directory: %w", err)
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("refusing to remove non-socket path %s", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("remove stale watcher socket: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect watcher socket: %w", err)
+	}
+	address := &net.UnixAddr{Name: path, Net: "unixgram"}
+	conn, err := net.ListenUnixgram("unixgram", address)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("secure watcher socket: %w", err)
+	}
+	return conn, nil
 }
 
 func removeStaleSocket(path string) error {

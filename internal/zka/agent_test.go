@@ -1,7 +1,6 @@
 package zka
 
 import (
-	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -10,34 +9,30 @@ import (
 	"testing"
 )
 
-func TestAgentRunPropagatesExitAndReportsError(t *testing.T) {
+func TestPaneHostPropagatesExitAndReportsError(t *testing.T) {
 	root := t.TempDir()
-	d, err := newTestDaemon(root, quietRunner())
+	d, err := newTestDaemon(t, root, quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = d.Serve(ctx) }()
-	waitFor(t, func() bool {
-		_, err := os.Stat(d.paths.Socket)
-		return err == nil
-	})
-	session, err := d.createSession(createSessionRequest{Name: "runner", Command: []string{"codex"}, CWD: root})
-	if err != nil {
+	serveTestDaemon(t, d)
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	d.mu.Lock()
+	d.state.Workspaces[workspace.ID].Panes[pane.ID].CWD = root
+	if err := d.store.Save(d.state); err != nil {
+		d.mu.Unlock()
 		t.Fatal(err)
 	}
+	d.mu.Unlock()
 	t.Setenv("ZKA_TEST_HELPER", "17")
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	code, err := runAgent(
-		[]string{"--session", session.ID, "--", exe, "-test.run=TestAgentHelperProcess"},
-		d.paths,
-		os.Stdin,
-		io.Discard,
-		io.Discard,
+	code, err := runPaneHost(
+		[]string{"--workspace", workspace.ID, "--pane", pane.ID, "--", exe, "-test.run=TestAgentHelperProcess"},
+		d.paths, os.Stdin, io.Discard, io.Discard,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -45,12 +40,13 @@ func TestAgentRunPropagatesExitAndReportsError(t *testing.T) {
 	if code != 17 {
 		t.Fatalf("exit code = %d", code)
 	}
-	got, err := d.getSession(session.ID)
+	got, err := d.getWorkspace(workspace.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != StateError || got.Process.ExitCode == nil || *got.Process.ExitCode != 17 || !got.BackendCreated {
-		t.Fatalf("reported session = %#v", got)
+	reported := got.Panes[pane.ID]
+	if reported.State != StateError || reported.Process.ExitCode == nil || *reported.Process.ExitCode != 17 || !reported.BackendCreated {
+		t.Fatalf("reported = %#v", reported)
 	}
 }
 

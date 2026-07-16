@@ -8,69 +8,100 @@ import (
 	"time"
 )
 
-func TestDetachedDoneUsesNtfy(t *testing.T) {
-	runner := quietRunner()
-	d, err := newTestDaemon(t.TempDir(), runner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session := createTestSession(t, d)
-	session.State = StateDone
-	session.LastTurnID = "turn-done"
-	session.Evidence = Evidence{Source: "codex", Event: "stop", Timestamp: time.Now().UTC()}
+func setPaneForNotification(t *testing.T, d *Daemon, workspace *Workspace, state AgentState, turn string) (*Workspace, *Pane) {
+	t.Helper()
 	d.mu.Lock()
-	d.state.Sessions[session.ID] = session.Clone()
+	actual := d.state.Workspaces[workspace.ID]
+	var pane *Pane
+	for _, candidate := range actual.Panes {
+		pane = candidate
+		break
+	}
+	pane.State = state
+	pane.LastTurnID = turn
+	pane.Evidence = Evidence{Source: "test", Event: "transition", Timestamp: time.Now().UTC()}
+	actual.RecomputeAttention()
 	if err := d.store.Save(d.state); err != nil {
+		d.mu.Unlock()
 		t.Fatal(err)
 	}
+	copy := actual.Clone()
 	d.mu.Unlock()
-	d.afterTransition(context.Background(), StateWorking, session)
-	waitFor(t, func() bool { return hasCommand(runner.Calls(), "ntfy-send") })
-	call := firstCommand(runner.Calls(), "ntfy-send")
-	joined := strings.Join(call.Args, " ")
-	if !strings.Contains(joined, "-p 3") || !strings.Contains(joined, "white_check_mark") {
-		t.Fatalf("ntfy args = %#v", call.Args)
+	return copy, copy.Panes[pane.ID]
+}
+
+func TestImportantDetachedStatesUseNtfy(t *testing.T) {
+	for _, test := range []struct {
+		state         AgentState
+		priority, tag string
+	}{
+		{StateDone, "-p 3", "white_check_mark"},
+		{StateBlocked, "-p 5", "warning"},
+		{StateError, "-p 5", "rotating_light"},
+	} {
+		runner := quietRunner()
+		d, err := newTestDaemon(t, t.TempDir(), runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		workspace := createTestWorkspace(t, d, 1)
+		workspace, pane := setPaneForNotification(t, d, workspace, test.state, "turn-"+string(test.state))
+		d.afterTransition(context.Background(), StateWorking, workspace, pane.ID)
+		call := firstCommand(runner.Calls(), "ntfy-send")
+		joined := strings.Join(call.Args, " ")
+		if !strings.Contains(joined, test.priority) || !strings.Contains(joined, test.tag) {
+			t.Fatalf("%s ntfy args = %#v", test.state, call.Args)
+		}
 	}
 }
 
-func TestBlockedUsesHighPriorityNtfy(t *testing.T) {
-	runner := quietRunner()
-	d, err := newTestDaemon(t.TempDir(), runner)
+func TestNotificationDedupeIsPerPane(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := createTestSession(t, d)
-	session.State = StateBlocked
-	session.LastTurnID = "turn-blocked"
-	session.Evidence = Evidence{Source: "codex", Event: "permission_request", Detail: "shell approval", Timestamp: time.Now().UTC()}
-	d.mu.Lock()
-	d.state.Sessions[session.ID] = session.Clone()
-	if err := d.store.Save(d.state); err != nil {
-		t.Fatal(err)
-	}
-	d.mu.Unlock()
-	d.afterTransition(context.Background(), StateWorking, session)
-	waitFor(t, func() bool { return hasCommand(runner.Calls(), "ntfy-send") })
-	call := firstCommand(runner.Calls(), "ntfy-send")
-	joined := strings.Join(call.Args, " ")
-	if !strings.Contains(joined, "-p 5") || !strings.Contains(joined, "warning") {
-		t.Fatalf("ntfy args = %#v", call.Args)
-	}
-}
-
-func TestNotificationDedupe(t *testing.T) {
-	runner := quietRunner()
-	d, err := newTestDaemon(t.TempDir(), runner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session := createTestSession(t, d)
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
 	key := "ntfy:error:event"
-	if !d.reserveNotification(session.ID, key, "ntfy") {
+	if !d.reserveNotification(workspace.ID, pane.ID, key, "ntfy") {
 		t.Fatal("first reservation failed")
 	}
-	if d.reserveNotification(session.ID, key, "ntfy") {
+	if d.reserveNotification(workspace.ID, pane.ID, key, "ntfy") {
 		t.Fatal("duplicate reservation succeeded")
+	}
+}
+
+func TestRemoteMirrorUsesKittyNotificationButNeverDuplicatesNtfy(t *testing.T) {
+	runner := quietRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	d.mu.Lock()
+	actual := d.state.Workspaces[workspace.ID]
+	actual.RemoteHost = "devbox.example"
+	actual.Panes[pane.ID].State = StateBlocked
+	actual.Panes[pane.ID].LastTurnID = "remote-turn"
+	actual.Attachments["local"] = &Attachment{
+		ID: "local", Endpoint: "unix:/kitty", Status: AttachmentReady,
+		Views: readyView(pane.ID, 7),
+	}
+	actual.Attachments["local"].Views[pane.ID] = RuntimeView{PaneID: pane.ID, WindowID: 7, Ready: true, Focused: false}
+	copy := actual.Clone()
+	d.mu.Unlock()
+	d.afterRemoteTransition(context.Background(), copy, pane.ID)
+	waitFor(t, func() bool {
+		for _, call := range runner.Calls() {
+			if call.Name == "kitten" && strings.Contains(strings.Join(call.Args, " "), " notify ") {
+				return true
+			}
+		}
+		return false
+	})
+	if hasCommand(runner.Calls(), "ntfy-send") {
+		t.Fatal("remote mirror duplicated origin ntfy notification")
 	}
 }
 
@@ -84,31 +115,22 @@ func TestNtfyFailureIsRetriedAndRecorded(t *testing.T) {
 		}
 		return "", "", nil
 	}}
-	d, err := newTestDaemon(t.TempDir(), runner)
+	d, err := newTestDaemon(t, t.TempDir(), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := createTestSession(t, d)
-	session.State = StateError
-	session.LastTurnID = "turn-error"
-	session.Evidence = Evidence{Source: "agent-run", Event: "process_exit", Timestamp: time.Now().UTC()}
-	d.mu.Lock()
-	d.state.Sessions[session.ID] = session.Clone()
-	if err := d.store.Save(d.state); err != nil {
-		t.Fatal(err)
+	workspace := createTestWorkspace(t, d, 1)
+	workspace, pane := setPaneForNotification(t, d, workspace, StateError, "turn-error")
+	d.afterTransition(context.Background(), StateWorking, workspace, pane.ID)
+	got, _ := d.getWorkspace(workspace.ID)
+	records := got.Panes[pane.ID].Notifications
+	found := false
+	for _, record := range records {
+		found = found || (record.Channel == "ntfy" && strings.Contains(record.LastError, "token secret"))
 	}
-	d.mu.Unlock()
-	d.afterTransition(context.Background(), StateWorking, session)
-	waitFor(t, func() bool {
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		for _, record := range d.state.Sessions[session.ID].Notifications {
-			if record.Channel == "ntfy" && strings.Contains(record.LastError, "token secret is unreadable") {
-				return true
-			}
-		}
-		return false
-	})
+	if !found {
+		t.Fatalf("records = %#v", records)
+	}
 	count := 0
 	for _, call := range runner.Calls() {
 		if call.Name == "ntfy-send" {
@@ -116,33 +138,81 @@ func TestNtfyFailureIsRetriedAndRecorded(t *testing.T) {
 		}
 	}
 	if count != 3 {
-		t.Fatalf("ntfy attempts = %d, want 3", count)
+		t.Fatalf("attempts = %d", count)
+	}
+}
+
+func TestStaleRemoteClientIsNotAnAttachedView(t *testing.T) {
+	workspace := &Workspace{Attachments: map[string]*Attachment{
+		"remote": {
+			ID: "remote", Transport: Transport{Kind: "ssh"}, Status: AttachmentReady,
+			Views:            map[string]RuntimeView{"pane": {PaneID: "pane", WindowID: 1, Ready: true}},
+			ClientHeartbeats: map[string]time.Time{"pane": time.Now().UTC().Add(-10 * time.Second)},
+		},
+	}}
+	if paneAttached(workspace, "pane") {
+		t.Fatal("stale SSH client counted as attached")
+	}
+	workspace.Attachments["remote"].ClientHeartbeats["pane"] = time.Now().UTC()
+	if !paneAttached(workspace, "pane") {
+		t.Fatal("fresh SSH client was not counted as attached")
+	}
+}
+
+func TestWaitJoinsAsynchronousTransition(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{}, 1)
+	runner := &fakeRunner{handler: func(_ context.Context, name string, args ...string) (string, string, error) {
+		if name == "kitten" && strings.Contains(strings.Join(args, " "), " ls") {
+			return "[]", "", nil
+		}
+		if name == "ntfy-send" {
+			close(started)
+			<-release
+		}
+		return "", "", nil
+	}}
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		select {
+		case release <- struct{}{}:
+		default:
+		}
+	})
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	code := 1
+	if _, err := d.applyEvent(context.Background(), Event{WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "process_exit", Source: "pane-host", ExitCode: &code}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("transition did not start")
+	}
+	waited := make(chan struct{})
+	go func() { _ = d.Wait(); close(waited) }()
+	select {
+	case <-waited:
+		t.Fatal("Wait returned early")
+	case <-time.After(20 * time.Millisecond):
+	}
+	release <- struct{}{}
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("Wait did not join worker")
 	}
 }
 
 func TestStatePriorityAndTitleMarker(t *testing.T) {
 	if statePriority(StateError) <= statePriority(StateBlocked) || statePriority(StateDone) <= statePriority(StateWorking) {
-		t.Fatal("attention state priority is incorrect")
+		t.Fatal("state priority")
 	}
 	if got := stripStateMarker("[!] agents"); got != "agents" {
-		t.Fatalf("stripStateMarker = %q", got)
+		t.Fatalf("strip = %q", got)
 	}
-}
-
-func hasCommand(calls []runnerCall, name string) bool {
-	for _, call := range calls {
-		if call.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
-func firstCommand(calls []runnerCall, name string) runnerCall {
-	for _, call := range calls {
-		if call.Name == name {
-			return call
-		}
-	}
-	return runnerCall{}
 }

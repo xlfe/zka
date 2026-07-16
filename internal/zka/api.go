@@ -2,6 +2,7 @@ package zka
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -10,7 +11,7 @@ type API struct {
 }
 
 func NewAPI(paths Paths) API {
-	return API{client: Client{Socket: paths.Socket, Timeout: 3 * time.Second}}
+	return API{client: Client{Socket: paths.Socket, Timeout: 5 * time.Second}}
 }
 
 func (a API) Ping(ctx context.Context) (map[string]any, error) {
@@ -19,54 +20,115 @@ func (a API) Ping(ctx context.Context) (map[string]any, error) {
 	return out, err
 }
 
-func (a API) CreateSession(ctx context.Context, req createSessionRequest) (*Session, error) {
-	var out Session
-	err := a.client.Call(ctx, "create_session", req, &out)
-	return &out, err
-}
-
-func (a API) DeleteSession(ctx context.Context, ref string) error {
-	return a.client.Call(ctx, "delete_session", refRequest{Ref: ref}, nil)
-}
-
-func (a API) Session(ctx context.Context, ref string) (*Session, error) {
-	var out Session
-	err := a.client.Call(ctx, "get_session", refRequest{Ref: ref}, &out)
-	return &out, err
-}
-
-func (a API) Sessions(ctx context.Context) ([]*Session, error) {
-	var out []*Session
-	err := a.client.Call(ctx, "list_sessions", nil, &out)
+func (a API) Node(ctx context.Context) (Host, error) {
+	var out Host
+	err := a.client.Call(ctx, "node", nil, &out)
 	return out, err
 }
 
-func (a API) AllSessions(ctx context.Context) (map[string]*Session, error) {
-	var out map[string]*Session
-	err := a.client.Call(ctx, "all_sessions", nil, &out)
-	return out, err
-}
-
-func (a API) RegisterView(ctx context.Context, sessionID string, view View) (*Session, error) {
-	var out Session
-	err := a.client.Call(ctx, "register_view", registerViewRequest{SessionID: sessionID, View: view}, &out)
+func (a API) CreateWorkspace(ctx context.Context, req createWorkspaceRequest) (*Workspace, error) {
+	var out Workspace
+	err := a.client.Call(ctx, "create_workspace", req, &out)
 	return &out, err
 }
 
-func (a API) PrepareView(ctx context.Context, ref string) (prepareViewResponse, error) {
-	var out prepareViewResponse
-	err := a.client.Call(ctx, "prepare_view", refRequest{Ref: ref}, &out)
+func (a API) DeleteWorkspace(ctx context.Context, ref string) error {
+	return a.client.Call(ctx, "delete_workspace", refRequest{Ref: ref}, nil)
+}
+
+func (a API) Workspace(ctx context.Context, ref string) (*Workspace, error) {
+	var out Workspace
+	err := a.client.Call(ctx, "get_workspace", refRequest{Ref: ref}, &out)
+	return &out, err
+}
+
+func (a API) Workspaces(ctx context.Context) ([]*Workspace, error) {
+	var out []*Workspace
+	err := a.client.Call(ctx, "list_workspaces", nil, &out)
 	return out, err
 }
 
-func (a API) Event(ctx context.Context, event Event) (*Session, error) {
-	var out Session
+func (a API) PreparePane(ctx context.Context, workspace, pane string) (preparePaneResponse, error) {
+	var out preparePaneResponse
+	err := a.client.Call(ctx, "prepare_pane", workspacePaneRequest{Workspace: workspace, Pane: pane}, &out)
+	return out, err
+}
+
+func (a API) AllocatePane(ctx context.Context, workspace, key string) (allocatePaneResponse, error) {
+	var out allocatePaneResponse
+	err := a.client.Call(ctx, "allocate_pane", allocatePaneRequest{Workspace: workspace, Key: key}, &out)
+	return out, err
+}
+
+func (a API) RegisterAttachment(ctx context.Context, workspace string, attachment Attachment) (*Attachment, error) {
+	var out Attachment
+	err := a.client.Call(ctx, "register_attachment", attachmentRequest{Workspace: workspace, Attachment: attachment}, &out)
+	return &out, err
+}
+
+func (a API) Attachment(ctx context.Context, workspace, attachment string) (*Attachment, error) {
+	var out Attachment
+	err := a.client.Call(ctx, "get_attachment", attachmentRefRequest{Workspace: workspace, Attachment: attachment}, &out)
+	return &out, err
+}
+
+func (a API) UpdateAttachment(ctx context.Context, req attachmentUpdateRequest) (*Workspace, error) {
+	var out Workspace
+	err := a.client.Call(ctx, "update_attachment", req, &out)
+	return &out, err
+}
+
+func (a API) SetAttachmentPaneReady(ctx context.Context, req attachmentPaneReadyRequest) (*Attachment, error) {
+	var out Attachment
+	err := a.client.Call(ctx, "set_attachment_pane_ready", req, &out)
+	return &out, err
+}
+
+func (a API) UpdateManifest(ctx context.Context, req manifestUpdateRequest) (*Workspace, error) {
+	var out Workspace
+	err := a.client.Call(ctx, "update_manifest", req, &out)
+	return &out, err
+}
+
+func (a API) CommitMove(ctx context.Context, req moveCommitRequest) (moveCommitResponse, error) {
+	var out moveCommitResponse
+	err := a.client.Call(ctx, "commit_move", req, &out)
+	return out, err
+}
+
+func (a API) DetachAttachment(ctx context.Context, workspace, attachment string) (*Workspace, error) {
+	var out Workspace
+	err := a.client.Call(ctx, "detach_attachment", attachmentRefRequest{Workspace: workspace, Attachment: attachment}, &out)
+	return &out, err
+}
+
+func (a API) Event(ctx context.Context, event Event) (*Workspace, error) {
+	var out Workspace
 	err := a.client.Call(ctx, "event", event, &out)
 	return &out, err
 }
 
-func (a API) Seen(ctx context.Context, ref string) (*Session, error) {
-	var out Session
-	err := a.client.Call(ctx, "seen", refRequest{Ref: ref}, &out)
+func (a API) Seen(ctx context.Context, workspace, pane string) (*Workspace, error) {
+	var out Workspace
+	err := a.client.Call(ctx, "seen", workspacePaneRequest{Workspace: workspace, Pane: pane}, &out)
 	return &out, err
+}
+
+func (a API) RemoteCall(ctx context.Context, host, op string, payload, out any) error {
+	var raw json.RawMessage
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		raw = encoded
+	}
+	var response json.RawMessage
+	if err := a.client.Call(ctx, "remote_call", remoteDaemonRequest{Host: host, Op: op, Payload: raw}, &response); err != nil {
+		return err
+	}
+	if out != nil && len(response) > 0 {
+		return json.Unmarshal(response, out)
+	}
+	return nil
 }

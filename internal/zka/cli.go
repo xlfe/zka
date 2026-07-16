@@ -19,15 +19,22 @@ import (
 	"time"
 )
 
+const Version = "0.2.0"
+
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
 		printUsage(stderr)
 		return 2, nil
 	}
-	// Managed hooks must never interfere with Codex. Non-zka sessions have no
-	// session id and can return before XDG/runtime discovery; a broken runtime
-	// environment is also treated as a dropped observation, not a hook failure.
-	if args[0] == "hook" && os.Getenv("ZKA_SESSION_ID") == "" {
+	switch args[0] {
+	case "help", "--help", "-h":
+		printUsage(stdout)
+		return 0, nil
+	case "version", "--version":
+		fmt.Fprintln(stdout, Version)
+		return 0, nil
+	}
+	if args[0] == "hook" && (os.Getenv("ZKA_WORKSPACE_ID") == "" || os.Getenv("ZKA_PANE_ID") == "") {
 		return hookSuccess(stdout)
 	}
 	paths, err := DefaultPaths()
@@ -38,33 +45,26 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) 
 		return 1, err
 	}
 	switch args[0] {
-	case "help", "--help", "-h":
-		printUsage(stdout)
-		return 0, nil
 	case "daemon":
-		return runDaemon(args[1:], paths, stderr)
-	case "launch":
-		return runLaunch(args[1:], paths, stdout, stderr)
-	case "attach":
-		return runAttach(args[1:], paths, stdout, stderr)
-	case "snapshot":
-		return runSnapshot(args[1:], paths, stdout, stderr)
-	case "restore":
-		return runRestore(args[1:], paths, stdout, stderr)
-	case "status":
-		return runStatus(args[1:], paths, stdout, stderr)
-	case "explain":
-		return runExplain(args[1:], paths, stdout, stderr)
-	case "seen":
-		return runSeen(args[1:], paths, stdout, stderr)
-	case "focus":
-		return runFocus(args[1:], paths, stdout, stderr)
+		return normalizeFlagHelp(runDaemon(args[1:], paths, stderr))
+	case "kitty":
+		return normalizeFlagHelp(runKitty(args[1:], paths, stdout, stderr))
+	case "workspace":
+		return normalizeFlagHelp(runWorkspace(args[1:], paths, stdout, stderr))
+	case "pane":
+		return normalizeFlagHelp(runPane(args[1:], paths, stdin, stdout, stderr))
+	case "pane-host":
+		return normalizeFlagHelp(runPaneHost(args[1:], paths, stdin, stdout, stderr))
+	case "remote-pane":
+		return normalizeFlagHelp(runRemotePane(args[1:], paths, stdin, stdout, stderr))
+	case "remote-new-pane":
+		return normalizeFlagHelp(runRemoteNewPane(args[1:], paths, stdin, stdout, stderr))
+	case "remote-attach":
+		return normalizeFlagHelp(runRemoteAttach(args[1:], paths, stdin, stdout, stderr))
+	case "remote-control":
+		return runRemoteControlCommand(args[1:], paths, stdin, stdout)
 	case "doctor":
-		return runDoctor(args[1:], paths, stdout, stderr)
-	case "view":
-		return runView(args[1:], paths, stdin, stdout, stderr)
-	case "agent-run":
-		return runAgent(args[1:], paths, stdin, stdout, stderr)
+		return normalizeFlagHelp(runDoctor(args[1:], paths, stdout, stderr))
 	case "hook":
 		return runHook(args[1:], paths, stdin, stdout)
 	default:
@@ -73,20 +73,23 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) 
 	}
 }
 
+func normalizeFlagHelp(code int, err error) (int, error) {
+	if errors.Is(err, flag.ErrHelp) {
+		return 0, nil
+	}
+	return code, err
+}
+
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `usage: zka COMMAND [OPTIONS]
 
 Commands:
-  launch    Create a persistent session and kitty view
-  attach    Focus or create a view for an existing session
-  snapshot  Save managed kitty views
-  restore   Restore managed kitty views
-  status    Show session state
-  explain   Show state evidence
-  focus     Focus a managed kitty view
-  seen      Acknowledge a completed session
-  doctor    Check runtime integration
-  daemon    Run zkad (normally via systemd --user)`)
+  kitty       Create a managed Kitty workspace
+  workspace   List, inspect, open, move, detach, focus, or acknowledge workspaces
+  doctor      Check local or remote integration
+  daemon      Run zkad (normally via systemd --user)
+
+Internal commands: pane, pane-host, remote-pane, remote-attach, remote-control, hook`)
 }
 
 func newFlagSet(name string, stderr io.Writer) *flag.FlagSet {
@@ -95,15 +98,50 @@ func newFlagSet(name string, stderr io.Writer) *flag.FlagSet {
 	return fs
 }
 
+func parseInterspersed(fs *flag.FlagSet, args []string) error {
+	var options, positionals []string
+	for i := 0; i < len(args); i++ {
+		token := args[i]
+		if token == "--" {
+			positionals = append(positionals, args[i:]...)
+			break
+		}
+		if !strings.HasPrefix(token, "-") || token == "-" {
+			positionals = append(positionals, token)
+			continue
+		}
+		options = append(options, token)
+		name := strings.TrimLeft(token, "-")
+		if at := strings.IndexByte(name, '='); at >= 0 {
+			continue
+		}
+		definition := fs.Lookup(name)
+		if definition == nil {
+			continue
+		}
+		if boolean, ok := definition.Value.(interface{ IsBoolFlag() bool }); ok && boolean.IsBoolFlag() {
+			continue
+		}
+		if i+1 < len(args) {
+			i++
+			options = append(options, args[i])
+		}
+	}
+	return fs.Parse(append(options, positionals...))
+}
+
 func runDaemon(args []string, paths Paths, stderr io.Writer) (int, error) {
 	fs := newFlagSet("daemon", stderr)
 	fs.StringVar(&paths.Socket, "socket", paths.Socket, "Unix socket path")
 	fs.StringVar(&paths.StateDir, "state-dir", paths.StateDir, "state directory")
-	if err := fs.Parse(args); err != nil {
+	if err := parseInterspersed(fs, args); err != nil {
 		return 2, err
 	}
+	if fs.NArg() != 0 {
+		return 2, fmt.Errorf("daemon accepts no positional arguments")
+	}
 	paths.StateFile = filepath.Join(paths.StateDir, "state.json")
-	paths.SnapshotDir = filepath.Join(paths.StateDir, "snapshots")
+	paths.GeneratedDir = filepath.Join(paths.StateDir, "generated")
 	d, err := NewDaemon(paths, ExecRunner{}, nil)
 	if err != nil {
 		return 1, err
@@ -113,29 +151,16 @@ func runDaemon(args []string, paths Paths, stderr io.Writer) (int, error) {
 	return 0, d.Serve(ctx)
 }
 
-func runLaunch(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
-	fs := newFlagSet("launch", stderr)
-	name := fs.String("name", "", "session name")
-	typ := fs.String("type", "window", "kitty view type: window, tab, or os-window")
-	cwd := fs.String("cwd", "", "working directory")
-	endpoint := fs.String("to", os.Getenv("KITTY_LISTEN_ON"), "kitty remote-control endpoint")
-	agent := fs.String("agent", "", "agent integration (default: infer from command)")
-	backend := fs.String("backend", "zmx", "session backend")
-	if err := fs.Parse(args); err != nil {
+func runKitty(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("kitty", stderr)
+	name := fs.String("name", "", "optional workspace name")
+	cwd := fs.String("cwd", "", "default pane working directory")
+	templatePath := fs.String("template", "", "topology-only Kitty session template")
+	if err := parseInterspersed(fs, args); err != nil {
 		return 2, err
 	}
-	command := fs.Args()
-	if *name == "" || len(command) == 0 {
-		return 2, fmt.Errorf("launch requires --name and a command after --")
-	}
-	if err := validateViewType(*typ); err != nil {
+	if err := validateKittyPassthrough(fs.Args()); err != nil {
 		return 2, err
-	}
-	if *endpoint == "" {
-		return 1, fmt.Errorf("kitty endpoint is required (--to or KITTY_LISTEN_ON)")
-	}
-	if *backend != "zmx" {
-		return 1, fmt.Errorf("backend adapter %q is modeled but not implemented", *backend)
 	}
 	if *cwd == "" {
 		var err error
@@ -144,310 +169,610 @@ func runLaunch(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 			return 1, err
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	api := NewAPI(paths)
-	session, err := api.CreateSession(ctx, createSessionRequest{Name: *name, BackendKind: *backend, Agent: *agent, Command: command, CWD: *cwd})
-	if err != nil {
-		return 1, err
-	}
-	kitty := KittyClient{Runner: ExecRunner{}, Command: os.Getenv("ZKA_KITTEN_COMMAND")}
-	windowID, err := kitty.Launch(ctx, LaunchOptions{Endpoint: *endpoint, Type: *typ, CWD: *cwd, Title: *name, SessionID: session.ID, Backend: session.Backend.Kind, State: session.State})
-	if err != nil {
-		_ = api.DeleteSession(context.Background(), session.ID)
-		return 1, err
-	}
-	_, err = api.RegisterView(ctx, session.ID, View{Endpoint: *endpoint, WindowID: windowID, Attached: true, LastSeen: time.Now().UTC()})
-	if err != nil {
-		return 1, err
-	}
-	fmt.Fprintf(stdout, "%s\t%s\n", session.ID, session.Name)
-	return 0, nil
-}
-
-func runAttach(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
-	fs := newFlagSet("attach", stderr)
-	typ := fs.String("type", "window", "kitty view type")
-	endpoint := fs.String("to", os.Getenv("KITTY_LISTEN_ON"), "kitty remote-control endpoint")
-	newView := fs.Bool("new-view", false, "create another view even if already attached")
-	if err := fs.Parse(args); err != nil {
-		return 2, err
-	}
-	if fs.NArg() != 1 {
-		return 2, fmt.Errorf("attach requires one session reference")
-	}
-	if err := validateViewType(*typ); err != nil {
-		return 2, err
-	}
-	if *endpoint == "" {
-		return 1, fmt.Errorf("kitty endpoint is required (--to or KITTY_LISTEN_ON)")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	api := NewAPI(paths)
-	session, err := api.Session(ctx, fs.Arg(0))
-	if err != nil {
-		return 1, err
-	}
-	if session.Backend.Kind != "zmx" {
-		return 1, fmt.Errorf("backend adapter %q is modeled but not implemented", session.Backend.Kind)
-	}
-	kitty := KittyClient{Runner: ExecRunner{}, Command: os.Getenv("ZKA_KITTEN_COMMAND")}
-	if !*newView {
-		tree, listErr := kitty.List(ctx, *endpoint)
-		if listErr == nil && len(findManagedViews(tree)[session.ID]) > 0 {
-			if err := kitty.Focus(ctx, *endpoint, session.ID); err != nil {
-				return 1, err
-			}
-			fmt.Fprintf(stdout, "focused existing view for %s\n", session.Name)
-			return 0, nil
+	template := DefaultSessionTemplate()
+	if *templatePath != "" {
+		content, err := os.ReadFile(*templatePath)
+		if err != nil {
+			return 1, fmt.Errorf("read Kitty template: %w", err)
+		}
+		template, err = ParseSessionTemplate(string(content))
+		if err != nil {
+			return 2, err
 		}
 	}
-	windowID, err := kitty.Launch(ctx, LaunchOptions{Endpoint: *endpoint, Type: *typ, CWD: session.CWD, Title: session.Name, SessionID: session.ID, Backend: session.Backend.Kind, State: session.State})
+	specs, err := templatePaneSpecs(template, *cwd)
 	if err != nil {
-		return 1, err
-	}
-	_, err = api.RegisterView(ctx, session.ID, View{Endpoint: *endpoint, WindowID: windowID, Attached: true, LastSeen: time.Now().UTC()})
-	if err != nil {
-		return 1, err
-	}
-	fmt.Fprintf(stdout, "%d\n", windowID)
-	return 0, nil
-}
-
-func validateViewType(value string) error {
-	switch value {
-	case "window", "tab", "os-window":
-		return nil
-	default:
-		return fmt.Errorf("invalid kitty view type %q", value)
-	}
-}
-
-func runSnapshot(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
-	fs := newFlagSet("snapshot", stderr)
-	endpoint := fs.String("to", os.Getenv("KITTY_LISTEN_ON"), "kitty remote-control endpoint")
-	output := fs.String("output", "", "output path or - for stdout")
-	if err := fs.Parse(args); err != nil {
 		return 2, err
 	}
-	if fs.NArg() != 1 || *endpoint == "" {
-		return 2, fmt.Errorf("snapshot requires NAME and a kitty endpoint")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	kitty := KittyClient{Runner: ExecRunner{}, Command: os.Getenv("ZKA_KITTEN_COMMAND")}
-	snapshot, err := CaptureSnapshot(ctx, kitty, *endpoint, fs.Arg(0))
-	if err != nil {
-		return 1, err
-	}
-	result, err := NewStore(paths).SaveSnapshot(snapshot, *output)
-	if err != nil {
-		return 1, err
-	}
-	if *output == "-" {
-		fmt.Fprint(stdout, result)
-	} else {
-		fmt.Fprintln(stdout, result)
-	}
-	return 0, nil
-}
-
-func runRestore(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
-	fs := newFlagSet("restore", stderr)
-	endpoint := fs.String("to", os.Getenv("KITTY_LISTEN_ON"), "kitty remote-control endpoint")
-	duplicate := fs.Bool("duplicate", false, "create duplicate views")
-	if err := fs.Parse(args); err != nil {
-		return 2, err
-	}
-	if fs.NArg() != 1 || *endpoint == "" {
-		return 2, fmt.Errorf("restore requires NAME|PATH and a kitty endpoint")
-	}
-	snapshot, _, err := NewStore(paths).LoadSnapshot(fs.Arg(0))
+	cfg, err := LoadConfig()
 	if err != nil {
 		return 1, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	api := NewAPI(paths)
-	sessions, err := api.AllSessions(ctx)
+	workspace, err := api.CreateWorkspace(ctx, createWorkspaceRequest{Name: *name, Shell: cfg.Shell.Command, Panes: specs})
 	if err != nil {
 		return 1, err
 	}
-	kitty := KittyClient{Runner: ExecRunner{}, Command: os.Getenv("ZKA_KITTEN_COMMAND")}
-	skip := map[string]bool{}
-	if !*duplicate {
-		tree, err := kitty.List(ctx, *endpoint)
-		if err != nil {
-			return 1, err
-		}
-		for id := range findManagedViews(tree) {
-			skip[id] = true
-		}
-	}
-	for _, id := range SnapshotSessionIDs(snapshot) {
-		if sessions[id] == nil {
-			return 1, fmt.Errorf("snapshot references unknown session %s", id)
-		}
-	}
-	content := ""
-	if len(skip) == 0 && nativeSessionIsManaged(snapshot.NativeSession, SnapshotSessionIDs(snapshot)) {
-		content = snapshot.NativeSession
-	} else {
-		content, err = GenerateKittySession(snapshot, sessions, skip)
-	}
+	session, err := GenerateManagedSession(template, workspace)
 	if err != nil {
-		if strings.Contains(err.Error(), "all snapshot views already exist") {
-			fmt.Fprintln(stdout, err.Error())
-			return 0, nil
-		}
+		_ = api.DeleteWorkspace(context.Background(), workspace.ID)
 		return 1, err
 	}
-	path, err := writeRestoreSession(paths, snapshot, content)
+	attachmentID := localAttachmentID(workspace.Origin.ID, workspace.ID)
+	attachment := Attachment{
+		ID: attachmentID, Node: workspace.Origin, Transport: Transport{Kind: "local"},
+		Endpoint: attachmentEndpoint(paths, attachmentID),
+	}
+	workspace, err = launchManagedKitty(ctx, paths, cfg, api, launchAttachmentOptions{
+		Workspace: workspace, Attachment: attachment, Session: session, KittyArgs: fs.Args(),
+	})
 	if err != nil {
+		if failedWorkspaceHasBackend(api, workspace.ID) {
+			return 1, fmt.Errorf("start managed Kitty (workspace %s retained because a zmx backend started): %w", workspace.ID, err)
+		}
+		_ = api.DeleteWorkspace(context.Background(), workspace.ID)
 		return 1, err
 	}
-	if err := kitty.LoadSession(ctx, *endpoint, path); err != nil {
-		return 1, err
-	}
-	for id := range skip {
-		fmt.Fprintf(stdout, "reused existing view %s\n", id)
-	}
-	fmt.Fprintln(stdout, path)
+	fmt.Fprintf(stdout, "%s\t%s\n", workspace.ID, workspace.Name)
 	return 0, nil
 }
 
-func runStatus(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
-	fs := newFlagSet("status", stderr)
+func failedWorkspaceHasBackend(api API, workspaceID string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	workspace, err := api.Workspace(ctx, workspaceID)
+	if err != nil {
+		return true
+	}
+	for _, pane := range workspace.Panes {
+		if pane.BackendCreated || pane.BackendStart {
+			return true
+		}
+	}
+	return false
+}
+
+func runWorkspace(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	if len(args) == 0 {
+		printWorkspaceUsage(stderr)
+		return 2, nil
+	}
+	switch args[0] {
+	case "help", "--help", "-h":
+		printWorkspaceUsage(stdout)
+		return 0, nil
+	case "list":
+		return runWorkspaceList(args[1:], paths, stdout, stderr)
+	case "inspect":
+		return runWorkspaceInspect(args[1:], paths, stdout, stderr)
+	case "open":
+		return runWorkspaceOpen(args[1:], paths, false, stdout, stderr)
+	case "move":
+		return runWorkspaceOpen(args[1:], paths, true, stdout, stderr)
+	case "detach":
+		return runWorkspaceDetach(args[1:], paths, stdout, stderr)
+	case "focus":
+		return runWorkspaceFocus(args[1:], paths, stdout, stderr)
+	case "seen":
+		return runWorkspaceSeen(args[1:], paths, stdout, stderr)
+	default:
+		printWorkspaceUsage(stderr)
+		return 2, fmt.Errorf("unknown workspace command %q", args[0])
+	}
+}
+
+func printWorkspaceUsage(w io.Writer) {
+	fmt.Fprintln(w, `usage: zka workspace COMMAND
+
+  list [--origin SSH_ALIAS] [--json]
+  inspect [SSH_ALIAS:]REF [--json]
+  open [SSH_ALIAS:]REF [--pane PANE]
+  move [SSH_ALIAS:]REF [--pane PANE]
+  detach REF
+  focus REF [--pane PANE]
+  seen REF [--pane PANE]`)
+}
+
+func runWorkspaceList(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("workspace list", stderr)
+	origin := fs.String("origin", "", "SSH host alias")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(args); err != nil {
+	if err := parseInterspersed(fs, args); err != nil {
 		return 2, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if fs.NArg() != 0 {
+		return 2, fmt.Errorf("workspace list accepts no references")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	api := NewAPI(paths)
-	var sessions []*Session
-	if fs.NArg() == 1 {
-		session, err := api.Session(ctx, fs.Arg(0))
-		if err != nil {
-			return 1, err
-		}
-		sessions = []*Session{session}
-	} else if fs.NArg() == 0 {
-		var err error
-		sessions, err = api.Sessions(ctx)
-		if err != nil {
-			return 1, err
-		}
+	var workspaces []*Workspace
+	var err error
+	if *origin != "" {
+		err = api.RemoteCall(ctx, *origin, "list", nil, &workspaces)
 	} else {
-		return 2, fmt.Errorf("status accepts at most one session reference")
+		workspaces, err = api.Workspaces(ctx)
+	}
+	if err != nil {
+		return 1, err
 	}
 	if *jsonOut {
-		return 0, writeJSON(stdout, sessions)
+		return 0, writeJSON(stdout, workspaces)
 	}
-	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "STATE\tNAME\tID\tBACKEND\tVIEWS\tEVIDENCE")
-	for _, session := range sessions {
-		attached := 0
-		for _, view := range session.Views {
-			if view.Attached {
-				attached++
+	writeWorkspaceTable(stdout, workspaces)
+	return 0, nil
+}
+
+func runWorkspaceInspect(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("workspace inspect", stderr)
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	if err := parseInterspersed(fs, args); err != nil {
+		return 2, err
+	}
+	if fs.NArg() != 1 {
+		return 2, fmt.Errorf("workspace inspect requires one workspace reference")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	workspace, err := resolveWorkspace(ctx, NewAPI(paths), fs.Arg(0))
+	if err != nil {
+		return 1, err
+	}
+	if *jsonOut {
+		return 0, writeJSON(stdout, workspace)
+	}
+	writeWorkspaceDetail(stdout, workspace)
+	return 0, nil
+}
+
+func runWorkspaceOpen(args []string, paths Paths, move bool, stdout, stderr io.Writer) (int, error) {
+	name := "workspace open"
+	if move {
+		name = "workspace move"
+	}
+	fs := newFlagSet(name, stderr)
+	paneRef := fs.String("pane", "", "pane to focus after opening")
+	if err := parseInterspersed(fs, args); err != nil {
+		return 2, err
+	}
+	if fs.NArg() != 1 {
+		return 2, fmt.Errorf("%s requires one workspace reference", name)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	api := NewAPI(paths)
+	host, ref := splitWorkspaceRef(fs.Arg(0))
+	var workspace *Workspace
+	var err error
+	if host == "" {
+		workspace, err = api.Workspace(ctx, ref)
+	} else {
+		var remote Workspace
+		err = api.RemoteCall(ctx, host, "get", refRequest{Ref: ref}, &remote)
+		if err == nil {
+			workspace, err = api.Workspace(ctx, remote.ID)
+		}
+	}
+	if err != nil {
+		return 1, err
+	}
+	if *paneRef != "" {
+		if _, err := resolvePaneFromCopy(workspace, *paneRef); err != nil {
+			return 1, err
+		}
+	}
+	node, err := api.Node(ctx)
+	if err != nil {
+		return 1, err
+	}
+	attachmentID := localAttachmentID(node.ID, workspace.ID)
+	existing := preferredLocalAttachment(workspace, node.ID)
+	if existing != nil {
+		attachmentID = existing.ID
+	}
+	if attachmentUsable(existing) && existing.AppliedRevision == workspace.Revision {
+		if move && workspace.PrimaryAttachmentID != existing.ID {
+			if host != "" {
+				workspace, err = commitRemoteMove(ctx, api, host, workspace, existing)
+			} else {
+				workspace, err = commitLocalMove(ctx, api, workspace, existing)
+			}
+			if err != nil {
+				return 1, err
 			}
 		}
-		shortID := session.ID
-		if len(shortID) > 8 {
-			shortID = shortID[:8]
+		if err := focusAttachment(ctx, paths, workspace, existing, *paneRef); err != nil {
+			return 1, err
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s:%s\t%d\t%s/%s\n", session.State, session.Name, shortID, session.Backend.Kind, session.Backend.Ref, attached, session.Evidence.Source, session.Evidence.Event)
+		fmt.Fprintf(stdout, "%s\t%s\n", workspace.ID, workspace.Name)
+		return 0, nil
 	}
-	_ = tw.Flush()
-	return 0, nil
-}
-
-func runExplain(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
-	fs := newFlagSet("explain", stderr)
-	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(args); err != nil {
-		return 2, err
+	if existing != nil && strings.HasPrefix(existing.Endpoint, "unix:") && existing.Status != AttachmentDetached {
+		if workspace.PrimaryAttachmentID == existing.ID && !existing.Revoked {
+			attachmentID, err = randomID()
+			if err != nil {
+				return 1, err
+			}
+		} else {
+			if err := closeAndDetachLocal(ctx, paths, api, workspace, existing); err != nil {
+				var closeErr *kittyCloseError
+				if !errors.As(err, &closeErr) {
+					return 1, err
+				}
+				fmt.Fprintf(stderr, "zka: %v; rebuilding the detached view\n", closeErr)
+			}
+			workspace, err = api.Workspace(ctx, workspace.ID)
+			if err != nil {
+				return 1, err
+			}
+		}
 	}
-	if fs.NArg() != 1 {
-		return 2, fmt.Errorf("explain requires one session reference")
+	if strings.TrimSpace(workspace.Manifest.Session) == "" {
+		return 1, fmt.Errorf("workspace %s has no captured Kitty manifest", workspace.Name)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	session, err := NewAPI(paths).Session(ctx, fs.Arg(0))
+	transport := Transport{Kind: "local"}
+	if host != "" {
+		transport = Transport{Kind: "ssh", Host: host}
+	}
+	attachment := Attachment{ID: attachmentID, Node: node, Transport: transport, Endpoint: attachmentEndpoint(paths, attachmentID)}
+	if host != "" {
+		remoteAttachment := attachment
+		remoteAttachment.Endpoint = "ssh:" + node.Name + ":" + attachment.ID
+		if err := api.RemoteCall(ctx, host, "register_attachment", attachmentRequest{Workspace: workspace.ID, Attachment: remoteAttachment}, new(Attachment)); err != nil {
+			return 1, err
+		}
+	}
+	session, err := RenderAttachmentSession(workspace, transport, attachmentID)
 	if err != nil {
 		return 1, err
 	}
-	if *jsonOut {
-		return 0, writeJSON(stdout, session)
-	}
-	fmt.Fprintf(stdout, "state=%s\nsource=%s\nevent=%s\nevidence=%s\nsession=%s\nbackend=%s:%s\nturn=%s\n",
-		session.State, session.Evidence.Source, session.Evidence.Event, session.Evidence.Detail, session.ID, session.Backend.Kind, session.Backend.Ref, session.LastTurnID)
-	for _, record := range session.Notifications {
-		if record.LastError != "" {
-			fmt.Fprintf(stdout, "notification_error[%s]=%s\n", record.Channel, record.LastError)
-		}
-	}
-	return 0, nil
-}
-
-func runSeen(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
-	fs := newFlagSet("seen", stderr)
-	if err := fs.Parse(args); err != nil {
-		return 2, err
-	}
-	if fs.NArg() != 1 {
-		return 2, fmt.Errorf("seen requires one session reference")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	session, err := NewAPI(paths).Seen(ctx, fs.Arg(0))
+	cfg, err := LoadConfig()
 	if err != nil {
 		return 1, err
 	}
-	fmt.Fprintf(stdout, "%s\t%s\n", session.State, session.Name)
+	opened, err := launchManagedKitty(ctx, paths, cfg, api, launchAttachmentOptions{Workspace: workspace, Attachment: attachment, Session: session})
+	if err != nil {
+		if host != "" {
+			_ = api.RemoteCall(context.Background(), host, "detach_attachment", attachmentRefRequest{Workspace: workspace.ID, Attachment: attachmentID}, nil)
+		}
+		return 1, err
+	}
+	workspace = opened
+	localAttachment := workspace.Attachments[attachmentID]
+	if host != "" {
+		workspace, err = readyRemoteAttachment(ctx, api, host, workspace, localAttachment)
+		if err != nil {
+			_ = closeAndDetachLocal(context.Background(), paths, api, workspace, localAttachment)
+			_ = api.RemoteCall(context.Background(), host, "detach_attachment", attachmentRefRequest{Workspace: workspace.ID, Attachment: attachmentID}, nil)
+			return 1, err
+		}
+		if move {
+			workspace, err = commitRemoteMove(ctx, api, host, workspace, workspace.Attachments[attachmentID])
+			if err != nil {
+				_ = closeAndDetachLocal(context.Background(), paths, api, workspace, workspace.Attachments[attachmentID])
+				_ = api.RemoteCall(context.Background(), host, "detach_attachment", attachmentRefRequest{Workspace: workspace.ID, Attachment: attachmentID}, nil)
+				return 1, err
+			}
+		}
+	} else if move && workspace.PrimaryAttachmentID != attachmentID {
+		workspace, err = commitLocalMove(ctx, api, workspace, localAttachment)
+		if err != nil {
+			_ = closeAndDetachLocal(context.Background(), paths, api, workspace, localAttachment)
+			return 1, err
+		}
+	}
+	if err := focusAttachment(ctx, paths, workspace, workspace.Attachments[attachmentID], *paneRef); err != nil {
+		return 1, err
+	}
+	fmt.Fprintf(stdout, "%s\t%s\n", workspace.ID, workspace.Name)
 	return 0, nil
 }
 
-func runFocus(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
-	fs := newFlagSet("focus", stderr)
-	endpoint := fs.String("to", "", "kitty remote-control endpoint")
+func attachmentUsable(attachment *Attachment) bool {
+	return attachment != nil && attachment.Status == AttachmentReady && strings.HasPrefix(attachment.Endpoint, "unix:") && !attachment.Revoked
+}
+
+func preferredLocalAttachment(workspace *Workspace, nodeID string) *Attachment {
+	primary := workspace.Attachments[workspace.PrimaryAttachmentID]
+	if primary != nil && primary.Node.ID == nodeID && attachmentUsable(primary) {
+		return primary
+	}
+	for _, attachment := range workspace.SortedAttachments() {
+		if attachment.Node.ID == nodeID && attachmentUsable(attachment) {
+			return workspace.Attachments[attachment.ID]
+		}
+	}
+	if primary != nil && primary.Node.ID == nodeID && strings.HasPrefix(primary.Endpoint, "unix:") && primary.Status != AttachmentDetached {
+		return primary
+	}
+	if deterministic := workspace.Attachments[localAttachmentID(nodeID, workspace.ID)]; deterministic != nil {
+		return deterministic
+	}
+	for _, attachment := range workspace.SortedAttachments() {
+		if attachment.Node.ID == nodeID && strings.HasPrefix(attachment.Endpoint, "unix:") {
+			return workspace.Attachments[attachment.ID]
+		}
+	}
+	return nil
+}
+
+func readyRemoteAttachment(ctx context.Context, api API, host string, workspace *Workspace, attachment *Attachment) (*Workspace, error) {
+	if attachment == nil {
+		return nil, fmt.Errorf("local attachment disappeared before remote readiness")
+	}
+	var remote Workspace
+	err := api.RemoteCall(ctx, host, "update_attachment", attachmentUpdateRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID, ExpectedRevision: workspace.Revision,
+		Status: AttachmentReady, Views: attachment.Views,
+	}, &remote)
+	if err != nil {
+		return nil, err
+	}
+	return api.Workspace(ctx, remote.ID)
+}
+
+func commitRemoteMove(ctx context.Context, api API, host string, workspace *Workspace, attachment *Attachment) (*Workspace, error) {
+	if attachment == nil {
+		return nil, fmt.Errorf("destination attachment does not exist")
+	}
+	if attachment.AppliedRevision != workspace.Revision {
+		var err error
+		workspace, err = readyRemoteAttachment(ctx, api, host, workspace, attachment)
+		if err != nil {
+			return nil, err
+		}
+		attachment = workspace.Attachments[attachment.ID]
+	}
+	var result moveCommitResponse
+	if err := api.RemoteCall(ctx, host, "commit_move", moveCommitRequest{
+		Workspace: workspace.ID, Destination: attachment.ID, ExpectedRevision: workspace.Revision,
+	}, &result); err != nil {
+		return nil, err
+	}
+	return api.Workspace(ctx, workspace.ID)
+}
+
+func commitLocalMove(ctx context.Context, api API, workspace *Workspace, attachment *Attachment) (*Workspace, error) {
+	if attachment == nil {
+		return nil, fmt.Errorf("destination attachment does not exist")
+	}
+	result, err := api.CommitMove(ctx, moveCommitRequest{
+		Workspace: workspace.ID, Destination: attachment.ID, ExpectedRevision: workspace.Revision,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.Workspace, nil
+}
+
+func runWorkspaceDetach(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("workspace detach", stderr)
 	if err := fs.Parse(args); err != nil {
 		return 2, err
 	}
 	if fs.NArg() != 1 {
-		return 2, fmt.Errorf("focus requires one session reference")
+		return 2, fmt.Errorf("workspace detach requires one local workspace reference")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	api := NewAPI(paths)
+	workspace, err := api.Workspace(ctx, fs.Arg(0))
+	if err != nil {
+		return 1, err
+	}
+	node, err := api.Node(ctx)
+	if err != nil {
+		return 1, err
+	}
+	var attachments []*Attachment
+	for _, attachment := range workspace.SortedAttachments() {
+		if attachment.Node.ID == node.ID && strings.HasPrefix(attachment.Endpoint, "unix:") && attachment.Status != AttachmentDetached {
+			attachments = append(attachments, attachment)
+		}
+	}
+	if len(attachments) == 0 {
+		fmt.Fprintln(stdout, "already detached")
+		return 0, nil
+	}
+	var firstErr error
+	for _, attachment := range attachments {
+		if err := closeAndDetachLocal(ctx, paths, api, workspace, attachment); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if workspace.RemoteHost != "" {
+			if err := api.RemoteCall(ctx, workspace.RemoteHost, "detach_attachment", attachmentRefRequest{Workspace: workspace.ID, Attachment: attachment.ID}, nil); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	if firstErr != nil {
+		return 1, firstErr
+	}
+	fmt.Fprintln(stdout, workspace.Name)
+	return 0, nil
+}
+
+func closeAndDetachLocal(ctx context.Context, paths Paths, api API, workspace *Workspace, attachment *Attachment) error {
+	if attachment == nil {
+		return fmt.Errorf("local attachment does not exist")
+	}
+	if _, err := api.DetachAttachment(ctx, workspace.ID, attachment.ID); err != nil {
+		return err
+	}
+	var closeErr error
+	if attachment != nil && strings.HasPrefix(attachment.Endpoint, "unix:") {
+		cfg, err := LoadConfig()
+		if err != nil {
+			return err
+		}
+		kitty := KittyClient{Runner: ExecRunner{}, Command: cfg.Kitty.KittenCommand}
+		callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		closeErr = kitty.CloseWorkspace(callCtx, attachment.Endpoint, workspace.ID)
+		cancel()
+	}
+	if closeErr != nil {
+		return &kittyCloseError{err: closeErr}
+	}
+	return nil
+}
+
+type kittyCloseError struct{ err error }
+
+func (e *kittyCloseError) Error() string {
+	return "Kitty was unreachable; attachment was still detached: " + e.err.Error()
+}
+func (e *kittyCloseError) Unwrap() error { return e.err }
+
+func runWorkspaceFocus(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("workspace focus", stderr)
+	pane := fs.String("pane", "", "pane reference")
+	if err := parseInterspersed(fs, args); err != nil {
+		return 2, err
+	}
+	if fs.NArg() != 1 {
+		return 2, fmt.Errorf("workspace focus requires one local workspace reference")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	api := NewAPI(paths)
-	session, err := api.Session(ctx, fs.Arg(0))
+	workspace, err := api.Workspace(ctx, fs.Arg(0))
 	if err != nil {
 		return 1, err
 	}
-	target := *endpoint
-	if target == "" {
-		target = os.Getenv("KITTY_LISTEN_ON")
+	if *pane != "" {
+		resolved, err := resolvePaneFromCopy(workspace, *pane)
+		if err != nil {
+			return 1, err
+		}
+		*pane = resolved.ID
 	}
-	if target == "" {
-		for _, view := range session.SortedViews() {
-			if view.Attached {
-				target = view.Endpoint
-				break
+	node, err := api.Node(ctx)
+	if err != nil {
+		return 1, err
+	}
+	attachment := preferredLocalAttachment(workspace, node.ID)
+	if !attachmentUsable(attachment) {
+		return 1, fmt.Errorf("workspace has no ready attachment on this node")
+	}
+	if err := focusAttachment(ctx, paths, workspace, attachment, *pane); err != nil {
+		return 1, err
+	}
+	fmt.Fprintln(stdout, workspace.Name)
+	return 0, nil
+}
+
+func focusAttachment(ctx context.Context, paths Paths, workspace *Workspace, attachment *Attachment, paneRef string) error {
+	if attachment == nil || attachment.Endpoint == "" {
+		return fmt.Errorf("workspace has no local Kitty attachment")
+	}
+	paneID := paneRef
+	if paneRef != "" {
+		pane, err := resolvePaneFromCopy(workspace, paneRef)
+		if err != nil {
+			return err
+		}
+		paneID = pane.ID
+	}
+	cfg, err := LoadConfig()
+	if err != nil {
+		return err
+	}
+	kitty := KittyClient{Runner: ExecRunner{}, Command: cfg.Kitty.KittenCommand}
+	if err := kitty.FocusPane(ctx, attachment.Endpoint, workspace.ID, paneID); err != nil {
+		return err
+	}
+	api := NewAPI(paths)
+	if workspace.RemoteHost != "" {
+		_ = api.RemoteCall(ctx, workspace.RemoteHost, "seen", workspacePaneRequest{Workspace: workspace.ID, Pane: paneID}, nil)
+	} else {
+		_, _ = api.Seen(ctx, workspace.ID, paneID)
+	}
+	return nil
+}
+
+func runWorkspaceSeen(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("workspace seen", stderr)
+	pane := fs.String("pane", "", "pane reference")
+	if err := parseInterspersed(fs, args); err != nil {
+		return 2, err
+	}
+	if fs.NArg() != 1 {
+		return 2, fmt.Errorf("workspace seen requires one workspace reference")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	api := NewAPI(paths)
+	host, ref := splitWorkspaceRef(fs.Arg(0))
+	var workspace Workspace
+	var err error
+	if host == "" {
+		result, callErr := api.Seen(ctx, ref, *pane)
+		err = callErr
+		if result != nil {
+			workspace = *result
+		}
+	} else {
+		err = api.RemoteCall(ctx, host, "seen", workspacePaneRequest{Workspace: ref, Pane: *pane}, &workspace)
+	}
+	if err != nil {
+		return 1, err
+	}
+	fmt.Fprintf(stdout, "%s\t%s\n", workspace.Attention, workspace.Name)
+	return 0, nil
+}
+
+func resolveWorkspace(ctx context.Context, api API, ref string) (*Workspace, error) {
+	host, localRef := splitWorkspaceRef(ref)
+	if host == "" {
+		return api.Workspace(ctx, localRef)
+	}
+	var workspace Workspace
+	if err := api.RemoteCall(ctx, host, "get", refRequest{Ref: localRef}, &workspace); err != nil {
+		return nil, err
+	}
+	return &workspace, nil
+}
+
+func splitWorkspaceRef(ref string) (host, workspace string) {
+	if at := strings.IndexByte(ref, ':'); at > 0 {
+		return ref[:at], ref[at+1:]
+	}
+	return "", ref
+}
+
+func resolvePaneFromCopy(workspace *Workspace, ref string) (*Pane, error) {
+	return resolvePaneLocked(workspace, ref)
+}
+
+func writeWorkspaceTable(w io.Writer, workspaces []*Workspace) {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "STATE\tNAME\tID\tORIGIN\tREV\tPANES\tATTACHMENTS")
+	for _, workspace := range workspaces {
+		origin := workspace.Origin.Name
+		if workspace.RemoteHost != "" {
+			origin = workspace.RemoteHost
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%d\t%d\n", workspace.Attention, workspace.Name, shortID(workspace.ID), origin, workspace.Revision, len(workspace.Panes), len(workspace.Attachments))
+	}
+	_ = tw.Flush()
+}
+
+func writeWorkspaceDetail(w io.Writer, workspace *Workspace) {
+	fmt.Fprintf(w, "workspace=%s\nname=%s\norigin=%s\nrevision=%d\nattention=%s\nprimary_attachment=%s\n",
+		workspace.ID, workspace.Name, workspace.Origin.Name, workspace.Revision, workspace.Attention, workspace.PrimaryAttachmentID)
+	for _, pane := range workspace.SortedPanes() {
+		fmt.Fprintf(w, "pane[%s]=%s backend=%s state=%s evidence=%s/%s\n", shortID(pane.ID), pane.Title, pane.Backend.Ref, pane.State, pane.Evidence.Source, pane.Evidence.Event)
+		for _, record := range pane.Notifications {
+			if record.LastError != "" {
+				fmt.Fprintf(w, "notification_error[%s]=%s\n", record.Channel, record.LastError)
 			}
 		}
 	}
-	if target == "" {
-		return 1, fmt.Errorf("session has no attached kitty view")
+	for _, attachment := range workspace.SortedAttachments() {
+		fmt.Fprintf(w, "attachment[%s]=%s node=%s transport=%s status=%s revision=%d\n", shortID(attachment.ID), attachment.Role, attachment.Node.Name, attachment.Transport.Kind, attachment.Status, attachment.AppliedRevision)
 	}
-	kitty := KittyClient{Runner: ExecRunner{}, Command: os.Getenv("ZKA_KITTEN_COMMAND")}
-	if err := kitty.Focus(ctx, target, session.ID); err != nil {
-		return 1, err
-	}
-	_, _ = api.Seen(ctx, session.ID)
-	fmt.Fprintln(stdout, session.Name)
-	return 0, nil
 }
 
 func writeJSON(w io.Writer, value any) error {
@@ -456,57 +781,138 @@ func writeJSON(w io.Writer, value any) error {
 	return enc.Encode(value)
 }
 
-func runView(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
-	if len(args) != 1 {
-		return 2, fmt.Errorf("view requires one session id")
+func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("pane", stderr)
+	workspaceRef := fs.String("workspace", "", "workspace id")
+	paneRef := fs.String("pane", "", "existing pane id")
+	if err := fs.Parse(args); err != nil {
+		return 2, err
 	}
-	ctx := context.Background()
+	if *workspaceRef == "" || fs.NArg() != 0 {
+		return 2, fmt.Errorf("pane requires --workspace and optional --pane")
+	}
 	api := NewAPI(paths)
-	prepared, err := api.PrepareView(ctx, args[0])
+	prepared, err := api.PreparePane(context.Background(), *workspaceRef, *paneRef)
 	if err != nil {
 		return 1, err
 	}
-	session := prepared.Session
-	view := viewFromEnv()
-	if view != nil {
-		_, _ = api.RegisterView(ctx, session.ID, *view)
+	cfg, err := LoadConfig()
+	if err != nil {
+		return 1, err
 	}
-	zmx := os.Getenv("ZKA_ZMX_COMMAND")
-	if zmx == "" {
-		zmx = "zmx"
+	windowID, parseErr := strconv.ParseInt(os.Getenv("KITTY_WINDOW_ID"), 10, 64)
+	endpoint := os.Getenv("KITTY_LISTEN_ON")
+	if endpoint == "" || parseErr != nil || windowID <= 0 {
+		return reportPaneBackendError(api, prepared.Workspace, prepared.Pane, fmt.Errorf("managed Kitty endpoint and window id are required"))
+	}
+	kitty := KittyClient{Runner: ExecRunner{}, Command: cfg.Kitty.KittenCommand}
+	identityCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	identityErr := kitty.SetIdentity(identityCtx, endpoint, windowID, prepared.Workspace.ID, prepared.Pane.ID)
+	cancel()
+	if identityErr != nil {
+		return reportPaneBackendError(api, prepared.Workspace, prepared.Pane, fmt.Errorf("tag Kitty pane: %w", identityErr))
 	}
 	if !prepared.Create {
-		exists, err := zmxSessionExists(ctx, zmx, session.Backend.Ref)
+		exists, err := zmxSessionExists(context.Background(), cfg.ZMX.Command, prepared.Pane.Backend.Ref)
 		if err != nil {
-			return reportBackendError(api, session, view, fmt.Errorf("query zmx sessions: %w", err))
+			return reportPaneBackendError(api, prepared.Workspace, prepared.Pane, fmt.Errorf("query zmx sessions: %w", err))
 		}
 		if !exists {
-			return reportBackendError(api, session, view, fmt.Errorf("zmx session %q no longer exists; refusing to restart it during attach", session.Backend.Ref))
+			return reportPaneBackendError(api, prepared.Workspace, prepared.Pane, fmt.Errorf("zmx session %q no longer exists; refusing to restart its foreground process", prepared.Pane.Backend.Ref))
 		}
 	}
-	cmdArgs := []string{"attach", session.Backend.Ref}
+	commandArgs := []string{"attach", prepared.Pane.Backend.Ref}
 	if prepared.Create {
-		exe, err := os.Executable()
-		if err != nil {
-			return 1, err
-		}
-		cmdArgs = append(cmdArgs, exe, "agent-run", "--session", session.ID, "--")
-		cmdArgs = append(cmdArgs, session.Command...)
+		commandArgs = append(commandArgs, "zka", "pane-host", "--workspace", prepared.Workspace.ID, "--pane", prepared.Pane.ID, "--")
+		commandArgs = append(commandArgs, prepared.Workspace.Shell...)
 	}
-	cmd := exec.Command(zmx, cmdArgs...)
+	cmd := exec.Command(cfg.ZMX.Command, commandArgs...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
-	cmd.Dir = session.CWD
-	cmd.Env = append(os.Environ(), "ZKA_SESSION_ID="+session.ID)
-	if err := cmd.Run(); err != nil {
-		return reportBackendError(api, session, view, err)
+	if prepared.Create && prepared.Pane.CWD != "" {
+		cmd.Dir = prepared.Pane.CWD
 	}
-	return 0, nil
+	cmd.Env = append(os.Environ(), "ZKA_WORKSPACE_ID="+prepared.Workspace.ID, "ZKA_PANE_ID="+prepared.Pane.ID)
+	if err := cmd.Start(); err != nil {
+		return reportPaneBackendError(api, prepared.Workspace, prepared.Pane, err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	runErr, exited, readyErr := waitForLocalPaneReady(readyCtx, api, prepared.Workspace.ID, prepared.Pane.ID, done)
+	readyCancel()
+	if readyErr != nil {
+		_ = cmd.Process.Kill()
+		if !exited {
+			runErr = <-done
+		}
+		return reportPaneBackendError(api, prepared.Workspace, prepared.Pane, fmt.Errorf("wait for zmx attachment readiness: %w", readyErr))
+	}
+	if exited {
+		return finishPaneAttach(api, cfg, prepared.Workspace, prepared.Pane, runErr)
+	}
+	readyCtx, readyCancel = context.WithTimeout(context.Background(), 2*time.Second)
+	readyErr = kitty.SetPaneReady(readyCtx, endpoint, windowID, true)
+	readyCancel()
+	if readyErr != nil {
+		_ = cmd.Process.Kill()
+		<-done
+		return 1, fmt.Errorf("mark Kitty pane ready: %w", readyErr)
+	}
+	runErr = <-done
+	notReadyCtx, notReadyCancel := context.WithTimeout(context.Background(), time.Second)
+	_ = kitty.SetPaneReady(notReadyCtx, endpoint, windowID, false)
+	notReadyCancel()
+	return finishPaneAttach(api, cfg, prepared.Workspace, prepared.Pane, runErr)
+}
+
+func waitForLocalPaneReady(ctx context.Context, api API, workspaceID, paneID string, done <-chan error) (error, bool, error) {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	started := time.Now()
+	var lastErr error
+	for {
+		select {
+		case runErr := <-done:
+			return runErr, true, nil
+		case <-ctx.Done():
+			if lastErr != nil {
+				return nil, false, lastErr
+			}
+			return nil, false, ctx.Err()
+		case <-ticker.C:
+			workspace, err := api.Workspace(ctx, workspaceID)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			pane := workspace.Panes[paneID]
+			if pane != nil && pane.BackendReady && time.Since(started) >= 100*time.Millisecond {
+				select {
+				case runErr := <-done:
+					return runErr, true, nil
+				default:
+					return nil, false, nil
+				}
+			}
+		}
+	}
+}
+
+func finishPaneAttach(api API, cfg Config, workspace *Workspace, pane *Pane, runErr error) (int, error) {
+	if runErr == nil {
+		return 0, nil
+	}
+	exists, queryErr := zmxSessionExists(context.Background(), cfg.ZMX.Command, pane.Backend.Ref)
+	if queryErr == nil && exists {
+		return processExitCode(runErr), nil
+	}
+	return reportPaneBackendError(api, workspace, pane, runErr)
 }
 
 func zmxSessionExists(ctx context.Context, command, name string) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	out, _, err := (ExecRunner{}).Run(ctx, command, "list", "--short")
+	out, _, err := (ExecRunner{}).Run(callCtx, command, "list", "--short")
 	if err != nil {
 		return false, err
 	}
@@ -520,34 +926,37 @@ func zmxSessionExists(ctx context.Context, command, name string) (bool, error) {
 	return false, scanner.Err()
 }
 
-func reportBackendError(api API, session *Session, view *View, cause error) (int, error) {
-	_, _ = api.Event(context.Background(), Event{SessionID: session.ID, Kind: "backend_error", Source: "zmx", Detail: cause.Error(), View: view})
+func reportPaneBackendError(api API, workspace *Workspace, pane *Pane, cause error) (int, error) {
+	_, _ = api.Event(context.Background(), Event{WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "backend_error", Source: "zmx", Detail: cause.Error()})
 	return 1, cause
 }
 
-func runAgent(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
-	fs := newFlagSet("agent-run", stderr)
-	sessionID := fs.String("session", "", "zka session id")
+func runPaneHost(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("pane-host", stderr)
+	workspaceID := fs.String("workspace", "", "workspace id")
+	paneID := fs.String("pane", "", "pane id")
 	if err := fs.Parse(args); err != nil {
 		return 2, err
 	}
 	command := fs.Args()
-	if *sessionID == "" || len(command) == 0 {
-		return 2, fmt.Errorf("agent-run requires --session ID -- COMMAND")
+	if *workspaceID == "" || *paneID == "" || len(command) == 0 {
+		return 2, fmt.Errorf("pane-host requires --workspace, --pane, and a command after --")
 	}
 	api := NewAPI(paths)
-	view := viewFromEnv()
-	started, err := api.Event(context.Background(), Event{SessionID: *sessionID, Kind: "process_started", Source: "agent-run", PID: os.Getpid(), View: view})
+	workspace, err := api.Event(context.Background(), Event{WorkspaceID: *workspaceID, PaneID: *paneID, Kind: "process_started", Source: "pane-host", PID: os.Getpid()})
 	if err != nil {
 		return 1, err
 	}
+	pane := workspace.Panes[*paneID]
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
-	cmd.Dir = started.CWD
-	cmd.Env = append(os.Environ(), "ZKA_SESSION_ID="+started.ID)
+	if pane != nil && pane.CWD != "" {
+		cmd.Dir = pane.CWD
+	}
+	cmd.Env = append(os.Environ(), "ZKA_WORKSPACE_ID="+*workspaceID, "ZKA_PANE_ID="+*paneID)
 	err = cmd.Run()
 	exitCode := processExitCode(err)
-	_, eventErr := api.Event(context.Background(), Event{SessionID: *sessionID, Kind: "process_exit", Source: "agent-run", ExitCode: &exitCode, Detail: fmt.Sprintf("exit code %d", exitCode), View: view})
+	_, eventErr := api.Event(context.Background(), Event{WorkspaceID: *workspaceID, PaneID: *paneID, Kind: "process_exit", Source: "pane-host", ExitCode: &exitCode, Detail: fmt.Sprintf("exit code %d", exitCode)})
 	if eventErr != nil {
 		fmt.Fprintf(stderr, "zka: report process exit: %v\n", eventErr)
 	}
@@ -555,6 +964,277 @@ func runAgent(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Wri
 		return exitCode, nil
 	}
 	return 0, nil
+}
+
+func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("remote-attach", stderr)
+	workspaceRef := fs.String("workspace", "", "workspace id")
+	paneRef := fs.String("pane", "", "pane id")
+	attachmentID := fs.String("attachment", "", "destination attachment id")
+	if err := fs.Parse(args); err != nil {
+		return 2, err
+	}
+	if *workspaceRef == "" || *paneRef == "" || *attachmentID == "" || fs.NArg() != 0 {
+		return 2, fmt.Errorf("remote-attach requires --workspace, --pane, and --attachment")
+	}
+	ctx := context.Background()
+	api := NewAPI(paths)
+	prepared, err := api.PreparePane(ctx, *workspaceRef, *paneRef)
+	if err != nil {
+		return 1, err
+	}
+	workspace, pane := prepared.Workspace, prepared.Pane
+	cfg, err := LoadConfig()
+	if err != nil {
+		return 1, err
+	}
+	if !prepared.Create {
+		exists, err := zmxSessionExists(ctx, cfg.ZMX.Command, pane.Backend.Ref)
+		if err != nil {
+			return 1, err
+		}
+		if !exists {
+			return reportPaneBackendError(api, workspace, pane, fmt.Errorf("remote zmx session %q is missing; refusing to restart it", pane.Backend.Ref))
+		}
+	}
+	zmxArgs := []string{"attach", pane.Backend.Ref}
+	if prepared.Create {
+		zmxArgs = append(zmxArgs, "zka", "pane-host", "--workspace", workspace.ID, "--pane", pane.ID, "--")
+		zmxArgs = append(zmxArgs, workspace.Shell...)
+	}
+	cmd := exec.Command(cfg.ZMX.Command, zmxArgs...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
+	cmd.Env = append(os.Environ(), "ZKA_WORKSPACE_ID="+workspace.ID, "ZKA_PANE_ID="+pane.ID)
+	if prepared.Create && pane.CWD != "" {
+		cmd.Dir = pane.CWD
+	}
+	if err := cmd.Start(); err != nil {
+		return reportPaneBackendError(api, workspace, pane, err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	readyCtx, readyCancel := context.WithTimeout(ctx, 8*time.Second)
+	runErr, exited, readyErr := waitForLocalPaneReady(readyCtx, api, workspace.ID, pane.ID, done)
+	readyCancel()
+	if readyErr != nil {
+		_ = cmd.Process.Kill()
+		if !exited {
+			<-done
+		}
+		return reportPaneBackendError(api, workspace, pane, fmt.Errorf("wait for remote zmx client readiness: %w", readyErr))
+	}
+	if exited {
+		return finishPaneAttach(api, cfg, workspace, pane, runErr)
+	}
+	heartbeat := attachmentPaneReadyRequest{Workspace: workspace.ID, Attachment: *attachmentID, Pane: pane.ID, Ready: true}
+	heartbeatCtx, heartbeatCancel := context.WithTimeout(ctx, 2*time.Second)
+	_, heartbeatErr := api.SetAttachmentPaneReady(heartbeatCtx, heartbeat)
+	heartbeatCancel()
+	if heartbeatErr != nil {
+		_ = cmd.Process.Kill()
+		<-done
+		return 1, fmt.Errorf("publish remote pane readiness: %w", heartbeatErr)
+	}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case runErr = <-done:
+			heartbeat.Ready = false
+			clearCtx, clearCancel := context.WithTimeout(context.Background(), time.Second)
+			_, _ = api.SetAttachmentPaneReady(clearCtx, heartbeat)
+			clearCancel()
+			return finishPaneAttach(api, cfg, workspace, pane, runErr)
+		case <-ticker.C:
+			heartbeatCtx, heartbeatCancel := context.WithTimeout(ctx, time.Second)
+			_, _ = api.SetAttachmentPaneReady(heartbeatCtx, heartbeat)
+			heartbeatCancel()
+		}
+	}
+}
+
+func runRemoteNewPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("remote-new-pane", stderr)
+	host := fs.String("origin", "", "origin SSH alias")
+	workspaceID := fs.String("workspace", "", "workspace id")
+	attachment := fs.String("attachment", "", "attachment id")
+	if err := fs.Parse(args); err != nil {
+		return 2, err
+	}
+	if *host == "" || *workspaceID == "" || *attachment == "" || fs.NArg() != 0 {
+		return 2, fmt.Errorf("remote-new-pane requires origin, workspace, and attachment")
+	}
+	if err := validateSSHHost(*host); err != nil {
+		return 2, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	api := NewAPI(paths)
+	windowID, err := strconv.ParseInt(os.Getenv("KITTY_WINDOW_ID"), 10, 64)
+	if err != nil || windowID <= 0 {
+		return 1, fmt.Errorf("KITTY_WINDOW_ID is unavailable for the new remote pane")
+	}
+	allocationID, err := randomID()
+	if err != nil {
+		return 1, err
+	}
+	var allocated allocatePaneResponse
+	if err := api.RemoteCall(ctx, *host, "allocate_pane", allocatePaneRequest{
+		Workspace: *workspaceID, Key: *attachment + ":" + allocationID,
+	}, &allocated); err != nil {
+		return 1, err
+	}
+	endpoint := os.Getenv("KITTY_LISTEN_ON")
+	cfg, err := LoadConfig()
+	if err != nil {
+		return 1, err
+	}
+	kitty := KittyClient{Runner: ExecRunner{}, Command: cfg.Kitty.KittenCommand}
+	if err := kitty.SetIdentity(ctx, endpoint, windowID, allocated.Workspace.ID, allocated.Pane.ID); err != nil {
+		return 1, err
+	}
+	return runRemotePane([]string{"--origin", *host, "--workspace", allocated.Workspace.ID, "--pane", allocated.Pane.ID, "--attachment", *attachment}, paths, stdin, stdout, stderr)
+}
+
+func runRemotePane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("remote-pane", stderr)
+	host := fs.String("origin", "", "origin SSH alias")
+	workspace := fs.String("workspace", "", "workspace id")
+	pane := fs.String("pane", "", "pane id")
+	attachment := fs.String("attachment", "", "attachment id")
+	if err := fs.Parse(args); err != nil {
+		return 2, err
+	}
+	if *host == "" || *workspace == "" || *pane == "" || *attachment == "" || fs.NArg() != 0 {
+		return 2, fmt.Errorf("remote-pane requires origin, workspace, pane, and attachment")
+	}
+	if err := validateSSHHost(*host); err != nil {
+		return 2, err
+	}
+	cfg, err := LoadConfig()
+	if err != nil {
+		return 1, err
+	}
+	windowID, parseErr := strconv.ParseInt(os.Getenv("KITTY_WINDOW_ID"), 10, 64)
+	endpoint := os.Getenv("KITTY_LISTEN_ON")
+	if endpoint == "" || parseErr != nil || windowID <= 0 {
+		return 1, fmt.Errorf("managed Kitty endpoint and window id are required")
+	}
+	kitty := KittyClient{Runner: ExecRunner{}, Command: cfg.Kitty.KittenCommand}
+	markCtx, markCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	err = kitty.SetPaneReady(markCtx, endpoint, windowID, false)
+	markCancel()
+	if err != nil {
+		return 1, fmt.Errorf("mark remote Kitty pane preparing: %w", err)
+	}
+	api := NewAPI(paths)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	backoff := 250 * time.Millisecond
+	for {
+		sshArgs := append([]string(nil), cfg.SSH.Options...)
+		sshArgs = append(sshArgs, "-tt", "--", *host, "exec", "zka", "remote-attach",
+			"--workspace", *workspace, "--pane", *pane, "--attachment", *attachment)
+		cmd := exec.CommandContext(ctx, cfg.SSH.Command, sshArgs...)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
+		if err := cmd.Start(); err != nil {
+			return 1, fmt.Errorf("start SSH pane attachment: %w", err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		readyCtx, readyCancel := context.WithTimeout(ctx, 8*time.Second)
+		runErr, exited, readyErr := waitForRemotePaneReady(readyCtx, api, *host, *workspace, *attachment, *pane, done)
+		readyCancel()
+		if readyErr != nil {
+			_ = cmd.Process.Kill()
+			if !exited {
+				runErr = <-done
+			}
+			return 1, fmt.Errorf("wait for remote zmx attachment readiness: %w", readyErr)
+		}
+		if !exited {
+			markCtx, markCancel := context.WithTimeout(ctx, 2*time.Second)
+			readyErr = kitty.SetPaneReady(markCtx, endpoint, windowID, true)
+			markCancel()
+			if readyErr != nil {
+				_ = cmd.Process.Kill()
+				<-done
+				return 1, fmt.Errorf("mark remote Kitty pane ready: %w", readyErr)
+			}
+			backoff = 250 * time.Millisecond
+			runErr = <-done
+			markCtx, markCancel = context.WithTimeout(context.Background(), time.Second)
+			_ = kitty.SetPaneReady(markCtx, endpoint, windowID, false)
+			markCancel()
+		}
+		code := processExitCode(runErr)
+		if runErr == nil {
+			return 0, nil
+		}
+		if ctx.Err() != nil {
+			return 130, nil
+		}
+		if code != 255 {
+			return code, nil
+		}
+		select {
+		case <-ctx.Done():
+			return 130, nil
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+func waitForRemotePaneReady(ctx context.Context, api API, host, workspaceID, attachmentID, paneID string, done <-chan error) (error, bool, error) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	started := time.Now()
+	var lastErr error
+	for {
+		select {
+		case runErr := <-done:
+			return runErr, true, nil
+		case <-ctx.Done():
+			if lastErr != nil {
+				return nil, false, lastErr
+			}
+			return nil, false, ctx.Err()
+		case <-ticker.C:
+			callCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			var readiness paneReadinessResponse
+			err := api.RemoteCall(callCtx, host, "pane_readiness", paneReadinessRequest{
+				Workspace: workspaceID, Attachment: attachmentID, Pane: paneID,
+			}, &readiness)
+			cancel()
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if readiness.BackendReady && readiness.ClientReady && time.Since(started) >= 150*time.Millisecond {
+				select {
+				case runErr := <-done:
+					return runErr, true, nil
+				default:
+					return nil, false, nil
+				}
+			}
+		}
+	}
+}
+
+func runRemoteControlCommand(args []string, paths Paths, stdin io.Reader, stdout io.Writer) (int, error) {
+	if len(args) != 0 {
+		return 2, fmt.Errorf("remote-control accepts no arguments")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return 0, runRemoteControl(ctx, paths, stdin, stdout)
 }
 
 func processExitCode(err error) int {
@@ -573,13 +1253,4 @@ func processExitCode(err error) int {
 		return 129
 	}
 	return code
-}
-
-func viewFromEnv() *View {
-	endpoint := os.Getenv("KITTY_LISTEN_ON")
-	id, err := strconv.ParseInt(os.Getenv("KITTY_WINDOW_ID"), 10, 64)
-	if endpoint == "" || err != nil || id <= 0 {
-		return nil
-	}
-	return &View{Endpoint: endpoint, WindowID: id, Attached: true, LastSeen: time.Now().UTC()}
 }

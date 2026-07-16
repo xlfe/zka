@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -43,6 +42,7 @@ type kittyWindow struct {
 	IsActive  bool              `json:"is_active"`
 	UserVars  map[string]string `json:"user_vars"`
 	Env       map[string]string `json:"env"`
+	Cmdline   []string          `json:"cmdline"`
 }
 
 func (k KittyClient) command() string {
@@ -74,9 +74,9 @@ func (k KittyClient) List(ctx context.Context, endpoint string) ([]kittyOSWindow
 	for oi := range windows {
 		for ti := range windows[oi].Tabs {
 			for wi := range windows[oi].Tabs[ti].Windows {
-				w := &windows[oi].Tabs[ti].Windows[wi]
-				if w.UserVars == nil {
-					w.UserVars = map[string]string{}
+				window := &windows[oi].Tabs[ti].Windows[wi]
+				if window.UserVars == nil {
+					window.UserVars = map[string]string{}
 				}
 			}
 		}
@@ -84,8 +84,8 @@ func (k KittyClient) List(ctx context.Context, endpoint string) ([]kittyOSWindow
 	return windows, nil
 }
 
-func (k KittyClient) NativeSession(ctx context.Context, endpoint string) (string, error) {
-	return k.rc(ctx, endpoint, "ls", "--match", "var:zka_session", "--output-format=session")
+func (k KittyClient) NativeSession(ctx context.Context, endpoint, workspaceID string) (string, error) {
+	return k.rc(ctx, endpoint, "ls", "--match", "var:zka_workspace="+workspaceID, "--output-format=session")
 }
 
 func (k KittyClient) Version(ctx context.Context) string {
@@ -96,65 +96,55 @@ func (k KittyClient) Version(ctx context.Context) string {
 	return strings.TrimSpace(out)
 }
 
-type LaunchOptions struct {
-	Endpoint  string
-	Type      string
-	CWD       string
-	Title     string
-	SessionID string
-	Backend   string
-	State     AgentState
-	NewView   bool
-}
-
-func (k KittyClient) Launch(ctx context.Context, opts LaunchOptions) (int64, error) {
-	typ := opts.Type
-	if typ == "" {
-		typ = "window"
-	}
-	exe, err := os.Executable()
-	if err != nil {
-		return 0, fmt.Errorf("find zka executable: %w", err)
-	}
-	args := []string{"launch", "--type", typ, "--title", opts.Title,
-		"--var", "zka_session=" + opts.SessionID,
-		"--var", "zka_backend=" + opts.Backend,
-		"--var", "zka_state=" + string(opts.State),
-		"--env", "ZKA_SESSION_ID=" + opts.SessionID,
-	}
-	if opts.CWD != "" {
-		args = append(args, "--cwd", opts.CWD)
-	}
-	if typ == "tab" {
-		args = append(args, "--tab-title", opts.Title)
-	}
-	args = append(args, exe, "view", opts.SessionID)
-	out, err := k.rc(ctx, opts.Endpoint, args...)
-	if err != nil {
-		return 0, fmt.Errorf("launch kitty view: %w", err)
-	}
-	id, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse kitty window id %q: %w", strings.TrimSpace(out), err)
-	}
-	return id, nil
-}
-
-func (k KittyClient) Focus(ctx context.Context, endpoint, sessionID string) error {
-	_, err := k.rc(ctx, endpoint, "focus-window", "--match", "var:zka_session="+sessionID)
+func (k KittyClient) FocusWorkspace(ctx context.Context, endpoint, workspaceID string) error {
+	_, err := k.rc(ctx, endpoint, "focus-window", "--match", "var:zka_workspace="+workspaceID)
 	return err
 }
 
-func (k KittyClient) SetState(ctx context.Context, endpoint string, windowID int64, session *Session) error {
-	match := "id:" + strconv.FormatInt(windowID, 10)
-	if _, err := k.rc(ctx, endpoint, "set-user-vars", "--match", match, "zka_state="+string(session.State)); err != nil {
+func (k KittyClient) FocusPane(ctx context.Context, endpoint, workspaceID, paneID string) error {
+	match := "var:zka_workspace=" + workspaceID
+	if paneID != "" {
+		match = "var:zka_pane=" + paneID
+	}
+	_, err := k.rc(ctx, endpoint, "focus-window", "--match", match)
+	return err
+}
+
+func (k KittyClient) CloseWorkspace(ctx context.Context, endpoint, workspaceID string) error {
+	_, err := k.rc(ctx, endpoint, "close-window", "--match", "var:zka_workspace="+workspaceID)
+	return err
+}
+
+func (k KittyClient) SetPaneState(ctx context.Context, endpoint string, view RuntimeView, workspace *Workspace, pane *Pane) error {
+	match := "id:" + strconv.FormatInt(view.WindowID, 10)
+	if _, err := k.rc(ctx, endpoint, "set-user-vars", "--match", match,
+		"zka_workspace="+workspace.ID, "zka_pane="+pane.ID, "zka_state="+string(pane.State)); err != nil {
 		return err
 	}
-	title := strings.TrimSpace(stateMarker(session.State) + " " + session.Name)
-	if _, err := k.rc(ctx, endpoint, "set-window-title", "--match", match, title); err != nil {
-		return err
+	title := strings.TrimSpace(stateMarker(pane.State) + " " + pane.Title)
+	_, err := k.rc(ctx, endpoint, "set-window-title", "--match", match, title)
+	return err
+}
+
+func (k KittyClient) SetIdentity(ctx context.Context, endpoint string, windowID int64, workspaceID, paneID string) error {
+	if endpoint == "" || windowID <= 0 {
+		return fmt.Errorf("current Kitty window identity is unavailable")
 	}
-	return nil
+	_, err := k.rc(ctx, endpoint, "set-user-vars", "--match", "id:"+strconv.FormatInt(windowID, 10),
+		"zka_workspace="+workspaceID, "zka_pane="+paneID, "zka_state="+string(StateUnknown), "zka_ready=0")
+	return err
+}
+
+func (k KittyClient) SetPaneReady(ctx context.Context, endpoint string, windowID int64, ready bool) error {
+	if endpoint == "" || windowID <= 0 {
+		return fmt.Errorf("current Kitty window identity is unavailable")
+	}
+	value := "0"
+	if ready {
+		value = "1"
+	}
+	_, err := k.rc(ctx, endpoint, "set-user-vars", "--match", "id:"+strconv.FormatInt(windowID, 10), "zka_ready="+value)
+	return err
 }
 
 func (k KittyClient) SetTabTitle(ctx context.Context, endpoint string, tabID int64, title string) error {
@@ -162,77 +152,91 @@ func (k KittyClient) SetTabTitle(ctx context.Context, endpoint string, tabID int
 	return err
 }
 
-func (k KittyClient) LoadSession(ctx context.Context, endpoint, path string) error {
-	_, err := k.rc(ctx, endpoint, "action", "goto_session "+quoteAction(path))
-	return err
-}
-
-func (k KittyClient) Notify(ctx context.Context, view View, session *Session) (string, error) {
-	urgency := "normal"
-	icon := "info"
-	switch session.State {
+func (k KittyClient) Notify(ctx context.Context, view RuntimeView, endpoint string, workspace *Workspace, pane *Pane) (string, error) {
+	urgency, icon := "normal", "info"
+	switch pane.State {
 	case StateBlocked:
 		urgency, icon = "critical", "question"
 	case StateError:
 		urgency, icon = "critical", "error"
-	case StateDone:
-		icon = "info"
 	}
-	title := notificationTitle(session)
-	body := notificationBody(session)
-	identifier := "zka-" + session.ID
-	ctx, cancel := context.WithTimeout(ctx, 24*time.Hour)
+	identifier := "zka-" + workspace.ID + "-" + pane.ID
+	callCtx, cancel := context.WithTimeout(ctx, 24*time.Hour)
 	defer cancel()
-	return k.rc(ctx, view.Endpoint, "run", k.command(), "notify",
+	return k.rc(callCtx, endpoint, "run", k.command(), "notify",
 		"--app-name", "zka", "--identifier", identifier,
 		"--urgency", urgency, "--icon", icon,
-		"--button", "Focus", "--wait-for-completion", title, body)
+		"--button", "Focus", "--wait-for-completion",
+		notificationTitle(workspace, pane), notificationBody(workspace, pane))
 }
 
-func (k KittyClient) CloseNotification(ctx context.Context, view View, sessionID string) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+func (k KittyClient) CloseNotification(ctx context.Context, endpoint, workspaceID, paneID string) {
+	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	_, _ = k.rc(ctx, view.Endpoint, "run", k.command(), "notify", "--identifier", "zka-"+sessionID)
+	_, _ = k.rc(callCtx, endpoint, "run", k.command(), "notify", "--identifier", "zka-"+workspaceID+"-"+paneID)
 }
 
-func findManagedViews(tree []kittyOSWindow) map[string][]View {
-	result := map[string][]View{}
+func findWorkspaceViews(tree []kittyOSWindow, workspaceID string) (map[string]RuntimeView, []int64) {
+	result := map[string]RuntimeView{}
+	var untagged []int64
 	now := time.Now().UTC()
-	for _, osw := range tree {
-		for _, tab := range osw.Tabs {
-			for _, win := range tab.Windows {
-				id := win.UserVars["zka_session"]
-				if id == "" {
+	for _, osWindow := range tree {
+		for _, tab := range osWindow.Tabs {
+			for _, window := range tab.Windows {
+				workspace := window.UserVars["zka_workspace"]
+				pane := window.UserVars["zka_pane"]
+				if workspace == "" || pane == "" {
+					untagged = append(untagged, window.ID)
 					continue
 				}
-				result[id] = append(result[id], View{
-					WindowID: win.ID,
-					Attached: true,
-					Focused:  win.IsFocused || (tab.IsFocused && win.IsActive) || (osw.IsFocused && tab.IsActive && win.IsActive),
-					LastSeen: now,
-				})
+				if workspace != workspaceID {
+					continue
+				}
+				result[pane] = RuntimeView{
+					PaneID: pane, WindowID: window.ID, TabID: tab.ID, OSWindowID: osWindow.ID,
+					Focused: window.IsFocused || (tab.IsFocused && window.IsActive) || (osWindow.IsFocused && tab.IsActive && window.IsActive),
+					Ready:   window.UserVars["zka_ready"] == "1", LastSeen: now,
+				}
 			}
 		}
 	}
-	return result
+	return result, untagged
+}
+
+func topologyFromKitty(tree []kittyOSWindow, workspaceID string) ([]Node, error) {
+	var topology []Node
+	for _, osWindow := range tree {
+		osNode := Node{Kind: "os-window", State: osWindow.State, Class: osWindow.WMClass, Name: osWindow.WMName, Focused: osWindow.IsFocused}
+		for _, tab := range osWindow.Tabs {
+			tabNode := Node{Kind: "tab", Title: stripStateMarker(tab.Title), Layout: tab.Layout, EnabledLayouts: append([]string(nil), tab.Enabled...), LayoutState: append(json.RawMessage(nil), tab.LayoutState...), Active: tab.IsActive, Focused: tab.IsFocused}
+			for _, window := range tab.Windows {
+				if window.UserVars["zka_workspace"] != workspaceID {
+					return nil, fmt.Errorf("kitty window %d is not tagged for workspace %s", window.ID, workspaceID)
+				}
+				paneID := window.UserVars["zka_pane"]
+				if paneID == "" {
+					return nil, fmt.Errorf("kitty window %d has no zka_pane tag", window.ID)
+				}
+				tabNode.Children = append(tabNode.Children, Node{Kind: "pane", PaneID: paneID, Title: stripStateMarker(window.Title), CWD: window.CWD, Active: window.IsActive, Focused: window.IsFocused})
+			}
+			if len(tabNode.Children) > 0 {
+				osNode.Children = append(osNode.Children, tabNode)
+			}
+		}
+		if len(osNode.Children) > 0 {
+			topology = append(topology, osNode)
+		}
+	}
+	if len(topology) == 0 {
+		return nil, fmt.Errorf("kitty instance has no panes for workspace %s", workspaceID)
+	}
+	return topology, nil
 }
 
 func quoteKitty(value string) string {
 	value = strings.ReplaceAll(value, "\\", "\\\\")
 	value = strings.ReplaceAll(value, "\"", "\\\"")
 	value = strings.ReplaceAll(value, "$", "$$")
-	value = strings.NewReplacer("\r", " ", "\n", " ").Replace(value)
-	return "\"" + value + "\""
-}
-
-func kittyDirective(value string) string {
-	value = strings.ReplaceAll(value, "$", "$$")
-	return strings.NewReplacer("\r", " ", "\n", " ").Replace(value)
-}
-
-func quoteAction(value string) string {
-	value = strings.ReplaceAll(value, "\\", "\\\\")
-	value = strings.ReplaceAll(value, "\"", "\\\"")
 	value = strings.NewReplacer("\r", " ", "\n", " ").Replace(value)
 	return "\"" + value + "\""
 }

@@ -3,121 +3,153 @@ package zka
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 )
 
-func notificationTitle(session *Session) string {
-	switch session.State {
+func notificationTitle(workspace *Workspace, pane *Pane) string {
+	switch pane.State {
 	case StateBlocked:
-		return "zka: " + session.Name + " needs input"
+		return "zka: " + workspace.Name + " needs input"
 	case StateError:
-		return "zka: " + session.Name + " failed"
+		return "zka: " + workspace.Name + " failed"
 	case StateDone:
-		return "zka: " + session.Name + " finished"
+		return "zka: " + workspace.Name + " finished"
 	default:
-		return "zka: " + session.Name
+		return "zka: " + workspace.Name
 	}
 }
 
-func notificationBody(session *Session) string {
-	detail := session.Evidence.Detail
+func notificationBody(workspace *Workspace, pane *Pane) string {
+	detail := pane.Evidence.Detail
 	if detail == "" {
-		detail = session.Evidence.Event
+		detail = pane.Evidence.Event
 	}
-	host, err := os.Hostname()
-	if err != nil || host == "" {
-		host = "unknown"
-	}
-	return fmt.Sprintf("%s\nHost: %s\nSession: %s\nFocus: zka focus %s", detail, host, session.ID, session.ID)
+	return fmt.Sprintf("%s\nOrigin: %s\nWorkspace: %s\nPane: %s\nFocus: zka workspace focus %s --pane %s",
+		detail, workspace.Origin.Name, workspace.ID, pane.ID, workspace.ID, pane.ID)
 }
 
-func (d *Daemon) afterTransition(ctx context.Context, before AgentState, session *Session) {
-	if session.State == StateBlocked || session.State == StateError || session.State == StateDone {
+func (d *Daemon) afterTransition(ctx context.Context, before AgentState, workspace *Workspace, paneID string) {
+	pane := workspace.Panes[paneID]
+	if pane == nil {
+		return
+	}
+	if pane.State == StateBlocked || pane.State == StateError || pane.State == StateDone {
 		d.reconcile(ctx)
-		fresh, err := d.getSession(session.ID)
-		if err == nil {
-			session = fresh
+		if fresh, err := d.getWorkspace(workspace.ID); err == nil {
+			workspace = fresh
+			pane = fresh.Panes[paneID]
 		}
-		if session.State != StateBlocked && session.State != StateError && session.State != StateDone {
+		if pane == nil || (pane.State != StateBlocked && pane.State != StateError && pane.State != StateDone) {
 			return
 		}
 	}
-	d.updateKittyState(ctx, session)
-	if session.State != StateBlocked && session.State != StateError && session.State != StateDone {
-		d.closeDesktopNotifications(ctx, session)
+	d.updateKittyState(ctx, workspace)
+	if pane.State != StateBlocked && pane.State != StateError && pane.State != StateDone {
+		d.closeDesktopNotifications(ctx, workspace, paneID)
 		return
 	}
-	var attached *View
-	for _, view := range session.SortedViews() {
-		if view.Attached && !view.Focused {
-			v := view
-			attached = &v
-			break
-		}
+	if attachment, view := firstUnfocusedView(workspace, paneID); attachment != nil {
+		d.sendDesktop(ctx, attachment, view, workspace, pane)
 	}
-	if attached != nil {
-		d.sendDesktop(ctx, *attached, session)
-	}
-	important := session.State == StateBlocked || session.State == StateError || (session.State == StateDone && !session.AnyAttached())
+	important := pane.State == StateBlocked || pane.State == StateError || (pane.State == StateDone && !paneAttached(workspace, paneID))
 	if important {
-		d.sendNtfy(ctx, session)
+		d.sendNtfy(ctx, workspace, pane)
+	}
+	_ = before
+}
+
+func (d *Daemon) afterRemoteTransition(ctx context.Context, workspace *Workspace, paneID string) {
+	pane := workspace.Panes[paneID]
+	if pane == nil {
+		return
+	}
+	d.updateKittyState(ctx, workspace)
+	if pane.State != StateBlocked && pane.State != StateError && pane.State != StateDone {
+		d.closeDesktopNotifications(ctx, workspace, paneID)
+		return
+	}
+	if attachment, view := firstUnfocusedView(workspace, paneID); attachment != nil {
+		d.sendDesktop(ctx, attachment, view, workspace, pane)
 	}
 }
 
-func (d *Daemon) updateKittyState(ctx context.Context, session *Session) {
-	endpoints := map[string]bool{}
-	for _, view := range session.SortedViews() {
-		if !view.Attached {
+func paneAttached(workspace *Workspace, paneID string) bool {
+	for _, attachment := range workspace.Attachments {
+		if attachment.Status != AttachmentReady {
 			continue
 		}
-		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		err := d.kitty.SetState(callCtx, view.Endpoint, view.WindowID, session)
-		cancel()
-		if err != nil {
-			d.logger.Printf("update kitty state session=%s window=%d: %v", session.ID, view.WindowID, err)
+		if attachment.Transport.Kind == "ssh" && !clientHeartbeatFresh(attachment.ClientHeartbeats[paneID], time.Now().UTC()) {
+			continue
 		}
-		endpoints[view.Endpoint] = true
+		if view, ok := attachment.Views[paneID]; ok && view.Ready {
+			return true
+		}
 	}
-	for endpoint := range endpoints {
-		d.updateKittyTabTitles(ctx, endpoint)
+	return false
+}
+
+func firstUnfocusedView(workspace *Workspace, paneID string) (*Attachment, RuntimeView) {
+	for _, attachment := range workspace.SortedAttachments() {
+		if !strings.HasPrefix(attachment.Endpoint, "unix:") || attachment.Status == AttachmentDetached {
+			continue
+		}
+		if view, ok := attachment.Views[paneID]; ok && view.Ready && !view.Focused {
+			return attachment, view
+		}
+	}
+	return nil, RuntimeView{}
+}
+
+func (d *Daemon) updateKittyState(ctx context.Context, workspace *Workspace) {
+	for _, attachment := range workspace.SortedAttachments() {
+		if !strings.HasPrefix(attachment.Endpoint, "unix:") || attachment.Status == AttachmentDetached {
+			continue
+		}
+		for paneID, view := range attachment.Views {
+			pane := workspace.Panes[paneID]
+			if pane == nil || !view.Ready {
+				continue
+			}
+			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			err := d.kitty.SetPaneState(callCtx, attachment.Endpoint, view, workspace, pane)
+			cancel()
+			if err != nil {
+				d.logger.Printf("update kitty state workspace=%s pane=%s: %v", workspace.ID, paneID, err)
+			}
+		}
+		d.updateKittyTabTitles(ctx, attachment.Endpoint, workspace)
 	}
 }
 
-func (d *Daemon) updateKittyTabTitles(ctx context.Context, endpoint string) {
+func (d *Daemon) updateKittyTabTitles(ctx context.Context, endpoint string, workspace *Workspace) {
 	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	tree, err := d.kitty.List(callCtx, endpoint)
 	cancel()
 	if err != nil {
 		return
 	}
-	d.mu.Lock()
-	states := make(map[string]AgentState, len(d.state.Sessions))
-	for id, session := range d.state.Sessions {
-		states[id] = session.State
-	}
-	d.mu.Unlock()
-	for _, osw := range tree {
-		for _, tab := range osw.Tabs {
+	for _, osWindow := range tree {
+		for _, tab := range osWindow.Tabs {
 			highest := StateIdle
 			hasManaged := false
 			for _, window := range tab.Windows {
-				id := window.UserVars["zka_session"]
-				state, ok := states[id]
-				if !ok {
+				if window.UserVars["zka_workspace"] != workspace.ID {
+					continue
+				}
+				pane := workspace.Panes[window.UserVars["zka_pane"]]
+				if pane == nil {
 					continue
 				}
 				hasManaged = true
-				if statePriority(state) > statePriority(highest) {
-					highest = state
+				if statePriority(pane.State) > statePriority(highest) {
+					highest = pane.State
 				}
 			}
 			if !hasManaged {
 				continue
 			}
-			base := stripStateMarker(tab.Title)
-			title := strings.TrimSpace(stateMarker(highest) + " " + base)
+			title := strings.TrimSpace(stateMarker(highest) + " " + stripStateMarker(tab.Title))
 			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			_ = d.kitty.SetTabTitle(callCtx, endpoint, tab.ID, title)
 			cancel()
@@ -152,104 +184,123 @@ func stripStateMarker(title string) string {
 	return title
 }
 
-func (d *Daemon) sendDesktop(ctx context.Context, view View, session *Session) {
-	key := "kitty:" + string(session.State) + ":" + eventIdentity(session)
-	if !d.reserveNotification(session.ID, key, "kitty") {
+func (d *Daemon) sendDesktop(ctx context.Context, attachment *Attachment, view RuntimeView, workspace *Workspace, pane *Pane) {
+	key := "kitty:" + string(pane.State) + ":" + eventIdentity(pane)
+	if !d.reserveNotification(workspace.ID, pane.ID, key, "kitty") {
 		return
 	}
-	go func() {
-		choice, err := d.kitty.Notify(context.WithoutCancel(ctx), view, session)
+	d.startWorker(func(workerCtx context.Context) {
+		choice, err := d.kitty.Notify(workerCtx, view, attachment.Endpoint, workspace, pane)
 		if err != nil {
-			d.finishNotification(session.ID, key, err)
+			d.finishNotification(workspace.ID, pane.ID, key, err)
 			return
 		}
-		d.finishNotification(session.ID, key, nil)
+		d.finishNotification(workspace.ID, pane.ID, key, nil)
 		choice = strings.TrimSpace(choice)
 		if choice == "0" || choice == "1" {
-			focusCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_ = d.kitty.Focus(focusCtx, view.Endpoint, session.ID)
+			focusCtx, cancel := context.WithTimeout(workerCtx, 3*time.Second)
+			_ = d.kitty.FocusPane(focusCtx, attachment.Endpoint, workspace.ID, pane.ID)
+			if workspace.RemoteHost != "" {
+				_, _ = d.remotes.Call(focusCtx, workspace.RemoteHost, "seen", workspacePaneRequest{Workspace: workspace.ID, Pane: pane.ID})
+			} else {
+				_, _ = d.markSeen(workspace.ID, pane.ID)
+			}
 			cancel()
 		}
-	}()
+	})
+	_ = ctx
 }
 
-func (d *Daemon) closeDesktopNotifications(ctx context.Context, session *Session) {
-	for _, view := range session.SortedViews() {
-		if view.Endpoint != "" {
-			d.kitty.CloseNotification(ctx, view, session.ID)
+func (d *Daemon) closeDesktopNotifications(ctx context.Context, workspace *Workspace, paneRef string) {
+	for _, attachment := range workspace.Attachments {
+		if !strings.HasPrefix(attachment.Endpoint, "unix:") {
+			continue
+		}
+		for paneID := range workspace.Panes {
+			if paneRef != "" && paneID != paneRef {
+				continue
+			}
+			d.kitty.CloseNotification(ctx, attachment.Endpoint, workspace.ID, paneID)
 		}
 	}
 }
 
-func (d *Daemon) sendNtfy(ctx context.Context, session *Session) {
-	key := "ntfy:" + string(session.State) + ":" + eventIdentity(session)
-	if !d.reserveNotification(session.ID, key, "ntfy") {
+func (d *Daemon) sendNtfy(ctx context.Context, workspace *Workspace, pane *Pane) {
+	key := "ntfy:" + string(pane.State) + ":" + eventIdentity(pane)
+	if !d.reserveNotification(workspace.ID, pane.ID, key, "ntfy") {
 		return
 	}
 	priority, tag := "3", "white_check_mark"
-	if session.State == StateBlocked {
+	if pane.State == StateBlocked {
 		priority, tag = "5", "warning"
-	} else if session.State == StateError {
+	}
+	if pane.State == StateError {
 		priority, tag = "5", "rotating_light"
 	}
-	title, body := notificationTitle(session), notificationBody(session)
+	title, body := notificationTitle(workspace, pane), notificationBody(workspace, pane)
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		_, _, lastErr = d.runner.Run(callCtx, d.ntfyCommand, "-T", title, "-p", priority, "-g", tag, body)
+		callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, _, lastErr = d.runner.Run(callCtx, d.config.Notifications.NtfyCommand, "-T", title, "-p", priority, "-g", tag, body)
 		cancel()
-		if lastErr == nil {
+		if lastErr == nil || ctx.Err() != nil {
 			break
 		}
 		if attempt < 2 {
-			time.Sleep(time.Duration(attempt+1) * 250 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				break
+			case <-time.After(time.Duration(attempt+1) * 250 * time.Millisecond):
+			}
 		}
 	}
-	d.finishNotification(session.ID, key, lastErr)
-	if lastErr != nil {
-		d.logger.Printf("ntfy delivery failed session=%s: %v", session.ID, lastErr)
+	d.finishNotification(workspace.ID, pane.ID, key, lastErr)
+	if lastErr != nil && ctx.Err() == nil {
+		d.logger.Printf("ntfy delivery failed workspace=%s pane=%s: %v", workspace.ID, pane.ID, lastErr)
 	}
 }
 
-func eventIdentity(session *Session) string {
-	if session.LastTurnID != "" {
-		return session.LastTurnID
+func eventIdentity(pane *Pane) string {
+	if pane.LastTurnID != "" {
+		return pane.LastTurnID
 	}
-	return session.Evidence.Timestamp.Format(time.RFC3339Nano)
+	return pane.Evidence.Timestamp.Format(time.RFC3339Nano)
 }
 
-func (d *Daemon) reserveNotification(sessionID, key, channel string) bool {
+func (d *Daemon) reserveNotification(workspaceID, paneID, key, channel string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	session := d.state.Sessions[sessionID]
-	if session == nil {
+	workspace := d.state.Workspaces[workspaceID]
+	if workspace == nil || workspace.Panes[paneID] == nil {
 		return false
 	}
-	if session.Notifications == nil {
-		session.Notifications = map[string]NotificationRecord{}
+	pane := workspace.Panes[paneID]
+	if pane.Notifications == nil {
+		pane.Notifications = map[string]NotificationRecord{}
 	}
-	if _, exists := session.Notifications[key]; exists {
+	if _, exists := pane.Notifications[key]; exists {
 		return false
 	}
-	session.Notifications[key] = NotificationRecord{Key: key, Channel: channel}
+	pane.Notifications[key] = NotificationRecord{Key: key, Channel: channel}
 	_ = d.store.Save(d.state)
 	return true
 }
 
-func (d *Daemon) finishNotification(sessionID, key string, err error) {
+func (d *Daemon) finishNotification(workspaceID, paneID, key string, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	session := d.state.Sessions[sessionID]
-	if session == nil {
+	workspace := d.state.Workspaces[workspaceID]
+	if workspace == nil || workspace.Panes[paneID] == nil {
 		return
 	}
-	record := session.Notifications[key]
+	pane := workspace.Panes[paneID]
+	record := pane.Notifications[key]
 	if err != nil {
 		record.LastError = err.Error()
 	} else {
 		record.SentAt = time.Now().UTC()
 		record.LastError = ""
 	}
-	session.Notifications[key] = record
+	pane.Notifications[key] = record
 	_ = d.store.Save(d.state)
 }

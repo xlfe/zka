@@ -2,39 +2,62 @@ package zka
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 )
 
-func TestKittyLaunchUsesStableVariablesAndNoShell(t *testing.T) {
-	runner := &fakeRunner{handler: func(_ context.Context, _ string, _ ...string) (string, string, error) {
-		return "42\n", "", nil
-	}}
+func TestKittyFocusUsesStablePaneVariable(t *testing.T) {
+	runner := &fakeRunner{}
 	kitty := KittyClient{Runner: runner, Command: "kitten-test"}
-	id, err := kitty.Launch(context.Background(), LaunchOptions{Endpoint: "unix:/kitty", Type: "tab", CWD: "/work dir", Title: "Reviewer", SessionID: "abc", Backend: "zmx", State: StateIdle})
-	if err != nil {
+	if err := kitty.FocusPane(context.Background(), "unix:/kitty", "workspace", "pane"); err != nil {
 		t.Fatal(err)
 	}
-	if id != 42 {
-		t.Fatalf("id = %d", id)
-	}
 	calls := runner.Calls()
-	if len(calls) != 1 || calls[0].Name != "kitten-test" {
+	if len(calls) != 1 || calls[0].Name != "kitten-test" || !strings.Contains(strings.Join(calls[0].Args, "|"), "var:zka_pane=pane") {
 		t.Fatalf("calls = %#v", calls)
-	}
-	joined := strings.Join(calls[0].Args, "|")
-	for _, want := range []string{"zka_session=abc", "zka_backend=zmx", "ZKA_SESSION_ID=abc", "/work dir"} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("launch args missing %q: %#v", want, calls[0].Args)
-		}
 	}
 }
 
-func TestFindManagedViews(t *testing.T) {
-	tree := []kittyOSWindow{{IsFocused: true, Tabs: []kittyTab{{IsActive: true, Windows: []kittyWindow{{ID: 9, IsActive: true, UserVars: map[string]string{"zka_session": "abc"}}, {ID: 10, UserVars: map[string]string{}}}}}}}
-	views := findManagedViews(tree)
-	if len(views) != 1 || len(views["abc"]) != 1 || !views["abc"][0].Focused {
-		t.Fatalf("views = %#v", views)
+func TestFindWorkspaceViewsKeepsRuntimeIDsInAttachment(t *testing.T) {
+	tree := []kittyOSWindow{{ID: 1, IsFocused: true, Tabs: []kittyTab{{ID: 2, IsActive: true, Windows: []kittyWindow{
+		{ID: 9, IsActive: true, UserVars: map[string]string{"zka_workspace": "work", "zka_pane": "pane"}},
+		{ID: 10, UserVars: map[string]string{}},
+	}}}}}
+	views, untagged := findWorkspaceViews(tree, "work")
+	if len(views) != 1 || !views["pane"].Focused || views["pane"].Ready || views["pane"].TabID != 2 || len(untagged) != 1 || untagged[0] != 10 {
+		t.Fatalf("views=%#v untagged=%#v", views, untagged)
+	}
+	tree[0].Tabs[0].Windows[0].UserVars["zka_ready"] = "1"
+	views, _ = findWorkspaceViews(tree, "work")
+	if !views["pane"].Ready {
+		t.Fatalf("explicitly ready view = %#v", views["pane"])
+	}
+}
+
+func TestTopologyHasLogicalIDsOnly(t *testing.T) {
+	tree := []kittyOSWindow{
+		{ID: 41, Tabs: []kittyTab{
+			{ID: 42, Title: "[!] Work", Layout: "splits", Windows: []kittyWindow{
+				{ID: 43, Title: "[✓] Pane", CWD: "/work", UserVars: map[string]string{"zka_workspace": "work", "zka_pane": "pane"}},
+			}},
+		}},
+	}
+	topology, err := topologyFromKitty(tree, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := topology[0].Children[0].Children[0].PaneID; got != "pane" {
+		t.Fatalf("pane id = %q", got)
+	}
+	if topology[0].Children[0].Title != "Work" || topology[0].Children[0].Children[0].Title != "Pane" {
+		t.Fatalf("attention marker leaked into topology: %#v", topology)
+	}
+	encoded := mustJSON(t, topology)
+	for _, runtimeID := range []string{`"id":41`, `"id":42`, `"id":43`, `window_id`} {
+		if strings.Contains(encoded, runtimeID) {
+			t.Fatalf("topology leaked runtime id: %s", encoded)
+		}
 	}
 }
 
@@ -45,9 +68,11 @@ func TestQuoteKitty(t *testing.T) {
 	}
 }
 
-func TestKittyDirectiveIsUnquotedAndExpansionSafe(t *testing.T) {
-	got := kittyDirective("$project\nnext")
-	if got != "$$project next" {
-		t.Fatalf("directive = %q", got)
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	b, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return string(b)
 }

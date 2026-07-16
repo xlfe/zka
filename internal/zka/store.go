@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 type Store struct {
@@ -16,18 +17,20 @@ type Store struct {
 func NewStore(paths Paths) *Store { return &Store{paths: paths} }
 
 func (s *Store) Ensure() error {
-	if err := os.MkdirAll(s.paths.StateDir, 0o700); err != nil {
-		return fmt.Errorf("create state directory: %w", err)
-	}
-	if err := os.Chmod(s.paths.StateDir, 0o700); err != nil {
-		return fmt.Errorf("secure state directory: %w", err)
-	}
-	if err := os.MkdirAll(s.paths.SnapshotDir, 0o700); err != nil {
-		return fmt.Errorf("create snapshot directory: %w", err)
+	for _, dir := range []string{s.paths.StateDir, s.paths.GeneratedDir, s.paths.AttachmentDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create directory %s: %w", dir, err)
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("secure directory %s: %w", dir, err)
+		}
 	}
 	return nil
 }
 
+// Load intentionally treats schema v1 as empty state. v1 represented
+// user-visible process sessions and cannot be truthfully migrated into Kitty
+// workspaces. NewDaemon immediately writes the replacement schema v2 state.
 func (s *Store) Load() (StateData, error) {
 	if err := s.Ensure(); err != nil {
 		return StateData{}, err
@@ -39,17 +42,64 @@ func (s *Store) Load() (StateData, error) {
 	if err != nil {
 		return StateData{}, fmt.Errorf("read state: %w", err)
 	}
+	var header struct {
+		SchemaVersion int `json:"schema_version"`
+	}
+	if err := json.Unmarshal(b, &header); err != nil {
+		return StateData{}, fmt.Errorf("decode state header: %w", err)
+	}
+	if header.SchemaVersion == 1 {
+		if err := os.RemoveAll(filepath.Join(s.paths.StateDir, "snapshots")); err != nil {
+			return StateData{}, fmt.Errorf("reset v1 snapshots: %w", err)
+		}
+		if err := os.RemoveAll(s.paths.GeneratedDir); err != nil {
+			return StateData{}, fmt.Errorf("reset generated v1 files: %w", err)
+		}
+		if err := os.MkdirAll(s.paths.GeneratedDir, 0o700); err != nil {
+			return StateData{}, fmt.Errorf("reset generated workspace files: %w", err)
+		}
+		return newStateData(), nil
+	}
+	if header.SchemaVersion != stateSchemaVersion {
+		return StateData{}, fmt.Errorf("unsupported state schema %d (want %d)", header.SchemaVersion, stateSchemaVersion)
+	}
 	var state StateData
 	if err := json.Unmarshal(b, &state); err != nil {
 		return StateData{}, fmt.Errorf("decode state: %w", err)
 	}
-	if state.SchemaVersion != stateSchemaVersion {
-		return StateData{}, fmt.Errorf("unsupported state schema %d (want %d)", state.SchemaVersion, stateSchemaVersion)
+	if state.Workspaces == nil {
+		state.Workspaces = map[string]*Workspace{}
 	}
-	if state.Sessions == nil {
-		state.Sessions = map[string]*Session{}
+	if state.Remotes == nil {
+		state.Remotes = map[string]*RemoteCache{}
+	}
+	for _, workspace := range state.Workspaces {
+		normalizeWorkspace(workspace)
 	}
 	return state, nil
+}
+
+func normalizeWorkspace(workspace *Workspace) {
+	if workspace.Panes == nil {
+		workspace.Panes = map[string]*Pane{}
+	}
+	if workspace.Attachments == nil {
+		workspace.Attachments = map[string]*Attachment{}
+	}
+	for _, pane := range workspace.Panes {
+		if pane.Notifications == nil {
+			pane.Notifications = map[string]NotificationRecord{}
+		}
+	}
+	for _, attachment := range workspace.Attachments {
+		if attachment.Views == nil {
+			attachment.Views = map[string]RuntimeView{}
+		}
+		if attachment.ClientHeartbeats == nil {
+			attachment.ClientHeartbeats = map[string]time.Time{}
+		}
+	}
+	workspace.RecomputeAttention()
 }
 
 func (s *Store) Save(state StateData) error {
@@ -65,51 +115,23 @@ func (s *Store) Save(state StateData) error {
 	return atomicWrite(s.paths.StateFile, b, 0o600)
 }
 
-func (s *Store) SnapshotPath(name string) string {
-	return filepath.Join(s.paths.SnapshotDir, name+".json")
+func (s *Store) SessionPath(workspaceID, suffix string) string {
+	name := shortID(workspaceID)
+	if suffix != "" {
+		name += "-" + suffix
+	}
+	return filepath.Join(s.paths.GeneratedDir, name+".kitty-session")
 }
 
-func (s *Store) SaveSnapshot(snapshot Snapshot, output string) (string, error) {
-	if err := validateSnapshotName(snapshot.Name); err != nil {
-		return "", err
-	}
+func (s *Store) WriteSession(workspaceID, suffix, content string) (string, error) {
 	if err := s.Ensure(); err != nil {
 		return "", err
 	}
-	if output == "" {
-		output = s.SnapshotPath(snapshot.Name)
-	}
-	b, err := json.MarshalIndent(snapshot, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("encode snapshot: %w", err)
-	}
-	b = append(b, '\n')
-	if output == "-" {
-		return string(b), nil
-	}
-	if err := atomicWrite(output, b, 0o600); err != nil {
+	path := s.SessionPath(workspaceID, suffix)
+	if err := atomicWrite(path, []byte(content), 0o600); err != nil {
 		return "", err
 	}
-	return output, nil
-}
-
-func (s *Store) LoadSnapshot(nameOrPath string) (Snapshot, string, error) {
-	path := nameOrPath
-	if filepath.Ext(path) == "" && filepath.Base(path) == path {
-		path = s.SnapshotPath(path)
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return Snapshot{}, path, fmt.Errorf("read snapshot: %w", err)
-	}
-	var snapshot Snapshot
-	if err := json.Unmarshal(b, &snapshot); err != nil {
-		return Snapshot{}, path, fmt.Errorf("decode snapshot: %w", err)
-	}
-	if snapshot.SchemaVersion != snapshotSchemaVersion {
-		return Snapshot{}, path, fmt.Errorf("unsupported snapshot schema %d", snapshot.SchemaVersion)
-	}
-	return snapshot, path, nil
+	return path, nil
 }
 
 func atomicWrite(path string, data []byte, mode fs.FileMode) error {
@@ -144,8 +166,7 @@ func atomicWrite(path string, data []byte, mode fs.FileMode) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("replace %s: %w", path, err)
 	}
-	d, err := os.Open(dir)
-	if err == nil {
+	if d, err := os.Open(dir); err == nil {
 		_ = d.Sync()
 		_ = d.Close()
 	}

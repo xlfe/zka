@@ -2,27 +2,20 @@ package zka
 
 import (
 	"bytes"
-	"context"
-	"os"
 	"strings"
 	"testing"
 )
 
-func TestCodexHookMapsUserPrompt(t *testing.T) {
-	root := t.TempDir()
-	d, err := newTestDaemon(root, quietRunner())
+func TestCodexHookMapsUserPromptToHiddenPane(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = d.Serve(ctx) }()
-	waitFor(t, func() bool {
-		_, err := os.Stat(d.paths.Socket)
-		return err == nil
-	})
-	session := createTestSession(t, d)
-	t.Setenv("ZKA_SESSION_ID", session.ID)
+	serveTestDaemon(t, d)
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	t.Setenv("ZKA_WORKSPACE_ID", workspace.ID)
+	t.Setenv("ZKA_PANE_ID", pane.ID)
 	input := `{"session_id":"codex-id","turn_id":"turn-7","hook_event_name":"UserPromptSubmit"}`
 	var output bytes.Buffer
 	code, err := runHook([]string{"codex"}, d.paths, strings.NewReader(input), &output)
@@ -30,36 +23,36 @@ func TestCodexHookMapsUserPrompt(t *testing.T) {
 		t.Fatalf("runHook = %d, %v", code, err)
 	}
 	if output.String() != "{}\n" {
-		t.Fatalf("unexpected hook output %q", output.String())
+		t.Fatalf("hook output = %q", output.String())
 	}
-	got, err := d.getSession(session.ID)
+	got, err := d.getWorkspace(workspace.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != StateWorking || got.LastTurnID != "turn-7" || got.Evidence.Source != "codex-hook" {
-		t.Fatalf("hook state = %#v", got)
+	reported := got.Panes[pane.ID]
+	if reported.State != StateWorking || reported.LastTurnID != "turn-7" || reported.Evidence.Source != "codex-hook" {
+		t.Fatalf("hook state = %#v", reported)
 	}
 }
 
-func TestCodexHookWithoutZKASessionIsNoop(t *testing.T) {
-	t.Setenv("ZKA_SESSION_ID", "")
+func TestCodexHookWithoutManagedPaneIsNoop(t *testing.T) {
+	t.Setenv("ZKA_WORKSPACE_ID", "")
+	t.Setenv("ZKA_PANE_ID", "")
 	var output bytes.Buffer
 	code, err := runHook([]string{"codex"}, testPaths(t.TempDir()), strings.NewReader(`{"hook_event_name":"Stop"}`), &output)
-	if err != nil || code != 0 {
-		t.Fatalf("runHook = %d, %v", code, err)
-	}
-	if output.String() != "{}\n" {
-		t.Fatalf("unexpected hook output %q", output.String())
+	if err != nil || code != 0 || output.String() != "{}\n" {
+		t.Fatalf("hook = %d, %v, %q", code, err, output.String())
 	}
 }
 
-func TestManagedHookDoesNotRequireRuntimeForUnmanagedSession(t *testing.T) {
-	t.Setenv("ZKA_SESSION_ID", "")
+func TestManagedHookDoesNotRequireRuntimeForUnmanagedShell(t *testing.T) {
+	t.Setenv("ZKA_WORKSPACE_ID", "")
+	t.Setenv("ZKA_PANE_ID", "")
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv("ZKA_RUNTIME_DIR", "")
 	var stdout, stderr bytes.Buffer
 	code, err := Run([]string{"hook", "codex"}, strings.NewReader(`{"hook_event_name":"Stop"}`), &stdout, &stderr)
 	if err != nil || code != 0 || stdout.String() != "{}\n" || stderr.Len() != 0 {
-		t.Fatalf("Run hook = code %d, err %v, stdout %q, stderr %q", code, err, stdout.String(), stderr.String())
+		t.Fatalf("Run hook = %d, %v, %q, %q", code, err, stdout.String(), stderr.String())
 	}
 }

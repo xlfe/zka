@@ -7,11 +7,13 @@ import (
 )
 
 type Paths struct {
-	StateDir    string
-	RuntimeDir  string
-	StateFile   string
-	SnapshotDir string
-	Socket      string
+	StateDir      string
+	RuntimeDir    string
+	StateFile     string
+	GeneratedDir  string
+	AttachmentDir string
+	Socket        string
+	WatcherSocket string
 }
 
 func DefaultPaths() (Paths, error) {
@@ -45,10 +47,12 @@ func DefaultPaths() (Paths, error) {
 		}
 	}
 	return Paths{
-		StateDir:    stateDir,
-		RuntimeDir:  runtimeDir,
-		StateFile:   filepath.Join(stateDir, "state.json"),
-		SnapshotDir: filepath.Join(stateDir, "snapshots"),
-		Socket:      socket,
+		StateDir:      stateDir,
+		RuntimeDir:    runtimeDir,
+		StateFile:     filepath.Join(stateDir, "state.json"),
+		GeneratedDir:  filepath.Join(stateDir, "generated"),
+		AttachmentDir: filepath.Join(runtimeDir, "kitty"),
+		Socket:        socket,
+		WatcherSocket: filepath.Join(runtimeDir, "watcher.sock"),
 	}, nil
 }

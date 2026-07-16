@@ -2,65 +2,43 @@ package zka
 
 import (
 	"context"
-	"os"
 	"testing"
-	"time"
 )
 
 func TestDaemonProtocolRoundTrip(t *testing.T) {
-	root := t.TempDir()
-	d, err := newTestDaemon(root, quietRunner())
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- d.Serve(ctx) }()
-	waitFor(t, func() bool {
-		_, err := os.Stat(d.paths.Socket)
-		return err == nil
-	})
+	serveTestDaemon(t, d)
 	api := NewAPI(d.paths)
 	if _, err := api.Ping(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	session, err := api.CreateSession(context.Background(), createSessionRequest{Name: "one", Command: []string{"codex"}, CWD: "/work"})
+	workspace, err := api.CreateWorkspace(context.Background(), createWorkspaceRequest{Name: "one", Shell: []string{"fish"}, Panes: []PaneSpec{{CWD: "/work"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := api.Session(context.Background(), "one")
+	got, err := api.Workspace(context.Background(), "one")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != session.ID {
-		t.Fatalf("session ids differ: %s != %s", got.ID, session.ID)
+	if got.ID != workspace.ID || len(got.Panes) != 1 {
+		t.Fatalf("workspace = %#v", got)
 	}
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("daemon did not stop")
+	node, err := api.Node(context.Background())
+	if err != nil || node.ID == "" {
+		t.Fatalf("node = %#v, %v", node, err)
 	}
 }
 
 func TestProtocolRejectsUnknownOperation(t *testing.T) {
-	root := t.TempDir()
-	d, err := newTestDaemon(root, quietRunner())
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = d.Serve(ctx) }()
-	waitFor(t, func() bool {
-		_, err := os.Stat(d.paths.Socket)
-		return err == nil
-	})
-	client := Client{Socket: d.paths.Socket}
-	if err := client.Call(context.Background(), "nope", nil, nil); err == nil {
+	serveTestDaemon(t, d)
+	if err := (Client{Socket: d.paths.Socket}).Call(context.Background(), "nope", nil, nil); err == nil {
 		t.Fatal("unknown operation succeeded")
 	}
 }

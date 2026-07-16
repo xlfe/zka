@@ -21,7 +21,7 @@
         rec {
           zka = pkgs.buildGoModule {
             pname = "zka";
-            version = "0.1.0";
+            version = "0.2.0";
             src = ./.;
             vendorHash = null;
             subPackages = [ "cmd/zka" ];
@@ -37,6 +37,7 @@
             postInstall = ''
               mkdir -p "$out/libexec/zka/hooks"
               ln "$out/bin/zka" "$out/libexec/zka/hooks/zka"
+              install -Dm0444 kitty/watcher.py "$out/share/zka/kitty-watcher.py"
             '';
           };
           default = zka;
@@ -64,9 +65,13 @@
           package = self.packages.${system}.zka;
           module = pkgs.runCommand "zka-module-check" {
             execStart = service.serviceConfig.ExecStart;
+            runtimeConfig = service.environment.ZKA_CONFIG;
             inherit requirements;
           } ''
             test -n "$execStart"
+            grep -q '"fish"' "$runtimeConfig"
+            grep -q 'ServerAliveInterval=5' "$runtimeConfig"
+            grep -q 'kitty-watcher.py' "$runtimeConfig"
             grep -q 'hook codex' "$requirements"
             grep -q 'managed_dir' "$requirements"
             touch "$out"

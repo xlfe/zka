@@ -8,6 +8,7 @@
 let
   cfg = config.services.zka;
   toml = pkgs.formats.toml { };
+  json = pkgs.formats.json { };
   hookCommand = "${cfg.package}/libexec/zka/hooks/zka hook codex";
   hook = {
     hooks = [
@@ -35,7 +36,6 @@ let
       Stop = [ hook ];
     };
   };
-  # zka's hook and feature keys are reserved; its values win on collision.
   requirements = lib.recursiveUpdate cfg.codex.extraRequirements zkaRequirements;
   requirementsFile = toml.generate "zka-codex-requirements.toml" requirements;
   reservedRequirementPaths = [
@@ -47,10 +47,38 @@ let
     [ "hooks" "PostToolUse" ]
     [ "hooks" "Stop" ]
   ];
+  zmxCommand =
+    if cfg.zmx.package == null then
+      "zmx"
+    else
+      "${cfg.zmx.package}/bin/zmx";
+  runtimeConfig = json.generate "zka-config.json" {
+    shell.command = cfg.shell.command;
+    kitty = {
+      command = "${cfg.kitty.package}/bin/kitty";
+      kitten_command = "${cfg.kitty.package}/bin/kitten";
+      watcher = toString cfg.kitty.watcher;
+      extra_args = cfg.kitty.extraArgs;
+    };
+    zmx.command = zmxCommand;
+    ssh = {
+      command = "${cfg.ssh.package}/bin/ssh";
+      options = cfg.ssh.options;
+    };
+    notifications.ntfy_command = cfg.notifications.ntfyCommand;
+  };
+  servicePath = [
+    cfg.package
+    cfg.shell.package
+    cfg.kitty.package
+    cfg.ssh.package
+  ]
+  ++ lib.optional (cfg.zmx.package != null) cfg.zmx.package
+  ++ cfg.extraPackages;
 in
 {
   options.services.zka = {
-    enable = lib.mkEnableOption "zka persistent coding-agent orchestration";
+    enable = lib.mkEnableOption "zka Kitty workspace orchestration";
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -59,12 +87,54 @@ in
       description = "The zka package to run.";
     };
 
-    kittyPackage = lib.mkPackageOption pkgs "kitty" { };
+    shell = {
+      package = lib.mkPackageOption pkgs "fish" { };
 
-    zmxPackage = lib.mkOption {
+      command = lib.mkOption {
+        type = lib.types.nonEmptyListOf lib.types.str;
+        default = [ "fish" ];
+        description = "Command started inside each new zmx-backed workspace pane.";
+      };
+    };
+
+    kitty = {
+      package = lib.mkPackageOption pkgs "kitty" { };
+
+      extraArgs = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Additional safe options passed to every dedicated managed Kitty process.";
+      };
+
+      watcher = lib.mkOption {
+        type = lib.types.path;
+        default = "${cfg.package}/share/zka/kitty-watcher.py";
+        defaultText = lib.literalExpression ''"\${config.services.zka.package}/share/zka/kitty-watcher.py"'';
+        description = "Global Kitty watcher used to trigger authoritative topology captures.";
+      };
+    };
+
+    zmx.package = lib.mkOption {
       type = lib.types.nullOr lib.types.package;
       default = null;
-      description = "Optional zmx package added to the user service PATH; leave null when supplied system-wide.";
+      description = "Optional zmx package; leave null when zmx is supplied system-wide.";
+    };
+
+    ssh = {
+      package = lib.mkPackageOption pkgs "openssh" { };
+
+      options = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [
+          "-o"
+          "ServerAliveInterval=5"
+          "-o"
+          "ServerAliveCountMax=3"
+          "-o"
+          "BatchMode=yes"
+        ];
+        description = "OpenSSH options used for remote workspace control and pane attachment.";
+      };
     };
 
     extraPackages = lib.mkOption {
@@ -103,31 +173,19 @@ in
         }
       ];
 
-      environment.systemPackages =
-        [
-          cfg.package
-          cfg.kittyPackage
-        ]
-        ++ lib.optional (cfg.zmxPackage != null) cfg.zmxPackage
-        ++ cfg.extraPackages;
+      environment.systemPackages = servicePath;
+      environment.sessionVariables.ZKA_CONFIG = runtimeConfig;
 
       systemd.user.services.zkad = {
-        description = "zka coding-agent session daemon";
+        description = "zka Kitty workspace daemon";
         wantedBy = [ "default.target" ];
-        path =
-          [
-            cfg.package
-            cfg.kittyPackage
-          ]
-          ++ lib.optional (cfg.zmxPackage != null) cfg.zmxPackage
-          ++ cfg.extraPackages;
-        environment = {
-          ZKA_NTFY_COMMAND = cfg.notifications.ntfyCommand;
-        };
+        path = servicePath;
+        environment.ZKA_CONFIG = runtimeConfig;
         serviceConfig = {
           ExecStart = "${cfg.package}/bin/zka daemon";
           Restart = "on-failure";
           RestartSec = 1;
+          TimeoutStopSec = 15;
           UMask = "0077";
           NoNewPrivileges = true;
         };

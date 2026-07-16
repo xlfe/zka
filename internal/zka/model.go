@@ -1,18 +1,20 @@
 package zka
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 )
 
 const (
-	stateSchemaVersion    = 1
-	snapshotSchemaVersion = 1
-	protocolVersion       = 1
+	stateSchemaVersion = 2
+	protocolVersion    = 2
+	remoteProtocolName = "zka.workspace"
+	remoteProtocolMax  = 1 << 20
 )
 
 type AgentState string
@@ -33,6 +35,34 @@ func (s AgentState) Valid() bool {
 	default:
 		return false
 	}
+}
+
+type AttachmentRole string
+
+const (
+	AttachmentPrimary AttachmentRole = "primary"
+	AttachmentMirror  AttachmentRole = "mirror"
+)
+
+type AttachmentStatus string
+
+const (
+	AttachmentPreparing AttachmentStatus = "preparing"
+	AttachmentReady     AttachmentStatus = "ready"
+	AttachmentUnhealthy AttachmentStatus = "unhealthy"
+	AttachmentDetached  AttachmentStatus = "detached"
+)
+
+type Transport struct {
+	Kind string `json:"kind"` // local or ssh
+	Host string `json:"host,omitempty"`
+}
+
+type Host struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	SSHHost  string `json:"ssh_host,omitempty"`
+	Platform string `json:"platform,omitempty"`
 }
 
 type BackendRef struct {
@@ -56,16 +86,6 @@ type ProcessStatus struct {
 	Exited   time.Time `json:"exited_at,omitempty"`
 }
 
-type View struct {
-	Endpoint string    `json:"endpoint"`
-	WindowID int64     `json:"window_id"`
-	Attached bool      `json:"attached"`
-	Focused  bool      `json:"focused"`
-	LastSeen time.Time `json:"last_seen"`
-}
-
-func (v View) Key() string { return fmt.Sprintf("%s#%d", v.Endpoint, v.WindowID) }
-
 type NotificationRecord struct {
 	Key       string    `json:"key"`
 	Channel   string    `json:"channel"`
@@ -73,18 +93,21 @@ type NotificationRecord struct {
 	LastError string    `json:"last_error,omitempty"`
 }
 
-type Session struct {
+// Pane is the durable identity of one Kitty terminal pane and its hidden zmx
+// PTY. Foreground programs are never stored as restore commands.
+type Pane struct {
 	ID             string                        `json:"id"`
-	Name           string                        `json:"name"`
+	AllocationKey  string                        `json:"allocation_key,omitempty"`
+	Position       int                           `json:"position"`
 	Backend        BackendRef                    `json:"backend"`
-	Agent          string                        `json:"agent"`
-	Command        []string                      `json:"command"`
-	CWD            string                        `json:"cwd"`
+	CWD            string                        `json:"cwd,omitempty"`
+	Title          string                        `json:"title,omitempty"`
+	Visible        bool                          `json:"visible"`
+	Agent          string                        `json:"agent,omitempty"`
 	State          AgentState                    `json:"state"`
 	Evidence       Evidence                      `json:"evidence"`
 	LastTurnID     string                        `json:"last_turn_id,omitempty"`
 	Process        ProcessStatus                 `json:"process"`
-	Views          map[string]View               `json:"views,omitempty"`
 	Notifications  map[string]NotificationRecord `json:"notifications,omitempty"`
 	BackendCreated bool                          `json:"backend_created"`
 	BackendReady   bool                          `json:"backend_ready"`
@@ -93,98 +116,187 @@ type Session struct {
 	UpdatedAt      time.Time                     `json:"updated_at"`
 }
 
-func (s *Session) Clone() *Session {
-	b, _ := json.Marshal(s)
-	var out Session
+func (p *Pane) Clone() *Pane {
+	b, _ := json.Marshal(p)
+	var out Pane
 	_ = json.Unmarshal(b, &out)
 	return &out
 }
 
-func (s *Session) AnyAttached() bool {
-	for _, v := range s.Views {
-		if v.Attached {
-			return true
-		}
-	}
-	return false
+// Node is a logical Kitty topology node. It intentionally has no Kitty
+// runtime IDs; those belong to Attachment.Views.
+type Node struct {
+	Kind           string          `json:"kind"` // os-window, tab, or pane
+	PaneID         string          `json:"pane_id,omitempty"`
+	Title          string          `json:"title,omitempty"`
+	CWD            string          `json:"cwd,omitempty"`
+	State          string          `json:"state,omitempty"`
+	Class          string          `json:"class,omitempty"`
+	Name           string          `json:"name,omitempty"`
+	Layout         string          `json:"layout,omitempty"`
+	EnabledLayouts []string        `json:"enabled_layouts,omitempty"`
+	LayoutState    json.RawMessage `json:"layout_state,omitempty"`
+	Active         bool            `json:"active,omitempty"`
+	Focused        bool            `json:"focused,omitempty"`
+	Children       []Node          `json:"children,omitempty"`
 }
 
-func (s *Session) AnyFocused() bool {
-	for _, v := range s.Views {
-		if v.Attached && v.Focused {
-			return true
-		}
-	}
-	return false
+type Manifest struct {
+	KittyVersion string    `json:"kitty_version,omitempty"`
+	CapturedAt   time.Time `json:"captured_at,omitempty"`
+	Session      string    `json:"session"`
+	Topology     []Node    `json:"topology"`
 }
 
-func (s *Session) SortedViews() []View {
-	views := make([]View, 0, len(s.Views))
-	for _, v := range s.Views {
-		views = append(views, v)
+type RuntimeView struct {
+	PaneID     string    `json:"pane_id"`
+	WindowID   int64     `json:"window_id"`
+	TabID      int64     `json:"tab_id,omitempty"`
+	OSWindowID int64     `json:"os_window_id,omitempty"`
+	Focused    bool      `json:"focused"`
+	Ready      bool      `json:"ready"`
+	LastSeen   time.Time `json:"last_seen"`
+}
+
+type Attachment struct {
+	ID               string                 `json:"id"`
+	Node             Host                   `json:"node"`
+	Transport        Transport              `json:"transport"`
+	Role             AttachmentRole         `json:"role"`
+	Status           AttachmentStatus       `json:"status"`
+	Endpoint         string                 `json:"endpoint,omitempty"`
+	PID              int                    `json:"pid,omitempty"`
+	AppliedRevision  uint64                 `json:"applied_revision"`
+	Views            map[string]RuntimeView `json:"views,omitempty"`
+	ClientHeartbeats map[string]time.Time   `json:"client_heartbeats,omitempty"`
+	LastError        string                 `json:"last_error,omitempty"`
+	CreatedAt        time.Time              `json:"created_at"`
+	UpdatedAt        time.Time              `json:"updated_at"`
+	Revoked          bool                   `json:"revoked,omitempty"`
+	RevocationClosed bool                   `json:"revocation_closed,omitempty"`
+}
+
+func (a *Attachment) Clone() *Attachment {
+	b, _ := json.Marshal(a)
+	var out Attachment
+	_ = json.Unmarshal(b, &out)
+	return &out
+}
+
+func (a *Attachment) SortedViews() []RuntimeView {
+	views := make([]RuntimeView, 0, len(a.Views))
+	for _, view := range a.Views {
+		views = append(views, view)
 	}
-	sort.Slice(views, func(i, j int) bool {
-		if views[i].Endpoint == views[j].Endpoint {
-			return views[i].WindowID < views[j].WindowID
-		}
-		return views[i].Endpoint < views[j].Endpoint
-	})
+	sort.Slice(views, func(i, j int) bool { return views[i].PaneID < views[j].PaneID })
 	return views
 }
 
+type Workspace struct {
+	ID                  string                 `json:"id"`
+	Name                string                 `json:"name"`
+	Origin              Host                   `json:"origin"`
+	RemoteHost          string                 `json:"remote_host,omitempty"`
+	Revision            uint64                 `json:"revision"`
+	Shell               []string               `json:"shell"`
+	Panes               map[string]*Pane       `json:"panes"`
+	Manifest            Manifest               `json:"manifest"`
+	Attachments         map[string]*Attachment `json:"attachments"`
+	PrimaryAttachmentID string                 `json:"primary_attachment_id,omitempty"`
+	PendingRevocations  []string               `json:"pending_revocations,omitempty"`
+	Attention           AgentState             `json:"attention"`
+	CreatedAt           time.Time              `json:"created_at"`
+	UpdatedAt           time.Time              `json:"updated_at"`
+}
+
+func (w *Workspace) Clone() *Workspace {
+	b, _ := json.Marshal(w)
+	var out Workspace
+	_ = json.Unmarshal(b, &out)
+	return &out
+}
+
+func (w *Workspace) RecomputeAttention() AgentState {
+	state := StateIdle
+	if len(w.Panes) == 0 {
+		state = StateUnknown
+	}
+	for _, pane := range w.Panes {
+		if statePriority(pane.State) > statePriority(state) {
+			state = pane.State
+		}
+	}
+	w.Attention = state
+	return state
+}
+
+func (w *Workspace) SortedPanes() []*Pane {
+	panes := make([]*Pane, 0, len(w.Panes))
+	for _, pane := range w.Panes {
+		panes = append(panes, pane.Clone())
+	}
+	sort.Slice(panes, func(i, j int) bool {
+		if panes[i].Position != panes[j].Position {
+			return panes[i].Position < panes[j].Position
+		}
+		if panes[i].CreatedAt.Equal(panes[j].CreatedAt) {
+			return panes[i].ID < panes[j].ID
+		}
+		return panes[i].CreatedAt.Before(panes[j].CreatedAt)
+	})
+	return panes
+}
+
+func (w *Workspace) SortedAttachments() []*Attachment {
+	attachments := make([]*Attachment, 0, len(w.Attachments))
+	for _, attachment := range w.Attachments {
+		attachments = append(attachments, attachment.Clone())
+	}
+	sort.Slice(attachments, func(i, j int) bool { return attachments[i].ID < attachments[j].ID })
+	return attachments
+}
+
+type RemoteCache struct {
+	Host       string                `json:"host"`
+	Workspaces map[string]*Workspace `json:"workspaces"`
+	UpdatedAt  time.Time             `json:"updated_at,omitempty"`
+	LastError  string                `json:"last_error,omitempty"`
+}
+
 type StateData struct {
-	SchemaVersion int                 `json:"schema_version"`
-	Sessions      map[string]*Session `json:"sessions"`
+	SchemaVersion int                     `json:"schema_version"`
+	Node          Host                    `json:"node"`
+	Workspaces    map[string]*Workspace   `json:"workspaces"`
+	Remotes       map[string]*RemoteCache `json:"remotes,omitempty"`
 }
 
 func newStateData() StateData {
-	return StateData{SchemaVersion: stateSchemaVersion, Sessions: map[string]*Session{}}
-}
-
-type Snapshot struct {
-	SchemaVersion int                `json:"schema_version"`
-	Name          string             `json:"name"`
-	CreatedAt     time.Time          `json:"created_at"`
-	KittyVersion  string             `json:"kitty_version,omitempty"`
-	Source        string             `json:"source"`
-	NativeSession string             `json:"native_session,omitempty"`
-	OSWindows     []SnapshotOSWindow `json:"os_windows"`
-}
-
-type SnapshotOSWindow struct {
-	State   string        `json:"state,omitempty"`
-	Class   string        `json:"class,omitempty"`
-	Name    string        `json:"window_name,omitempty"`
-	Focused bool          `json:"focused,omitempty"`
-	Tabs    []SnapshotTab `json:"tabs"`
-}
-
-type SnapshotTab struct {
-	Title       string          `json:"title"`
-	Layout      string          `json:"layout"`
-	Enabled     []string        `json:"enabled_layouts,omitempty"`
-	LayoutState json.RawMessage `json:"layout_state,omitempty"`
-	Active      bool            `json:"active,omitempty"`
-	Views       []SnapshotView  `json:"views"`
-}
-
-type SnapshotView struct {
-	SessionID string `json:"session_id"`
-	Title     string `json:"title"`
-	CWD       string `json:"cwd,omitempty"`
-	Active    bool   `json:"active,omitempty"`
+	return StateData{
+		SchemaVersion: stateSchemaVersion,
+		Workspaces:    map[string]*Workspace{},
+		Remotes:       map[string]*RemoteCache{},
+	}
 }
 
 type Event struct {
-	SessionID string         `json:"session_id"`
-	Kind      string         `json:"kind"`
-	Source    string         `json:"source"`
-	TurnID    string         `json:"turn_id,omitempty"`
-	Detail    string         `json:"detail,omitempty"`
-	PID       int            `json:"pid,omitempty"`
-	ExitCode  *int           `json:"exit_code,omitempty"`
-	View      *View          `json:"view,omitempty"`
-	Fields    map[string]any `json:"fields,omitempty"`
+	WorkspaceID string         `json:"workspace_id"`
+	PaneID      string         `json:"pane_id"`
+	Kind        string         `json:"kind"`
+	Source      string         `json:"source"`
+	TurnID      string         `json:"turn_id,omitempty"`
+	Detail      string         `json:"detail,omitempty"`
+	PID         int            `json:"pid,omitempty"`
+	ExitCode    *int           `json:"exit_code,omitempty"`
+	Fields      map[string]any `json:"fields,omitempty"`
+}
+
+type WatcherEvent struct {
+	Version   int       `json:"version"`
+	Endpoint  string    `json:"endpoint"`
+	Workspace string    `json:"workspace,omitempty"`
+	Kind      string    `json:"kind"`
+	WindowID  int64     `json:"window_id,omitempty"`
+	Timestamp time.Time `json:"timestamp,omitempty"`
 }
 
 func validateName(name string) error {
@@ -195,20 +307,29 @@ func validateName(name string) error {
 	if len(name) > 80 {
 		return fmt.Errorf("name must be at most 80 characters")
 	}
-	if strings.ContainsAny(name, "\x00\r\n") {
+	if strings.ContainsAny(name, "\x00\r\n:") {
 		return fmt.Errorf("name contains a control character")
 	}
 	return nil
 }
 
-func validateSnapshotName(name string) error {
-	if err := validateName(name); err != nil {
-		return err
+func randomID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate id: %w", err)
 	}
-	if filepath.Base(name) != name || name == "." || name == ".." || strings.Contains(name, "\\") {
-		return fmt.Errorf("snapshot name must be a single filename component")
+	return hex.EncodeToString(b), nil
+}
+
+func backendName(workspaceID, paneID string) string {
+	return "zka-" + shortID(workspaceID) + "-" + shortID(paneID)
+}
+
+func shortID(id string) string {
+	if len(id) <= 8 {
+		return id
 	}
-	return nil
+	return id[:8]
 }
 
 func stateMarker(state AgentState) string {

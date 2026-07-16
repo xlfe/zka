@@ -10,7 +10,12 @@ func TestStoreRoundTripAndPermissions(t *testing.T) {
 	paths := testPaths(t.TempDir())
 	store := NewStore(paths)
 	state := newStateData()
-	state.Sessions["abc"] = &Session{ID: "abc", Name: "test", State: StateIdle, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	state.Node = Host{ID: "node", Name: "devbox.example"}
+	state.Workspaces["abc"] = &Workspace{
+		ID: "abc", Name: "test", Origin: state.Node, Revision: 1,
+		Panes: map[string]*Pane{}, Attachments: map[string]*Attachment{},
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
 	if err := store.Save(state); err != nil {
 		t.Fatal(err)
 	}
@@ -25,37 +30,52 @@ func TestStoreRoundTripAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Sessions["abc"].Name != "test" {
-		t.Fatalf("unexpected loaded state: %#v", loaded)
+	if loaded.Workspaces["abc"].Name != "test" || loaded.Node.Name != "devbox.example" {
+		t.Fatalf("loaded = %#v", loaded)
 	}
 }
 
-func TestStoreRejectsUnknownSchema(t *testing.T) {
+func TestStoreResetsUndeployedV1Schema(t *testing.T) {
 	paths := testPaths(t.TempDir())
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(paths.StateFile, []byte(`{"schema_version":99,"sessions":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(paths.StateFile, []byte(`{"schema_version":1,"sessions":{"old":{}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewStore(paths).Load(); err == nil {
-		t.Fatal("unknown schema was accepted")
+	state, err := NewStore(paths).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.SchemaVersion != stateSchemaVersion || len(state.Workspaces) != 0 {
+		t.Fatalf("state = %#v", state)
 	}
 }
 
-func TestSnapshotRoundTrip(t *testing.T) {
+func TestStoreRejectsFutureSchema(t *testing.T) {
 	paths := testPaths(t.TempDir())
-	store := NewStore(paths)
-	snapshot := Snapshot{SchemaVersion: snapshotSchemaVersion, Name: "daily", CreatedAt: time.Now(), OSWindows: []SnapshotOSWindow{{Tabs: []SnapshotTab{{Views: []SnapshotView{{SessionID: "abc"}}}}}}}
-	path, err := store.SaveSnapshot(snapshot, "")
+	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.StateFile, []byte(`{"schema_version":99,"workspaces":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewStore(paths).Load(); err == nil {
+		t.Fatal("future schema was accepted")
+	}
+}
+
+func TestGeneratedSessionIsAtomicAndPrivate(t *testing.T) {
+	paths := testPaths(t.TempDir())
+	path, err := NewStore(paths).WriteSession("0123456789", "attachment", "launch\n")
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded, gotPath, err := store.LoadSnapshot("daily")
+	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotPath != path || loaded.Name != "daily" {
-		t.Fatalf("round trip = %#v, %q", loaded, gotPath)
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("session mode = %o", info.Mode().Perm())
 	}
 }
