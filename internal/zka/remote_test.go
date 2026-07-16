@@ -266,3 +266,42 @@ func TestRemotePaneReadinessComesFromOriginClientHeartbeat(t *testing.T) {
 		t.Fatalf("readiness = %#v", ready)
 	}
 }
+
+func TestRemoteDeadPaneIsReadyWhilePlaceholderClientIsAlive(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	attachment, err := d.registerAttachment(workspace.ID, Attachment{
+		ID: "remote-dead-view", Node: Host{ID: "laptop.example", Name: "laptop.example"},
+		Transport: Transport{Kind: "ssh", Host: "devbox.example"}, Endpoint: "ssh:laptop.example",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.applyEvent(context.Background(), Event{
+		WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "backend_error", Source: "zmx", Detail: "session missing",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.setAttachmentPaneReady(attachmentPaneReadyRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID, Pane: pane.ID, Ready: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(paneReadinessRequest{Workspace: workspace.ID, Attachment: attachment.ID, Pane: pane.ID})
+	raw, err := dispatchRemoteControl(context.Background(), NewAPI(d.paths), "pane_readiness", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ready paneReadinessResponse
+	if err := json.Unmarshal(raw, &ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready.BackendReady || !ready.BackendDead || !ready.ClientReady {
+		t.Fatalf("dead pane readiness = %#v", ready)
+	}
+}

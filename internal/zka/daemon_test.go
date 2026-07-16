@@ -82,17 +82,20 @@ func TestPreparePaneAllocatesAndNeverRestartsMissingBackend(t *testing.T) {
 	}
 	workspace := createTestWorkspace(t, d, 1)
 	pane := firstPane(workspace)
-	first, err := d.preparePane(workspace.ID, pane.ID)
+	first, err := d.preparePane(workspace.ID, pane.ID, "")
 	if err != nil || !first.Create {
 		t.Fatalf("first = %#v, %v", first, err)
 	}
-	second, err := d.preparePane(workspace.ID, pane.ID)
+	second, err := d.preparePane(workspace.ID, pane.ID, "")
 	if err != nil || second.Create {
 		t.Fatalf("second = %#v, %v", second, err)
 	}
-	created, err := d.preparePane(workspace.ID, "")
+	created, err := d.preparePane(workspace.ID, "", "/work/project")
 	if err != nil || !created.Create || created.Pane.ID == pane.ID || created.Workspace.Revision != workspace.Revision+1 {
 		t.Fatalf("allocated = %#v, %v", created, err)
+	}
+	if created.Pane.CWD != "/work/project" {
+		t.Fatalf("allocated pane cwd = %q", created.Pane.CWD)
 	}
 }
 
@@ -102,16 +105,19 @@ func TestPaneAllocationKeyMakesRemoteRetryIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspace := createTestWorkspace(t, d, 1)
-	first, err := d.allocatePane(workspace.ID, "attachment:request")
+	first, err := d.allocatePane(workspace.ID, "attachment:request", "/remote/project")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := d.allocatePane(workspace.ID, "attachment:request")
+	second, err := d.allocatePane(workspace.ID, "attachment:request", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first.Pane.ID != second.Pane.ID || first.Workspace.Revision != second.Workspace.Revision {
 		t.Fatalf("allocation replay created another pane: first=%#v second=%#v", first, second)
+	}
+	if first.Pane.CWD != "/remote/project" || second.Pane.CWD != "/remote/project" {
+		t.Fatalf("allocation lost cwd: first=%q second=%q", first.Pane.CWD, second.Pane.CWD)
 	}
 }
 

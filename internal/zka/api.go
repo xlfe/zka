@@ -48,15 +48,21 @@ func (a API) Workspaces(ctx context.Context) ([]*Workspace, error) {
 	return out, err
 }
 
-func (a API) PreparePane(ctx context.Context, workspace, pane string) (preparePaneResponse, error) {
+func (a API) PreparePane(ctx context.Context, workspace, pane, cwd string) (preparePaneResponse, error) {
 	var out preparePaneResponse
-	err := a.client.Call(ctx, "prepare_pane", workspacePaneRequest{Workspace: workspace, Pane: pane}, &out)
+	err := a.client.Call(ctx, "prepare_pane", workspacePaneRequest{Workspace: workspace, Pane: pane, CWD: cwd}, &out)
 	return out, err
 }
 
-func (a API) AllocatePane(ctx context.Context, workspace, key string) (allocatePaneResponse, error) {
+func (a API) AllocatePane(ctx context.Context, workspace, key, cwd string) (allocatePaneResponse, error) {
 	var out allocatePaneResponse
-	err := a.client.Call(ctx, "allocate_pane", allocatePaneRequest{Workspace: workspace, Key: key}, &out)
+	err := a.client.Call(ctx, "allocate_pane", allocatePaneRequest{Workspace: workspace, Key: key, CWD: cwd}, &out)
+	return out, err
+}
+
+func (a API) ReconcileBackends(ctx context.Context, workspace string) (backendReconcileResponse, error) {
+	var out backendReconcileResponse
+	err := a.client.Call(ctx, "reconcile_backends", backendReconcileRequest{Workspace: workspace}, &out)
 	return out, err
 }
 

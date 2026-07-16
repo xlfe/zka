@@ -153,6 +153,7 @@ func (d *Daemon) Start() error {
 	d.startWorkerLocked(func(ctx context.Context) { d.acceptLoop(ctx) })
 	d.startWorkerLocked(func(ctx context.Context) { d.watcherReadLoop(ctx) })
 	d.startWorkerLocked(func(ctx context.Context) { d.topologyLoop(ctx) })
+	d.startWorkerLocked(func(ctx context.Context) { d.backendReconcileLoop(ctx) })
 	d.lifeMu.Unlock()
 	d.resumeLifecycleCleanup()
 	return nil
@@ -322,6 +323,7 @@ type refRequest struct {
 type workspacePaneRequest struct {
 	Workspace string `json:"workspace"`
 	Pane      string `json:"pane,omitempty"`
+	CWD       string `json:"cwd,omitempty"`
 }
 
 type preparePaneResponse struct {
@@ -338,6 +340,16 @@ type allocatePaneResponse struct {
 type allocatePaneRequest struct {
 	Workspace string `json:"workspace"`
 	Key       string `json:"key,omitempty"`
+	CWD       string `json:"cwd,omitempty"`
+}
+
+type backendReconcileRequest struct {
+	Workspace string `json:"workspace,omitempty"`
+}
+
+type backendReconcileResponse struct {
+	Marked  []string `json:"marked,omitempty"`
+	Deleted []string `json:"deleted,omitempty"`
 }
 
 type attachmentRequest struct {
@@ -451,13 +463,19 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
-		return d.preparePane(req.Workspace, req.Pane)
+		return d.preparePane(req.Workspace, req.Pane, req.CWD)
 	case "allocate_pane":
 		var req allocatePaneRequest
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
-		return d.allocatePane(req.Workspace, req.Key)
+		return d.allocatePane(req.Workspace, req.Key, req.CWD)
+	case "reconcile_backends":
+		var req backendReconcileRequest
+		if err := decodePayload(raw, &req); err != nil {
+			return nil, err
+		}
+		return d.reconcileBackends(ctx, req.Workspace)
 	case "register_attachment":
 		var req attachmentRequest
 		if err := decodePayload(raw, &req); err != nil {
@@ -699,7 +717,7 @@ func resolvePaneLocked(workspace *Workspace, ref string) (*Pane, error) {
 	return found, nil
 }
 
-func (d *Daemon) preparePane(workspaceRef, paneRef string) (preparePaneResponse, error) {
+func (d *Daemon) preparePane(workspaceRef, paneRef, cwd string) (preparePaneResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
@@ -711,7 +729,7 @@ func (d *Daemon) preparePane(workspaceRef, paneRef string) (preparePaneResponse,
 	}
 	var pane *Pane
 	if paneRef == "" {
-		pane, _, err = allocatePaneLocked(workspace, "")
+		pane, _, err = allocatePaneLocked(workspace, "", cwd)
 		if err != nil {
 			return preparePaneResponse{}, err
 		}
@@ -733,10 +751,15 @@ func (d *Daemon) preparePane(workspaceRef, paneRef string) (preparePaneResponse,
 	return preparePaneResponse{Workspace: workspace.Clone(), Pane: pane.Clone(), Create: create}, nil
 }
 
-func allocatePaneLocked(workspace *Workspace, key string) (*Pane, bool, error) {
+func allocatePaneLocked(workspace *Workspace, key, cwd string) (*Pane, bool, error) {
 	if key != "" {
 		for _, pane := range workspace.Panes {
 			if pane.AllocationKey == key {
+				if pane.CWD == "" && cwd != "" {
+					pane.CWD = cwd
+					pane.UpdatedAt = time.Now().UTC()
+					workspace.UpdatedAt = pane.UpdatedAt
+				}
 				return pane, false, nil
 			}
 		}
@@ -747,7 +770,7 @@ func allocatePaneLocked(workspace *Workspace, key string) (*Pane, bool, error) {
 			position = existing.Position + 1
 		}
 	}
-	pane, err := newPane(workspace.ID, position, PaneSpec{}, time.Now().UTC())
+	pane, err := newPane(workspace.ID, position, PaneSpec{CWD: cwd}, time.Now().UTC())
 	if err != nil {
 		return nil, false, err
 	}
@@ -758,7 +781,7 @@ func allocatePaneLocked(workspace *Workspace, key string) (*Pane, bool, error) {
 	return pane, true, nil
 }
 
-func (d *Daemon) allocatePane(workspaceRef, key string) (allocatePaneResponse, error) {
+func (d *Daemon) allocatePane(workspaceRef, key, cwd string) (allocatePaneResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
@@ -768,7 +791,7 @@ func (d *Daemon) allocatePane(workspaceRef, key string) (allocatePaneResponse, e
 	if err := requireWorkspaceMutable(workspace); err != nil {
 		return allocatePaneResponse{}, err
 	}
-	pane, _, err := allocatePaneLocked(workspace, key)
+	pane, _, err := allocatePaneLocked(workspace, key, cwd)
 	if err != nil {
 		return allocatePaneResponse{}, err
 	}
@@ -1267,9 +1290,14 @@ func (d *Daemon) applyEvent(_ context.Context, event Event) (*Workspace, error) 
 	case "process_started":
 		pane.Process = ProcessStatus{Running: true, PID: event.PID, Started: now}
 		pane.BackendCreated, pane.BackendReady, pane.BackendStart = true, true, false
+		pane.BackendDead, pane.BackendError = false, ""
 	case "process_exit":
 		pane.Process.Running, pane.Process.PID, pane.Process.ExitCode, pane.Process.Exited = false, 0, event.ExitCode, now
 		pane.BackendReady, pane.BackendStart = false, false
+		pane.BackendDead, pane.BackendError = true, event.Detail
+		if pane.BackendError == "" {
+			pane.BackendError = "backend process exited"
+		}
 		if event.ExitCode != nil && *event.ExitCode != 0 {
 			pane.State = StateError
 		} else if pane.State != StateDone {
@@ -1277,6 +1305,7 @@ func (d *Daemon) applyEvent(_ context.Context, event Event) (*Workspace, error) 
 		}
 	case "backend_error":
 		pane.BackendReady, pane.BackendStart, pane.State = false, false, StateError
+		pane.BackendDead, pane.BackendError = true, event.Detail
 	default:
 		d.mu.Unlock()
 		return nil, fmt.Errorf("unsupported event kind %q", event.Kind)

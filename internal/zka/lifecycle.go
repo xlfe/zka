@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const backendStartupGrace = 30 * time.Second
+
 func requireWorkspaceMutable(workspace *Workspace) error {
 	if workspace.DeletionPending {
 		return fmt.Errorf("workspace %q is being deleted", workspace.Name)
@@ -435,6 +437,128 @@ func listZMXSessions(ctx context.Context, runner CommandRunner, command string) 
 		}
 	}
 	return result, scanner.Err()
+}
+
+func (d *Daemon) backendReconcileLoop(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := d.reconcileBackends(ctx, ""); err != nil && ctx.Err() == nil {
+				d.logger.Printf("reconcile zmx backends: %v", err)
+			}
+		}
+	}
+}
+
+func (d *Daemon) reconcileBackends(ctx context.Context, workspaceRef string) (backendReconcileResponse, error) {
+	active, err := listZMXSessions(ctx, d.runner, d.config.ZMX.Command)
+	if err != nil {
+		return backendReconcileResponse{}, fmt.Errorf("list zmx sessions: %w", err)
+	}
+
+	d.mu.Lock()
+	var workspaces []*Workspace
+	if workspaceRef != "" {
+		workspace, resolveErr := d.resolveWorkspaceLocked(workspaceRef)
+		if resolveErr != nil {
+			d.mu.Unlock()
+			return backendReconcileResponse{}, resolveErr
+		}
+		if workspace.RemoteHost != "" {
+			d.mu.Unlock()
+			return backendReconcileResponse{}, fmt.Errorf("workspace %q is not authoritative on this host", workspace.Name)
+		}
+		workspaces = []*Workspace{workspace}
+	} else {
+		for _, workspace := range d.state.Workspaces {
+			if workspace.RemoteHost == "" {
+				workspaces = append(workspaces, workspace)
+			}
+		}
+	}
+
+	response := backendReconcileResponse{}
+	var deleteIDs []string
+	changed := false
+	changedBefore := map[string]*Workspace{}
+	now := time.Now().UTC()
+	for _, workspace := range workspaces {
+		if workspace.DeletionPending {
+			continue
+		}
+		pending, live, established, removalPending := false, false, false, false
+		workspaceChanged := false
+		for _, pane := range workspace.Panes {
+			if pane.RemovalPending {
+				removalPending = true
+				continue
+			}
+			if !pane.BackendCreated && !pane.BackendDead {
+				startedAt := pane.UpdatedAt
+				if startedAt.IsZero() {
+					startedAt = pane.CreatedAt
+				}
+				if startedAt.IsZero() || now.Sub(startedAt) < backendStartupGrace {
+					pending = true
+					continue
+				}
+			}
+			established = true
+			if active[pane.Backend.Ref] {
+				live = true
+				continue
+			}
+			if !pane.BackendDead || pane.BackendReady || pane.Process.Running || pane.State != StateError || pane.Evidence.Event != "backend_missing" {
+				if !workspaceChanged {
+					changedBefore[workspace.ID] = workspace.Clone()
+				}
+				pane.BackendDead = true
+				pane.BackendReady = false
+				pane.BackendStart = false
+				pane.BackendError = fmt.Sprintf("zmx session %q is missing", pane.Backend.Ref)
+				pane.Process.Running = false
+				pane.Process.PID = 0
+				pane.Process.Exited = now
+				pane.State = StateError
+				pane.Evidence = Evidence{Source: "zkad", Event: "backend_missing", Detail: pane.BackendError, Timestamp: now}
+				pane.UpdatedAt = now
+				response.Marked = append(response.Marked, pane.ID)
+				workspaceChanged = true
+			}
+		}
+		if workspaceChanged {
+			workspace.UpdatedAt = now
+			workspace.RecomputeAttention()
+			changed = true
+		}
+		if established && !pending && !live && !removalPending {
+			deleteIDs = append(deleteIDs, workspace.ID)
+		}
+	}
+	if changed {
+		if err := d.store.Save(d.state); err != nil {
+			for workspaceID, before := range changedBefore {
+				d.state.Workspaces[workspaceID] = before
+			}
+			d.mu.Unlock()
+			return backendReconcileResponse{}, err
+		}
+	}
+	d.mu.Unlock()
+
+	for _, workspaceID := range deleteIDs {
+		if _, err := d.killWorkspace(ctx, workspaceID); err != nil {
+			return response, err
+		}
+		response.Deleted = append(response.Deleted, workspaceID)
+	}
+	sort.Strings(response.Marked)
+	sort.Strings(response.Deleted)
+	return response, nil
 }
 
 func (d *Daemon) recordLifecycleError(workspaceID string, panes []*Pane, detail string) {

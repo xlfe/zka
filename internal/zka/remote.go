@@ -39,6 +39,7 @@ type paneReadinessRequest struct {
 
 type paneReadinessResponse struct {
 	BackendReady bool `json:"backend_ready"`
+	BackendDead  bool `json:"backend_dead,omitempty"`
 	ClientReady  bool `json:"client_ready"`
 }
 
@@ -600,7 +601,17 @@ func dispatchRemoteControl(ctx context.Context, api API, op string, raw json.Raw
 		if err := requireAuthoritative(ctx, api, req.Workspace); err != nil {
 			return nil, err
 		}
-		result, err := api.AllocatePane(ctx, req.Workspace, req.Key)
+		result, err := api.AllocatePane(ctx, req.Workspace, req.Key, req.CWD)
+		value = result
+		if err != nil {
+			return nil, err
+		}
+	case "reconcile_backends":
+		var req backendReconcileRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		result, err := api.ReconcileBackends(ctx, req.Workspace)
 		value = result
 		if err != nil {
 			return nil, err
@@ -730,6 +741,7 @@ func dispatchRemoteControl(ctx context.Context, api API, op string, raw json.Raw
 		}
 		value = paneReadinessResponse{
 			BackendReady: pane.BackendReady,
+			BackendDead:  pane.BackendDead,
 			ClientReady:  clientHeartbeatFresh(attachment.ClientHeartbeats[req.Pane], time.Now().UTC()),
 		}
 	default:

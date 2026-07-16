@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
@@ -85,7 +85,7 @@ func printUsage(w io.Writer) {
 
 Commands:
   kitty       Create a managed Kitty workspace
-  workspace   List, inspect, open, move, detach, rename, kill, focus, or acknowledge workspaces
+  workspace   List, inspect, attach, move, detach, rename, kill, focus, or acknowledge workspaces
   doctor      Check local or remote integration
   daemon      Run zkad (normally via systemd --user)
 
@@ -248,10 +248,10 @@ func runWorkspace(args []string, paths Paths, stdout, stderr io.Writer) (int, er
 		return runWorkspaceList(args[1:], paths, stdout, stderr)
 	case "inspect":
 		return runWorkspaceInspect(args[1:], paths, stdout, stderr)
-	case "open":
-		return runWorkspaceOpen(args[1:], paths, false, stdout, stderr)
+	case "attach":
+		return runWorkspaceAttach(args[1:], paths, false, stdout, stderr)
 	case "move":
-		return runWorkspaceOpen(args[1:], paths, true, stdout, stderr)
+		return runWorkspaceAttach(args[1:], paths, true, stdout, stderr)
 	case "detach":
 		return runWorkspaceDetach(args[1:], paths, stdout, stderr)
 	case "rename":
@@ -273,7 +273,7 @@ func printWorkspaceUsage(w io.Writer) {
 
   list [--origin SSH_ALIAS] [--json]
   inspect [SSH_ALIAS:]REF [--json]
-  open [SSH_ALIAS:]REF [--pane PANE]
+  attach [SSH_ALIAS:]REF [--pane PANE]
   move [SSH_ALIAS:]REF [--pane PANE]
   detach REF
   rename [SSH_ALIAS:]REF NAME
@@ -334,13 +334,13 @@ func runWorkspaceInspect(args []string, paths Paths, stdout, stderr io.Writer) (
 	return 0, nil
 }
 
-func runWorkspaceOpen(args []string, paths Paths, move bool, stdout, stderr io.Writer) (int, error) {
-	name := "workspace open"
+func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io.Writer) (int, error) {
+	name := "workspace attach"
 	if move {
 		name = "workspace move"
 	}
 	fs := newFlagSet(name, stderr)
-	paneRef := fs.String("pane", "", "pane to focus after opening")
+	paneRef := fs.String("pane", "", "pane to focus after attaching")
 	if err := parseInterspersed(fs, args); err != nil {
 		return 2, err
 	}
@@ -355,9 +355,19 @@ func runWorkspaceOpen(args []string, paths Paths, move bool, stdout, stderr io.W
 	var err error
 	if host == "" {
 		workspace, err = api.Workspace(ctx, ref)
+		if err == nil && workspace.RemoteHost == "" {
+			_, err = api.ReconcileBackends(ctx, workspace.ID)
+			if err == nil {
+				workspace, err = api.Workspace(ctx, workspace.ID)
+			}
+		}
 	} else {
+		var reconciled backendReconcileResponse
+		err = api.RemoteCall(ctx, host, "reconcile_backends", backendReconcileRequest{Workspace: ref}, &reconciled)
 		var remote Workspace
-		err = api.RemoteCall(ctx, host, "get", refRequest{Ref: ref}, &remote)
+		if err == nil {
+			err = api.RemoteCall(ctx, host, "get", refRequest{Ref: ref}, &remote)
+		}
 		if err == nil {
 			workspace, err = api.Workspace(ctx, remote.ID)
 		}
@@ -442,14 +452,14 @@ func runWorkspaceOpen(args []string, paths Paths, move bool, stdout, stderr io.W
 	if err != nil {
 		return 1, err
 	}
-	opened, err := launchManagedKitty(ctx, paths, cfg, api, launchAttachmentOptions{Workspace: workspace, Attachment: attachment, Session: session})
+	attached, err := launchManagedKitty(ctx, paths, cfg, api, launchAttachmentOptions{Workspace: workspace, Attachment: attachment, Session: session})
 	if err != nil {
 		if host != "" {
 			_ = api.RemoteCall(context.Background(), host, "detach_attachment", attachmentRefRequest{Workspace: workspace.ID, Attachment: attachmentID}, nil)
 		}
 		return 1, err
 	}
-	workspace = opened
+	workspace = attached
 	localAttachment := workspace.Attachments[attachmentID]
 	if host != "" {
 		workspace, err = readyRemoteAttachment(ctx, api, host, workspace, localAttachment)
@@ -850,6 +860,9 @@ func writeWorkspaceDetail(w io.Writer, workspace *Workspace) {
 	}
 	for _, pane := range workspace.SortedPanes() {
 		fmt.Fprintf(w, "pane[%s]=%s backend=%s state=%s evidence=%s/%s\n", shortID(pane.ID), pane.Title, pane.Backend.Ref, pane.State, pane.Evidence.Source, pane.Evidence.Event)
+		if pane.BackendDead {
+			fmt.Fprintf(w, "pane_backend[%s]=dead error=%s\n", shortID(pane.ID), pane.BackendError)
+		}
 		if pane.RemovalPending {
 			fmt.Fprintf(w, "pane_removal[%s]=pending error=%s\n", shortID(pane.ID), pane.RemovalError)
 		}
@@ -881,7 +894,8 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 		return 2, fmt.Errorf("pane requires --workspace and optional --pane")
 	}
 	api := NewAPI(paths)
-	prepared, err := api.PreparePane(context.Background(), *workspaceRef, *paneRef)
+	cwd, _ := os.Getwd()
+	prepared, err := api.PreparePane(context.Background(), *workspaceRef, *paneRef, cwd)
 	if err != nil {
 		return 1, err
 	}
@@ -892,22 +906,27 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 	windowID, parseErr := strconv.ParseInt(os.Getenv("KITTY_WINDOW_ID"), 10, 64)
 	endpoint := os.Getenv("KITTY_LISTEN_ON")
 	if endpoint == "" || parseErr != nil || windowID <= 0 {
-		return reportPaneBackendError(api, prepared.Workspace, prepared.Pane, fmt.Errorf("managed Kitty endpoint and window id are required"))
+		return 1, fmt.Errorf("managed Kitty endpoint and window id are required")
 	}
 	kitty := KittyClient{Runner: ExecRunner{}, Command: cfg.Kitty.KittenCommand}
 	identityCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	identityErr := kitty.SetIdentity(identityCtx, endpoint, windowID, prepared.Workspace.ID, prepared.Pane.ID)
 	cancel()
 	if identityErr != nil {
-		return reportPaneBackendError(api, prepared.Workspace, prepared.Pane, fmt.Errorf("tag Kitty pane: %w", identityErr))
+		return 1, fmt.Errorf("tag Kitty pane: %w", identityErr)
 	}
 	if !prepared.Create {
+		if prepared.Pane.BackendDead {
+			return runLocalDeadPane(api, kitty, endpoint, windowID, prepared.Workspace, prepared.Pane,
+				paneBackendError(prepared.Pane), stdin, stdout)
+		}
 		exists, err := zmxSessionExists(context.Background(), cfg.ZMX.Command, prepared.Pane.Backend.Ref)
 		if err != nil {
-			return reportPaneBackendError(api, prepared.Workspace, prepared.Pane, fmt.Errorf("query zmx sessions: %w", err))
+			return 1, fmt.Errorf("query zmx sessions: %w", err)
 		}
 		if !exists {
-			return reportPaneBackendError(api, prepared.Workspace, prepared.Pane, fmt.Errorf("zmx session %q no longer exists; refusing to restart its foreground process", prepared.Pane.Backend.Ref))
+			return runLocalDeadPane(api, kitty, endpoint, windowID, prepared.Workspace, prepared.Pane,
+				fmt.Errorf("zmx session %q no longer exists", prepared.Pane.Backend.Ref), stdin, stdout)
 		}
 	}
 	commandArgs := []string{"attach", prepared.Pane.Backend.Ref}
@@ -922,7 +941,7 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 	}
 	cmd.Env = append(os.Environ(), "ZKA_WORKSPACE_ID="+prepared.Workspace.ID, "ZKA_PANE_ID="+prepared.Pane.ID)
 	if err := cmd.Start(); err != nil {
-		return reportPaneBackendError(api, prepared.Workspace, prepared.Pane, err)
+		return runLocalDeadPane(api, kitty, endpoint, windowID, prepared.Workspace, prepared.Pane, err, stdin, stdout)
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -934,10 +953,11 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 		if !exited {
 			runErr = <-done
 		}
-		return reportPaneBackendError(api, prepared.Workspace, prepared.Pane, fmt.Errorf("wait for zmx attachment readiness: %w", readyErr))
+		return finishLocalPaneAttach(api, cfg, kitty, endpoint, windowID, prepared.Workspace, prepared.Pane,
+			fmt.Errorf("wait for zmx attachment readiness: %w", readyErr), stdin, stdout)
 	}
 	if exited {
-		return finishPaneAttach(api, cfg, prepared.Workspace, prepared.Pane, runErr)
+		return finishLocalPaneAttach(api, cfg, kitty, endpoint, windowID, prepared.Workspace, prepared.Pane, runErr, stdin, stdout)
 	}
 	readyCtx, readyCancel = context.WithTimeout(context.Background(), 2*time.Second)
 	readyErr = kitty.SetPaneReady(readyCtx, endpoint, windowID, true)
@@ -948,10 +968,7 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 		return 1, fmt.Errorf("mark Kitty pane ready: %w", readyErr)
 	}
 	runErr = <-done
-	notReadyCtx, notReadyCancel := context.WithTimeout(context.Background(), time.Second)
-	_ = kitty.SetPaneReady(notReadyCtx, endpoint, windowID, false)
-	notReadyCancel()
-	return finishPaneAttach(api, cfg, prepared.Workspace, prepared.Pane, runErr)
+	return finishLocalPaneAttach(api, cfg, kitty, endpoint, windowID, prepared.Workspace, prepared.Pane, runErr, stdin, stdout)
 }
 
 func waitForLocalPaneReady(ctx context.Context, api API, workspaceID, paneID string, done <-chan error) (error, bool, error) {
@@ -987,15 +1004,21 @@ func waitForLocalPaneReady(ctx context.Context, api API, workspaceID, paneID str
 	}
 }
 
-func finishPaneAttach(api API, cfg Config, workspace *Workspace, pane *Pane, runErr error) (int, error) {
-	if runErr == nil {
-		return 0, nil
+func finishLocalPaneAttach(api API, cfg Config, kitty KittyClient, endpoint string, windowID int64, workspace *Workspace, pane *Pane, runErr error, stdin io.Reader, stdout io.Writer) (int, error) {
+	if recorded := recordedBackendError(api, workspace.ID, pane.ID); recorded != nil {
+		return runLocalDeadPane(api, kitty, endpoint, windowID, workspace, pane, recorded, stdin, stdout)
 	}
 	exists, queryErr := zmxSessionExists(context.Background(), cfg.ZMX.Command, pane.Backend.Ref)
 	if queryErr == nil && exists {
 		return processExitCode(runErr), nil
 	}
-	return reportPaneBackendError(api, workspace, pane, runErr)
+	if queryErr != nil {
+		return 1, fmt.Errorf("query zmx session after attachment exited: %w", queryErr)
+	}
+	if runErr == nil {
+		runErr = fmt.Errorf("zmx session %q exited", pane.Backend.Ref)
+	}
+	return runLocalDeadPane(api, kitty, endpoint, windowID, workspace, pane, runErr, stdin, stdout)
 }
 
 func zmxSessionExists(ctx context.Context, command, name string) (bool, error) {
@@ -1015,9 +1038,83 @@ func zmxSessionExists(ctx context.Context, command, name string) (bool, error) {
 	return false, scanner.Err()
 }
 
-func reportPaneBackendError(api API, workspace *Workspace, pane *Pane, cause error) (int, error) {
+func recordedBackendError(api API, workspaceID, paneID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	workspace, err := api.Workspace(ctx, workspaceID)
+	if err != nil {
+		return nil
+	}
+	pane := workspace.Panes[paneID]
+	if pane == nil || !pane.BackendDead {
+		return nil
+	}
+	return paneBackendError(pane)
+}
+
+func paneBackendError(pane *Pane) error {
+	if pane.BackendError != "" {
+		return errors.New(pane.BackendError)
+	}
+	return fmt.Errorf("zmx backend %q is dead", pane.Backend.Ref)
+}
+
+func runLocalDeadPane(api API, kitty KittyClient, endpoint string, windowID int64, workspace *Workspace, pane *Pane, cause error, stdin io.Reader, stdout io.Writer) (int, error) {
 	_, _ = api.Event(context.Background(), Event{WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "backend_error", Source: "zmx", Detail: cause.Error()})
-	return 1, cause
+	readyCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	err := kitty.SetPaneReady(readyCtx, endpoint, windowID, true)
+	cancel()
+	if err != nil {
+		return 1, fmt.Errorf("mark dead Kitty pane ready: %w", err)
+	}
+	if err := writeDeadPaneMessage(stdout, workspace, pane, cause); err != nil {
+		return 1, err
+	}
+	if err := waitForDeadPaneDismiss(stdin); err != nil {
+		return 1, err
+	}
+	return 0, nil
+}
+
+func writeDeadPaneMessage(w io.Writer, workspace *Workspace, pane *Pane, cause error) error {
+	detail := "zmx backend is unavailable"
+	if cause != nil {
+		detail = strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(cause.Error()))
+	}
+	_, err := fmt.Fprintf(w, "\x1b[2J\x1b[H\n  zka: zmx backend is dead\n\n  workspace: %s\n  pane:      %s\n  backend:   %s\n  reason:    %s\n\n  Press Ctrl-C to remove this pane.\n", workspace.Name, shortID(pane.ID), pane.Backend.Ref, detail)
+	return err
+}
+
+func waitForDeadPaneDismiss(stdin io.Reader) error {
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	defer signal.Stop(interrupt)
+	input := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 64)
+		for {
+			n, err := stdin.Read(buffer)
+			for _, value := range buffer[:n] {
+				if value == 3 {
+					input <- nil
+					return
+				}
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					err = nil
+				}
+				input <- err
+				return
+			}
+		}
+	}()
+	select {
+	case <-interrupt:
+		return nil
+	case err := <-input:
+		return err
+	}
 }
 
 func runPaneHost(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
@@ -1068,7 +1165,7 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 	}
 	ctx := context.Background()
 	api := NewAPI(paths)
-	prepared, err := api.PreparePane(ctx, *workspaceRef, *paneRef)
+	prepared, err := api.PreparePane(ctx, *workspaceRef, *paneRef, "")
 	if err != nil {
 		return 1, err
 	}
@@ -1078,12 +1175,16 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 		return 1, err
 	}
 	if !prepared.Create {
+		if pane.BackendDead {
+			return runRemoteDeadPane(api, workspace, pane, *attachmentID, paneBackendError(pane), stdin, stdout)
+		}
 		exists, err := zmxSessionExists(ctx, cfg.ZMX.Command, pane.Backend.Ref)
 		if err != nil {
 			return 1, err
 		}
 		if !exists {
-			return reportPaneBackendError(api, workspace, pane, fmt.Errorf("remote zmx session %q is missing; refusing to restart it", pane.Backend.Ref))
+			return runRemoteDeadPane(api, workspace, pane, *attachmentID,
+				fmt.Errorf("remote zmx session %q is missing", pane.Backend.Ref), stdin, stdout)
 		}
 	}
 	zmxArgs := []string{"attach", pane.Backend.Ref}
@@ -1098,7 +1199,7 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 		cmd.Dir = pane.CWD
 	}
 	if err := cmd.Start(); err != nil {
-		return reportPaneBackendError(api, workspace, pane, err)
+		return runRemoteDeadPane(api, workspace, pane, *attachmentID, err, stdin, stdout)
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -1108,12 +1209,17 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 	if readyErr != nil {
 		_ = cmd.Process.Kill()
 		if !exited {
-			<-done
+			runErr = <-done
 		}
-		return reportPaneBackendError(api, workspace, pane, fmt.Errorf("wait for remote zmx client readiness: %w", readyErr))
+		exists, queryErr := zmxSessionExists(ctx, cfg.ZMX.Command, pane.Backend.Ref)
+		if queryErr == nil && !exists {
+			return runRemoteDeadPane(api, workspace, pane, *attachmentID,
+				fmt.Errorf("wait for remote zmx client readiness: %w", readyErr), stdin, stdout)
+		}
+		return 1, fmt.Errorf("wait for remote zmx client readiness: %w", readyErr)
 	}
 	if exited {
-		return finishPaneAttach(api, cfg, workspace, pane, runErr)
+		return finishRemotePaneAttach(api, cfg, workspace, pane, *attachmentID, runErr, stdin, stdout)
 	}
 	heartbeat := attachmentPaneReadyRequest{Workspace: workspace.ID, Attachment: *attachmentID, Pane: pane.ID, Ready: true}
 	heartbeatCtx, heartbeatCancel := context.WithTimeout(ctx, 2*time.Second)
@@ -1129,17 +1235,72 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 	for {
 		select {
 		case runErr = <-done:
-			heartbeat.Ready = false
-			clearCtx, clearCancel := context.WithTimeout(context.Background(), time.Second)
-			_, _ = api.SetAttachmentPaneReady(clearCtx, heartbeat)
-			clearCancel()
-			return finishPaneAttach(api, cfg, workspace, pane, runErr)
+			return finishRemotePaneAttach(api, cfg, workspace, pane, *attachmentID, runErr, stdin, stdout)
 		case <-ticker.C:
 			heartbeatCtx, heartbeatCancel := context.WithTimeout(ctx, time.Second)
 			_, _ = api.SetAttachmentPaneReady(heartbeatCtx, heartbeat)
 			heartbeatCancel()
 		}
 	}
+}
+
+func finishRemotePaneAttach(api API, cfg Config, workspace *Workspace, pane *Pane, attachmentID string, runErr error, stdin io.Reader, stdout io.Writer) (int, error) {
+	if recorded := recordedBackendError(api, workspace.ID, pane.ID); recorded != nil {
+		return runRemoteDeadPane(api, workspace, pane, attachmentID, recorded, stdin, stdout)
+	}
+	exists, queryErr := zmxSessionExists(context.Background(), cfg.ZMX.Command, pane.Backend.Ref)
+	if queryErr != nil {
+		clearRemotePaneHeartbeat(api, workspace.ID, attachmentID, pane.ID)
+		return 1, fmt.Errorf("query remote zmx session after attachment exited: %w", queryErr)
+	}
+	if exists {
+		clearRemotePaneHeartbeat(api, workspace.ID, attachmentID, pane.ID)
+		return processExitCode(runErr), nil
+	}
+	if runErr == nil {
+		runErr = fmt.Errorf("zmx session %q exited", pane.Backend.Ref)
+	}
+	return runRemoteDeadPane(api, workspace, pane, attachmentID, runErr, stdin, stdout)
+}
+
+func runRemoteDeadPane(api API, workspace *Workspace, pane *Pane, attachmentID string, cause error, stdin io.Reader, stdout io.Writer) (int, error) {
+	_, _ = api.Event(context.Background(), Event{WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "backend_error", Source: "zmx", Detail: cause.Error()})
+	heartbeat := attachmentPaneReadyRequest{Workspace: workspace.ID, Attachment: attachmentID, Pane: pane.ID, Ready: true}
+	heartbeatCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, err := api.SetAttachmentPaneReady(heartbeatCtx, heartbeat)
+	cancel()
+	if err != nil {
+		return 1, fmt.Errorf("publish dead remote pane readiness: %w", err)
+	}
+	defer clearRemotePaneHeartbeat(api, workspace.ID, attachmentID, pane.ID)
+	if err := writeDeadPaneMessage(stdout, workspace, pane, cause); err != nil {
+		return 1, err
+	}
+	dismissed := make(chan error, 1)
+	go func() { dismissed <- waitForDeadPaneDismiss(stdin) }()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-dismissed:
+			if err != nil {
+				return 1, err
+			}
+			return 0, nil
+		case <-ticker.C:
+			heartbeatCtx, heartbeatCancel := context.WithTimeout(context.Background(), time.Second)
+			_, _ = api.SetAttachmentPaneReady(heartbeatCtx, heartbeat)
+			heartbeatCancel()
+		}
+	}
+}
+
+func clearRemotePaneHeartbeat(api API, workspaceID, attachmentID, paneID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _ = api.SetAttachmentPaneReady(ctx, attachmentPaneReadyRequest{
+		Workspace: workspaceID, Attachment: attachmentID, Pane: paneID, Ready: false,
+	})
 }
 
 func runRemoteNewPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
@@ -1168,8 +1329,9 @@ func runRemoteNewPane(args []string, paths Paths, stdin io.Reader, stdout, stder
 		return 1, err
 	}
 	var allocated allocatePaneResponse
+	cwd, _ := os.Getwd()
 	if err := api.RemoteCall(ctx, *host, "allocate_pane", allocatePaneRequest{
-		Workspace: *workspaceID, Key: *attachment + ":" + allocationID,
+		Workspace: *workspaceID, Key: *attachment + ":" + allocationID, CWD: cwd,
 	}, &allocated); err != nil {
 		return 1, err
 	}
@@ -1305,7 +1467,7 @@ func waitForRemotePaneReady(ctx context.Context, api API, host, workspaceID, att
 				lastErr = err
 				continue
 			}
-			if readiness.BackendReady && readiness.ClientReady && time.Since(started) >= 150*time.Millisecond {
+			if (readiness.BackendReady || readiness.BackendDead) && readiness.ClientReady && time.Since(started) >= 150*time.Millisecond {
 				select {
 				case runErr := <-done:
 					return runErr, true, nil

@@ -21,7 +21,7 @@
         rec {
           zka = pkgs.buildGoModule {
             pname = "zka";
-            version = "0.3.0";
+            version = "0.4.0";
             src = ./.;
             vendorHash = null;
             subPackages = [ "cmd/zka" ];

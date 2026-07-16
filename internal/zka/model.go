@@ -12,7 +12,7 @@ import (
 
 const (
 	stateSchemaVersion = 3
-	protocolVersion    = 3
+	protocolVersion    = 4
 	remoteProtocolName = "zka.workspace"
 	remoteProtocolMax  = 1 << 20
 )
@@ -112,6 +112,8 @@ type Pane struct {
 	BackendCreated bool                          `json:"backend_created"`
 	BackendReady   bool                          `json:"backend_ready"`
 	BackendStart   bool                          `json:"backend_starting,omitempty"`
+	BackendDead    bool                          `json:"backend_dead,omitempty"`
+	BackendError   string                        `json:"backend_error,omitempty"`
 	RemovalPending bool                          `json:"removal_pending,omitempty"`
 	RemovalError   string                        `json:"removal_error,omitempty"`
 	CreatedAt      time.Time                     `json:"created_at"`

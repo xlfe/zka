@@ -27,6 +27,16 @@ func newLifecycleRunner(names ...string) *lifecycleRunner {
 	return runner
 }
 
+func (r *lifecycleRunner) setSession(name string, exists bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if exists {
+		r.sessions[name] = true
+	} else {
+		delete(r.sessions, name)
+	}
+}
+
 func (r *lifecycleRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -75,6 +85,112 @@ func viewsForPanes(paneIDs ...string) map[string]RuntimeView {
 		views[paneID] = RuntimeView{PaneID: paneID, WindowID: int64(index + 1), Ready: true}
 	}
 	return views
+}
+
+func TestBackendReconcileKeepsPartialWorkspaceAndMarksDeadPane(t *testing.T) {
+	runner := newLifecycleRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 2)
+	panes := workspace.SortedPanes()
+	for _, pane := range panes {
+		if _, err := d.applyEvent(context.Background(), Event{
+			WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "process_started", Source: "test", PID: 42,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner.setSession(panes[0].Backend.Ref, true)
+
+	result, err := d.reconcileBackends(context.Background(), workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Deleted) != 0 || len(result.Marked) != 1 || result.Marked[0] != panes[1].ID {
+		t.Fatalf("reconcile result = %#v", result)
+	}
+	got, err := d.getWorkspace(workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Panes[panes[0].ID].BackendDead || !got.Panes[panes[0].ID].BackendReady {
+		t.Fatalf("live pane was marked dead: %#v", got.Panes[panes[0].ID])
+	}
+	dead := got.Panes[panes[1].ID]
+	if !dead.BackendDead || dead.BackendReady || dead.Process.Running || dead.State != StateError || dead.Evidence.Event != "backend_missing" {
+		t.Fatalf("missing pane was not tombstoned: %#v", dead)
+	}
+}
+
+func TestBackendReconcileDeletesWorkspaceWhenAllBackendsAreDead(t *testing.T) {
+	runner := newLifecycleRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 2)
+	for _, pane := range workspace.SortedPanes() {
+		if _, err := d.applyEvent(context.Background(), Event{
+			WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "process_started", Source: "test", PID: 42,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := d.reconcileBackends(context.Background(), workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Deleted) != 1 || result.Deleted[0] != workspace.ID {
+		t.Fatalf("reconcile result = %#v", result)
+	}
+	if _, err := d.getWorkspace(workspace.ID); err == nil {
+		t.Fatal("all-dead workspace remained in daemon state")
+	}
+	if _, err := os.Stat(filepath.Join(d.paths.GeneratedDir, workspace.ID)); !os.IsNotExist(err) {
+		t.Fatalf("generated workspace directory still exists: %v", err)
+	}
+}
+
+func TestBackendReconcileDoesNotDeleteUnstartedWorkspace(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), newLifecycleRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	result, err := d.reconcileBackends(context.Background(), workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Deleted) != 0 || len(result.Marked) != 0 {
+		t.Fatalf("unstarted workspace was reconciled as dead: %#v", result)
+	}
+	if _, err := d.getWorkspace(workspace.ID); err != nil {
+		t.Fatalf("unstarted workspace was removed: %v", err)
+	}
+}
+
+func TestBackendReconcileDeletesExpiredUnstartedWorkspace(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), newLifecycleRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	d.mu.Lock()
+	pane := d.state.Workspaces[workspace.ID].Panes[firstPane(workspace).ID]
+	pane.CreatedAt = time.Now().Add(-backendStartupGrace - time.Second)
+	pane.UpdatedAt = pane.CreatedAt
+	d.mu.Unlock()
+
+	result, err := d.reconcileBackends(context.Background(), workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Deleted) != 1 || result.Deleted[0] != workspace.ID {
+		t.Fatalf("expired unstarted workspace was retained: %#v", result)
+	}
 }
 
 func readyWorkspaceAttachment(t *testing.T, d *Daemon, workspace *Workspace, id string) (*Workspace, *Attachment) {
@@ -330,7 +446,7 @@ func TestDeletionPendingRejectsMutations(t *testing.T) {
 	if _, err := d.renameWorkspace(renameWorkspaceRequest{Workspace: workspace.ID, Name: "new"}); err == nil {
 		t.Fatal("rename succeeded while deletion was pending")
 	}
-	if _, err := d.allocatePane(workspace.ID, "new"); err == nil {
+	if _, err := d.allocatePane(workspace.ID, "new", ""); err == nil {
 		t.Fatal("pane allocation succeeded while deletion was pending")
 	}
 	if _, err := d.detachAttachment(workspace.ID, "missing"); err == nil || !strings.Contains(err.Error(), "being deleted") {

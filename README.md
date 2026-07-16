@@ -29,18 +29,21 @@ only persistent PTY owner.
 
 ## Status
 
-Version 0.3 implements the workspace-centric workflow:
+Version 0.4 implements the workspace-centric workflow:
 
 - one dedicated Kitty process and remote-control socket per attachment;
 - one automatically managed `zmx` backend per pane;
 - topology-only Kitty templates;
 - watcher-driven topology capture with a two-second reconciliation fallback;
 - canonical manifests that restore only `zka pane`, never a foreground command;
-- primary and mirror attachments with idempotent open and two-phase move;
-- destination-initiated remote open/move over a supervised SSH control channel;
+- primary and mirror attachments with idempotent attach and two-phase move;
+- destination-initiated remote attach/move over a supervised SSH control channel;
 - remote state mirroring, lease revocation, reconnect, and full-snapshot resync;
 - explicit workspace rename and kill operations, locally and over SSH;
 - view-owned zmx lifecycle cleanup with durable retry after partial failures;
+- dead-backend placeholders for partial failures and automatic reclamation when
+  a workspace has no surviving zmx sessions;
+- same-directory tab/window creation through Kitty's last reported shell CWD;
 - Codex lifecycle attention state, Kitty notifications, and important
   `ntfy-send` notifications;
 - daemon-owned cancellation and deterministic worker shutdown.
@@ -113,12 +116,18 @@ workspace. If Kitty crashes or its socket becomes unreachable without a
 confirmed close event, zka preserves the zmx sessions and marks the attachment
 unhealthy.
 
+If one zmx backend dies while other panes remain alive, a later attach restores
+that pane as a static `zmx backend is dead` placeholder so the surviving panes
+stay accessible. Press Ctrl-C in the placeholder to remove only that pane. If
+the last zmx backend dies, the daemon closes any remaining managed Kitty view
+and removes the workspace automatically.
+
 Workspace operations are intentionally workspace-level:
 
 ```sh
 zka workspace list
 zka workspace inspect example-project
-zka workspace open example-project
+zka workspace attach example-project
 zka workspace move example-project
 zka workspace focus example-project --pane PANE_ID
 zka workspace seen example-project
@@ -128,12 +137,12 @@ zka workspace kill shell-work
 ```
 
 `detach` is the intentional persistence boundary: it closes the local Kitty
-attachment while leaving every zmx session alive for a later `open`. `kill` is
+attachment while leaving every zmx session alive for a later `attach`. `kill` is
 immediate and non-interactive. Cleanup state is persisted before zmx is
 signalled, and failed kills are retried by the daemon until absence is
 confirmed.
 
-Opening an already attached workspace focuses and reuses it. Restoration
+Attaching an already attached workspace focuses and reuses it. Restoration
 recreates the logical OS-window/tab/split hierarchy, layout state, titles,
 working directories, and active focus. It never saves or reruns `codex`, `nvim`,
 or another foreground program; those processes are already alive in zmx.
@@ -170,13 +179,13 @@ Then, from the destination machine:
 ```sh
 zka workspace list --origin devbox.example
 zka workspace inspect devbox.example:example-project
-zka workspace open devbox.example:example-project
+zka workspace attach devbox.example:example-project
 zka workspace move devbox.example:example-project
 zka workspace rename devbox.example:example-project shell-work
 zka workspace kill devbox.example:shell-work
 ```
 
-`open` creates or focuses a mirror. `move` performs a two-phase handoff:
+`attach` creates or focuses a mirror. `move` performs a two-phase handoff:
 
 1. fetch origin revision R and register a preparing destination attachment;
 2. create every destination Kitty pane;
@@ -186,7 +195,7 @@ zka workspace kill devbox.example:shell-work
 6. only then revoke and close the old primary views.
 
 If destination creation, SSH, revision validation, or pane readiness fails, the
-new views are removed and the source remains untouched. Repeating open or move
+new views are removed and the source remains untouched. Repeating attach or move
 reuses the deterministic node/workspace attachment instead of creating
 duplicates.
 
@@ -207,7 +216,8 @@ ssh -tt -- devbox.example exec zka remote-attach --workspace W --pane P --attach
 
 OpenSSH server-alive checks detect dead TCP sessions. zka retries only SSH exit
 status 255, with exponential backoff from 250 ms to 30 seconds, then reattaches
-to the same zmx session. It never restarts a missing foreground process.
+to the same zmx session. It never restarts a missing foreground process; a
+missing backend becomes the same removable static placeholder used locally.
 
 ## Attention and notifications
 
@@ -230,10 +240,11 @@ managed workspace:
 bindsym $mod+Return exec zka kitty
 ```
 
-Keep Kitty's `new_window_with_cwd` and `new_tab_with_cwd` mappings; the dedicated
-instance's forced shell routes each new pane through zka automatically. Point a
-quad-terminal binding at a topology template instead of launching four
-independent terminals.
+Keep mappings such as `new_window_with_cwd` and `new_tab_with_cwd` (including a
+custom Ctrl-T mapping). The managed instance redirects those action names
+through Kitty's last OSC-7-reported directory before its forced shell routes the
+new pane through zka. Point a quad-terminal binding at a topology template
+instead of launching four independent terminals.
 
 Leave utility terminals such as `audio-mixer`, `work-log`, and `system-monitor` on plain Kitty
 unless their processes should also persist. zka does not try to adopt an

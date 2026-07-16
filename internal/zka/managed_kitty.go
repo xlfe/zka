@@ -137,10 +137,9 @@ func launchManagedKitty(ctx context.Context, paths Paths, cfg Config, api API, o
 		managedShell = "zka remote-new-pane --origin " + attachment.Transport.Host +
 			" --workspace " + opts.Workspace.ID + " --attachment " + attachment.ID
 	}
+	args = append(args, managedKittyOverrides(managedShell)...)
 	args = append(args,
 		"--listen-on", attachment.Endpoint,
-		"--override", "allow_remote_control=socket-only",
-		"--override", "shell="+managedShell,
 		"--watcher", cfg.Kitty.Watcher,
 		"--session", path,
 	)
@@ -176,9 +175,20 @@ func launchManagedKitty(ctx context.Context, paths Paths, cfg Config, api API, o
 	return workspace, nil
 }
 
+func managedKittyOverrides(managedShell string) []string {
+	return []string{
+		"--override", "allow_remote_control=socket-only",
+		"--override", "shell=" + managedShell,
+		"--override", "action_alias new_tab_with_cwd launch --type=tab --cwd=last_reported",
+		"--override", "action_alias new_window_with_cwd launch --type=window --cwd=last_reported",
+		"--override", "action_alias new_os_window_with_cwd launch --type=os-window --cwd=last_reported",
+	}
+}
+
 func waitForAttachmentReady(ctx context.Context, api API, kitty KittyClient, workspace *Workspace, attachment *Attachment) (*Workspace, error) {
 	deadline := time.Now().Add(10 * time.Second)
 	var lastErr error
+	var validationErr error
 	for time.Now().Before(deadline) {
 		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		fresh, refreshErr := api.Workspace(callCtx, workspace.ID)
@@ -204,7 +214,7 @@ func waitForAttachmentReady(ctx context.Context, api API, kitty KittyClient, wor
 				if updateErr == nil {
 					return updated, nil
 				}
-				lastErr = updateErr
+				lastErr, validationErr = updateErr, updateErr
 			} else {
 				updated, updateErr := api.UpdateAttachment(ctx, attachmentUpdateRequest{
 					Workspace: workspace.ID, Attachment: attachment.ID,
@@ -213,7 +223,7 @@ func waitForAttachmentReady(ctx context.Context, api API, kitty KittyClient, wor
 				if updateErr == nil {
 					return updated, nil
 				}
-				lastErr = updateErr
+				lastErr, validationErr = updateErr, updateErr
 			}
 		} else {
 			lastErr = err
@@ -223,6 +233,12 @@ func waitForAttachmentReady(ctx context.Context, api API, kitty KittyClient, wor
 			return nil, ctx.Err()
 		case <-time.After(100 * time.Millisecond):
 		}
+	}
+	if validationErr != nil {
+		lastErr = validationErr
+	}
+	if lastErr == nil {
+		lastErr = context.DeadlineExceeded
 	}
 	return nil, fmt.Errorf("managed Kitty did not become ready: %w", lastErr)
 }
