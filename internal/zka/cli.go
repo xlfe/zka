@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
@@ -85,7 +85,7 @@ func printUsage(w io.Writer) {
 
 Commands:
   kitty       Create a managed Kitty workspace
-  workspace   List, inspect, open, move, detach, focus, or acknowledge workspaces
+  workspace   List, inspect, open, move, detach, rename, kill, focus, or acknowledge workspaces
   doctor      Check local or remote integration
   daemon      Run zkad (normally via systemd --user)
 
@@ -254,6 +254,10 @@ func runWorkspace(args []string, paths Paths, stdout, stderr io.Writer) (int, er
 		return runWorkspaceOpen(args[1:], paths, true, stdout, stderr)
 	case "detach":
 		return runWorkspaceDetach(args[1:], paths, stdout, stderr)
+	case "rename":
+		return runWorkspaceRename(args[1:], paths, stdout, stderr)
+	case "kill":
+		return runWorkspaceKill(args[1:], paths, stdout, stderr)
 	case "focus":
 		return runWorkspaceFocus(args[1:], paths, stdout, stderr)
 	case "seen":
@@ -272,6 +276,8 @@ func printWorkspaceUsage(w io.Writer) {
   open [SSH_ALIAS:]REF [--pane PANE]
   move [SSH_ALIAS:]REF [--pane PANE]
   detach REF
+  rename [SSH_ALIAS:]REF NAME
+  kill [SSH_ALIAS:]REF
   focus REF [--pane PANE]
   seen REF [--pane PANE]`)
 }
@@ -358,6 +364,9 @@ func runWorkspaceOpen(args []string, paths Paths, move bool, stdout, stderr io.W
 	}
 	if err != nil {
 		return 1, err
+	}
+	if workspace.DeletionPending {
+		return 1, fmt.Errorf("workspace %q is being deleted", workspace.Name)
 	}
 	if *paneRef != "" {
 		if _, err := resolvePaneFromCopy(workspace, *paneRef); err != nil {
@@ -579,19 +588,85 @@ func runWorkspaceDetach(args []string, paths Paths, stdout, stderr io.Writer) (i
 	}
 	var firstErr error
 	for _, attachment := range attachments {
+		if workspace.RemoteHost != "" {
+			if err := api.RemoteCall(ctx, workspace.RemoteHost, "detach_attachment", attachmentRefRequest{Workspace: workspace.ID, Attachment: attachment.ID}, nil); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+		}
 		if err := closeAndDetachLocal(ctx, paths, api, workspace, attachment); err != nil && firstErr == nil {
 			firstErr = err
-		}
-		if workspace.RemoteHost != "" {
-			if err := api.RemoteCall(ctx, workspace.RemoteHost, "detach_attachment", attachmentRefRequest{Workspace: workspace.ID, Attachment: attachment.ID}, nil); err != nil && firstErr == nil {
-				firstErr = err
-			}
 		}
 	}
 	if firstErr != nil {
 		return 1, firstErr
 	}
 	fmt.Fprintln(stdout, workspace.Name)
+	return 0, nil
+}
+
+func runWorkspaceRename(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("workspace rename", stderr)
+	if err := fs.Parse(args); err != nil {
+		return 2, err
+	}
+	if fs.NArg() != 2 {
+		return 2, fmt.Errorf("workspace rename requires a workspace reference and a new name")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	api := NewAPI(paths)
+	host, _ := splitWorkspaceRef(fs.Arg(0))
+	workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
+	if err != nil {
+		return 1, err
+	}
+	request := renameWorkspaceRequest{Workspace: workspace.ID, Name: fs.Arg(1), ExpectedRevision: workspace.Revision}
+	if host == "" {
+		workspace, err = api.RenameWorkspace(ctx, request)
+	} else {
+		var renamed Workspace
+		err = api.RemoteCall(ctx, host, "rename_workspace", request, &renamed)
+		workspace = &renamed
+	}
+	if err != nil {
+		return 1, err
+	}
+	fmt.Fprintf(stdout, "%s\t%s\n", workspace.ID, workspace.Name)
+	return 0, nil
+}
+
+func runWorkspaceKill(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("workspace kill", stderr)
+	if err := fs.Parse(args); err != nil {
+		return 2, err
+	}
+	if fs.NArg() != 1 {
+		return 2, fmt.Errorf("workspace kill requires one workspace reference")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	api := NewAPI(paths)
+	host, _ := splitWorkspaceRef(fs.Arg(0))
+	workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
+	if err != nil {
+		return 1, err
+	}
+	killCtx, killCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer killCancel()
+	api.client.Timeout = 15 * time.Second
+	var response workspaceDeletionResponse
+	if host == "" {
+		response, err = api.KillWorkspace(killCtx, workspace.ID)
+	} else {
+		err = api.RemoteCall(killCtx, host, "kill_workspace", killWorkspaceRequest{WorkspaceID: workspace.ID}, &response)
+	}
+	if err != nil {
+		return 1, err
+	}
+	fmt.Fprintf(stdout, "%s\t%s\n", response.DeletedWorkspaceID, response.Name)
 	return 0, nil
 }
 
@@ -641,6 +716,9 @@ func runWorkspaceFocus(args []string, paths Paths, stdout, stderr io.Writer) (in
 	workspace, err := api.Workspace(ctx, fs.Arg(0))
 	if err != nil {
 		return 1, err
+	}
+	if workspace.DeletionPending {
+		return 1, fmt.Errorf("workspace %q is being deleted", workspace.Name)
 	}
 	if *pane != "" {
 		resolved, err := resolvePaneFromCopy(workspace, *pane)
@@ -755,7 +833,11 @@ func writeWorkspaceTable(w io.Writer, workspaces []*Workspace) {
 		if workspace.RemoteHost != "" {
 			origin = workspace.RemoteHost
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%d\t%d\n", workspace.Attention, workspace.Name, shortID(workspace.ID), origin, workspace.Revision, len(workspace.Panes), len(workspace.Attachments))
+		state := string(workspace.Attention)
+		if workspace.DeletionPending {
+			state = "deleting"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%d\t%d\n", state, workspace.Name, shortID(workspace.ID), origin, workspace.Revision, len(workspace.Panes), len(workspace.Attachments))
 	}
 	_ = tw.Flush()
 }
@@ -763,8 +845,14 @@ func writeWorkspaceTable(w io.Writer, workspaces []*Workspace) {
 func writeWorkspaceDetail(w io.Writer, workspace *Workspace) {
 	fmt.Fprintf(w, "workspace=%s\nname=%s\norigin=%s\nrevision=%d\nattention=%s\nprimary_attachment=%s\n",
 		workspace.ID, workspace.Name, workspace.Origin.Name, workspace.Revision, workspace.Attention, workspace.PrimaryAttachmentID)
+	if workspace.DeletionPending {
+		fmt.Fprintf(w, "deletion_pending=true\ndeletion_error=%s\n", workspace.DeletionError)
+	}
 	for _, pane := range workspace.SortedPanes() {
 		fmt.Fprintf(w, "pane[%s]=%s backend=%s state=%s evidence=%s/%s\n", shortID(pane.ID), pane.Title, pane.Backend.Ref, pane.State, pane.Evidence.Source, pane.Evidence.Event)
+		if pane.RemovalPending {
+			fmt.Fprintf(w, "pane_removal[%s]=pending error=%s\n", shortID(pane.ID), pane.RemovalError)
+		}
 		for _, record := range pane.Notifications {
 			if record.LastError != "" {
 				fmt.Fprintf(w, "notification_error[%s]=%s\n", record.Channel, record.LastError)

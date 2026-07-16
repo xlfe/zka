@@ -29,18 +29,36 @@ def _workspace(window: Any | None) -> str:
     return str(values.get("zka_workspace", ""))
 
 
+def _pane(window: Any | None) -> str:
+    if window is None:
+        return os.environ.get("ZKA_PANE_ID", "")
+    values = getattr(window, "user_vars", None) or {}
+    return str(values.get("zka_pane", ""))
+
+
+def _event_data(args: tuple[Any, ...]) -> dict[str, Any]:
+    for value in reversed(args):
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
 def _emit(kind: str, *args: Any) -> None:
     path = os.environ.get("ZKA_WATCHER_SOCKET", "")
     endpoint = os.environ.get("KITTY_LISTEN_ON", "")
     if not path or not endpoint:
         return
     window = _window(args)
+    data = _event_data(args)
     payload = {
         "version": 1,
         "endpoint": endpoint,
         "workspace": _workspace(window),
         "kind": kind,
         "window_id": int(getattr(window, "id", 0) or 0),
+        "pane_id": _pane(window),
+        "confirmed": bool(data.get("confirmed", False)),
+        "aborted": bool(data.get("aborted", False)),
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")

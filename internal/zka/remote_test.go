@@ -90,6 +90,42 @@ func TestRemoteControlRejectsVersionMismatch(t *testing.T) {
 	<-done
 }
 
+func TestRemoteControlRenamesAndKillsAuthoritativeWorkspace(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+	workspace := createTestWorkspace(t, d, 1)
+	api := NewAPI(d.paths)
+
+	renamePayload, _ := json.Marshal(renameWorkspaceRequest{
+		Workspace: workspace.ID, Name: "shell-work", ExpectedRevision: workspace.Revision,
+	})
+	raw, err := dispatchRemoteControl(context.Background(), api, "rename_workspace", renamePayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var renamed Workspace
+	if err := json.Unmarshal(raw, &renamed); err != nil || renamed.Name != "shell-work" {
+		t.Fatalf("renamed workspace = %#v, %v", renamed, err)
+	}
+
+	killPayload, _ := json.Marshal(killWorkspaceRequest{WorkspaceID: workspace.ID})
+	raw, err = dispatchRemoteControl(context.Background(), api, "kill_workspace", killPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deleted workspaceDeletionResponse
+	if err := json.Unmarshal(raw, &deleted); err != nil || deleted.DeletedWorkspaceID != workspace.ID || deleted.Name != "shell-work" {
+		t.Fatalf("deletion response = %#v, %v", deleted, err)
+	}
+	// A lost response can be replayed by stable id on the same daemon.
+	if _, err := dispatchRemoteControl(context.Background(), api, "kill_workspace", killPayload); err != nil {
+		t.Fatalf("replayed kill: %v", err)
+	}
+}
+
 func TestRemoteMessageLimit(t *testing.T) {
 	oversized := strings.Repeat("x", remoteProtocolMax+1) + "\n"
 	if _, err := readRemoteEnvelope(bufio.NewReader(strings.NewReader(oversized))); err == nil || !strings.Contains(err.Error(), "exceeds") {
@@ -131,6 +167,42 @@ func TestRemoteCachePreservesLocalRuntimeMapping(t *testing.T) {
 	if local.Endpoint != "unix:/kitty" || local.Views["pane"].WindowID != 9 || local.Role != AttachmentPrimary || local.AppliedRevision != 5 {
 		t.Fatalf("local attachment = %#v", local)
 	}
+}
+
+func TestRemoteSnapshotEvictsMissingWorkspaceAndClosesLocalView(t *testing.T) {
+	runner := quietRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &Workspace{
+		ID: "remote", Name: "example-project", Origin: Host{ID: "devbox.example", Name: "devbox.example"}, Revision: 4,
+		Panes: map[string]*Pane{"pane": {ID: "pane", Visible: true}}, Attachments: map[string]*Attachment{},
+	}
+	d.cacheRemoteWorkspace("devbox.example", remote)
+	d.mu.Lock()
+	d.state.Workspaces[remote.ID].Attachments["local"] = &Attachment{
+		ID: "local", Endpoint: "unix:/kitty", Node: d.state.Node, Status: AttachmentReady,
+	}
+	d.mu.Unlock()
+	d.cacheRemoteSnapshot("devbox.example", nil)
+	if _, err := d.getWorkspace(remote.ID); err == nil {
+		t.Fatal("workspace missing from a full snapshot remained cached")
+	}
+	d.mu.Lock()
+	_, cached := d.state.Remotes["devbox.example"].Workspaces[remote.ID]
+	d.mu.Unlock()
+	if cached {
+		t.Fatal("remote cache retained an absent workspace")
+	}
+	waitFor(t, func() bool {
+		for _, call := range runner.Calls() {
+			if call.Name == "kitten" && strings.Contains(strings.Join(call.Args, " "), "close-window") {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 func TestUnreachableSSHControlReturnsWithoutMutatingWorkspace(t *testing.T) {

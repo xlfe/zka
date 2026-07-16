@@ -2,6 +2,7 @@ package zka
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -49,6 +50,30 @@ func TestStoreResetsUndeployedV1Schema(t *testing.T) {
 	}
 	if state.SchemaVersion != stateSchemaVersion || len(state.Workspaces) != 0 {
 		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestStoreResetsV2StateAndGeneratedFiles(t *testing.T) {
+	paths := testPaths(t.TempDir())
+	if err := os.MkdirAll(paths.GeneratedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.StateFile, []byte(`{"schema_version":2,"workspaces":{"old":{"id":"old"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generated := filepath.Join(paths.GeneratedDir, "old.kitty-session")
+	if err := os.WriteFile(generated, []byte("launch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := NewStore(paths).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.SchemaVersion != 3 || len(state.Workspaces) != 0 {
+		t.Fatalf("state = %#v", state)
+	}
+	if _, err := os.Stat(generated); !os.IsNotExist(err) {
+		t.Fatalf("legacy generated session remains: %v", err)
 	}
 }
 

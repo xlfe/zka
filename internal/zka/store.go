@@ -28,9 +28,10 @@ func (s *Store) Ensure() error {
 	return nil
 }
 
-// Load intentionally treats schema v1 as empty state. v1 represented
-// user-visible process sessions and cannot be truthfully migrated into Kitty
-// workspaces. NewDaemon immediately writes the replacement schema v2 state.
+// Load intentionally treats the pre-v3 schemas as empty state. v3 changes
+// process ownership: Kitty view closure now removes its zmx backend. Migrating
+// the old records would make that ownership ambiguous, so only zka's generated
+// files are reset. Existing zmx processes are deliberately left untouched.
 func (s *Store) Load() (StateData, error) {
 	if err := s.Ensure(); err != nil {
 		return StateData{}, err
@@ -48,12 +49,12 @@ func (s *Store) Load() (StateData, error) {
 	if err := json.Unmarshal(b, &header); err != nil {
 		return StateData{}, fmt.Errorf("decode state header: %w", err)
 	}
-	if header.SchemaVersion == 1 {
+	if header.SchemaVersion == 1 || header.SchemaVersion == 2 {
 		if err := os.RemoveAll(filepath.Join(s.paths.StateDir, "snapshots")); err != nil {
-			return StateData{}, fmt.Errorf("reset v1 snapshots: %w", err)
+			return StateData{}, fmt.Errorf("reset legacy snapshots: %w", err)
 		}
 		if err := os.RemoveAll(s.paths.GeneratedDir); err != nil {
-			return StateData{}, fmt.Errorf("reset generated v1 files: %w", err)
+			return StateData{}, fmt.Errorf("reset legacy generated files: %w", err)
 		}
 		if err := os.MkdirAll(s.paths.GeneratedDir, 0o700); err != nil {
 			return StateData{}, fmt.Errorf("reset generated workspace files: %w", err)
@@ -132,6 +133,20 @@ func (s *Store) WriteSession(workspaceID, suffix, content string) (string, error
 		return "", err
 	}
 	return path, nil
+}
+
+func (s *Store) RemoveWorkspaceSessions(workspaceID string) error {
+	pattern := filepath.Join(s.paths.GeneratedDir, shortID(workspaceID)+"*.kitty-session")
+	paths, err := filepath.Glob(pattern)
+	if err != nil {
+		return fmt.Errorf("find generated workspace sessions: %w", err)
+	}
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("remove generated workspace session %s: %w", path, err)
+		}
+	}
+	return nil
 }
 
 func atomicWrite(path string, data []byte, mode fs.FileMode) error {

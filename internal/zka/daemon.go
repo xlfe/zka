@@ -20,6 +20,7 @@ type Daemon struct {
 	mu        sync.Mutex
 	lifeMu    sync.Mutex
 	captureMu sync.Mutex
+	cleanupMu sync.Mutex
 	wg        sync.WaitGroup
 
 	paths  Paths
@@ -40,6 +41,9 @@ type Daemon struct {
 	workerErr error
 	events    chan WatcherEvent
 	capturing map[string]bool
+	cleaning  map[string]bool
+	cleanups  map[string]*sync.Mutex
+	deleted   map[string]string
 	remotes   *RemoteManager
 }
 
@@ -109,6 +113,9 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 		cancel:    cancel,
 		events:    make(chan WatcherEvent, 128),
 		capturing: map[string]bool{},
+		cleaning:  map[string]bool{},
+		cleanups:  map[string]*sync.Mutex{},
+		deleted:   map[string]string{},
 		conns:     map[net.Conn]struct{}{},
 	}
 	d.remotes = NewRemoteManager(d)
@@ -119,30 +126,35 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 // are bound. Close is idempotent and Wait joins all workers.
 func (d *Daemon) Start() error {
 	d.lifeMu.Lock()
-	defer d.lifeMu.Unlock()
 	if d.closed {
+		d.lifeMu.Unlock()
 		return fmt.Errorf("daemon has already been closed")
 	}
 	if d.started {
+		d.lifeMu.Unlock()
 		return nil
 	}
 	ln, err := listenUnix(d.paths.Socket)
 	if err != nil {
+		d.lifeMu.Unlock()
 		return err
 	}
 	watcher, err := listenUnixgram(d.paths.WatcherSocket)
 	if err != nil {
 		_ = ln.Close()
 		_ = os.Remove(d.paths.Socket)
+		d.lifeMu.Unlock()
 		return err
 	}
 	d.listener = ln
 	d.watcher = watcher
 	d.started = true
 	d.logger.Printf("listening on %s", d.paths.Socket)
-	d.startWorker(func(ctx context.Context) { d.acceptLoop(ctx) })
-	d.startWorker(func(ctx context.Context) { d.watcherReadLoop(ctx) })
-	d.startWorker(func(ctx context.Context) { d.topologyLoop(ctx) })
+	d.startWorkerLocked(func(ctx context.Context) { d.acceptLoop(ctx) })
+	d.startWorkerLocked(func(ctx context.Context) { d.watcherReadLoop(ctx) })
+	d.startWorkerLocked(func(ctx context.Context) { d.topologyLoop(ctx) })
+	d.lifeMu.Unlock()
+	d.resumeLifecycleCleanup()
 	return nil
 }
 
@@ -190,12 +202,22 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	return d.Wait()
 }
 
-func (d *Daemon) startWorker(work func(context.Context)) {
+func (d *Daemon) startWorker(work func(context.Context)) bool {
+	d.lifeMu.Lock()
+	defer d.lifeMu.Unlock()
+	return d.startWorkerLocked(work)
+}
+
+func (d *Daemon) startWorkerLocked(work func(context.Context)) bool {
+	if d.closed {
+		return false
+	}
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
 		work(d.ctx)
 	}()
+	return true
 }
 
 func (d *Daemon) failWorker(err error) {
@@ -352,6 +374,31 @@ type manifestUpdateRequest struct {
 	Views            map[string]RuntimeView `json:"views"`
 }
 
+type renameWorkspaceRequest struct {
+	Workspace        string `json:"workspace"`
+	Name             string `json:"name"`
+	ExpectedRevision uint64 `json:"expected_revision,omitempty"`
+}
+
+type closePanesRequest struct {
+	Workspace        string                 `json:"workspace"`
+	Attachment       string                 `json:"attachment"`
+	ExpectedRevision uint64                 `json:"expected_revision"`
+	Panes            []string               `json:"panes"`
+	Manifest         Manifest               `json:"manifest"`
+	Views            map[string]RuntimeView `json:"views"`
+}
+
+type killWorkspaceRequest struct {
+	WorkspaceID string `json:"workspace_id"`
+}
+
+type workspaceDeletionResponse struct {
+	DeletedWorkspaceID string   `json:"deleted_workspace_id"`
+	Name               string   `json:"name"`
+	Remaining          []string `json:"remaining,omitempty"`
+}
+
 type moveCommitRequest struct {
 	Workspace        string `json:"workspace"`
 	Destination      string `json:"destination"`
@@ -441,6 +488,24 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 			return nil, err
 		}
 		return d.updateManifest(req)
+	case "rename_workspace":
+		var req renameWorkspaceRequest
+		if err := decodePayload(raw, &req); err != nil {
+			return nil, err
+		}
+		return d.renameWorkspace(req)
+	case "close_panes":
+		var req closePanesRequest
+		if err := decodePayload(raw, &req); err != nil {
+			return nil, err
+		}
+		return d.closePanes(ctx, req)
+	case "kill_workspace":
+		var req killWorkspaceRequest
+		if err := decodePayload(raw, &req); err != nil {
+			return nil, err
+		}
+		return d.killWorkspace(ctx, req.WorkspaceID)
 	case "commit_move":
 		var req moveCommitRequest
 		if err := decodePayload(raw, &req); err != nil {
@@ -499,7 +564,7 @@ func (d *Daemon) createWorkspace(req createWorkspaceRequest) (*Workspace, error)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, existing := range d.state.Workspaces {
-		if existing.Name == req.Name {
+		if existing.RemoteHost == "" && existing.Name == req.Name {
 			return nil, fmt.Errorf("workspace name %q already exists", req.Name)
 		}
 	}
@@ -551,8 +616,20 @@ func (d *Daemon) deleteWorkspace(ref string) error {
 	if err != nil {
 		return err
 	}
+	if len(workspace.Attachments) != 0 {
+		return fmt.Errorf("workspace %q has attachments and cannot be rollback-deleted", workspace.Name)
+	}
+	for _, pane := range workspace.Panes {
+		if pane.BackendCreated || pane.BackendStart {
+			return fmt.Errorf("workspace %q has a started backend and cannot be rollback-deleted", workspace.Name)
+		}
+	}
 	delete(d.state.Workspaces, workspace.ID)
-	return d.store.Save(d.state)
+	if err := d.store.Save(d.state); err != nil {
+		d.state.Workspaces[workspace.ID] = workspace
+		return err
+	}
+	return d.store.RemoveWorkspaceSessions(workspace.ID)
 }
 
 func (d *Daemon) getWorkspace(ref string) (*Workspace, error) {
@@ -629,6 +706,9 @@ func (d *Daemon) preparePane(workspaceRef, paneRef string) (preparePaneResponse,
 	if err != nil {
 		return preparePaneResponse{}, err
 	}
+	if err := requireWorkspaceMutable(workspace); err != nil {
+		return preparePaneResponse{}, err
+	}
 	var pane *Pane
 	if paneRef == "" {
 		pane, _, err = allocatePaneLocked(workspace, "")
@@ -685,6 +765,9 @@ func (d *Daemon) allocatePane(workspaceRef, key string) (allocatePaneResponse, e
 	if err != nil {
 		return allocatePaneResponse{}, err
 	}
+	if err := requireWorkspaceMutable(workspace); err != nil {
+		return allocatePaneResponse{}, err
+	}
 	pane, _, err := allocatePaneLocked(workspace, key)
 	if err != nil {
 		return allocatePaneResponse{}, err
@@ -707,6 +790,9 @@ func (d *Daemon) registerAttachment(workspaceRef string, attachment Attachment) 
 	defer d.mu.Unlock()
 	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
 	if err != nil {
+		return nil, err
+	}
+	if err := requireWorkspaceMutable(workspace); err != nil {
 		return nil, err
 	}
 	now := time.Now().UTC()
@@ -776,6 +862,9 @@ func (d *Daemon) updateAttachment(req attachmentUpdateRequest) (*Workspace, erro
 	if err != nil {
 		return nil, err
 	}
+	if err := requireWorkspaceMutable(workspace); err != nil {
+		return nil, err
+	}
 	attachment := workspace.Attachments[req.Attachment]
 	if attachment == nil {
 		return nil, fmt.Errorf("unknown attachment %q", req.Attachment)
@@ -818,6 +907,9 @@ func (d *Daemon) setAttachmentPaneReady(req attachmentPaneReadyRequest) (*Attach
 	defer d.mu.Unlock()
 	workspace, err := d.resolveWorkspaceLocked(req.Workspace)
 	if err != nil {
+		return nil, err
+	}
+	if err := requireWorkspaceMutable(workspace); err != nil {
 		return nil, err
 	}
 	if workspace.Panes[req.Pane] == nil {
@@ -868,6 +960,9 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	defer d.mu.Unlock()
 	workspace, err := d.resolveWorkspaceLocked(req.Workspace)
 	if err != nil {
+		return nil, err
+	}
+	if err := requireWorkspaceMutable(workspace); err != nil {
 		return nil, err
 	}
 	attachment := workspace.Attachments[req.Attachment]
@@ -1035,6 +1130,9 @@ func (d *Daemon) commitMove(req moveCommitRequest) (moveCommitResponse, error) {
 	if err != nil {
 		return moveCommitResponse{}, err
 	}
+	if err := requireWorkspaceMutable(workspace); err != nil {
+		return moveCommitResponse{}, err
+	}
 	destination := workspace.Attachments[req.Destination]
 	if destination == nil {
 		return moveCommitResponse{}, fmt.Errorf("unknown destination attachment %q", req.Destination)
@@ -1097,6 +1195,9 @@ func (d *Daemon) detachAttachment(workspaceRef, attachmentID string) (*Workspace
 	defer d.mu.Unlock()
 	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
 	if err != nil {
+		return nil, err
+	}
+	if err := requireWorkspaceMutable(workspace); err != nil {
 		return nil, err
 	}
 	attachment := workspace.Attachments[attachmentID]
@@ -1199,6 +1300,10 @@ func (d *Daemon) markSeen(workspaceRef, paneRef string) (*Workspace, error) {
 	d.mu.Lock()
 	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
 	if err != nil {
+		d.mu.Unlock()
+		return nil, err
+	}
+	if err := requireWorkspaceMutable(workspace); err != nil {
 		d.mu.Unlock()
 		return nil, err
 	}

@@ -90,6 +90,24 @@ func (a API) UpdateManifest(ctx context.Context, req manifestUpdateRequest) (*Wo
 	return &out, err
 }
 
+func (a API) RenameWorkspace(ctx context.Context, req renameWorkspaceRequest) (*Workspace, error) {
+	var out Workspace
+	err := a.client.Call(ctx, "rename_workspace", req, &out)
+	return &out, err
+}
+
+func (a API) ClosePanes(ctx context.Context, req closePanesRequest) (*Workspace, error) {
+	var out Workspace
+	err := a.client.Call(ctx, "close_panes", req, &out)
+	return &out, err
+}
+
+func (a API) KillWorkspace(ctx context.Context, workspaceID string) (workspaceDeletionResponse, error) {
+	var out workspaceDeletionResponse
+	err := a.client.Call(ctx, "kill_workspace", killWorkspaceRequest{WorkspaceID: workspaceID}, &out)
+	return out, err
+}
+
 func (a API) CommitMove(ctx context.Context, req moveCommitRequest) (moveCommitResponse, error) {
 	var out moveCommitResponse
 	err := a.client.Call(ctx, "commit_move", req, &out)

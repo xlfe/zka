@@ -2,6 +2,7 @@ package zka
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"io"
 	"path/filepath"
@@ -68,5 +69,34 @@ func TestPreferredLocalAttachmentReusesReadyAlternateInstance(t *testing.T) {
 	}
 	if got := preferredLocalAttachment(workspace, "node"); got == nil || got.ID != "ready" {
 		t.Fatalf("preferred attachment = %#v", got)
+	}
+}
+
+func TestWorkspaceRenameAndKillCLI(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+	workspace := createTestWorkspace(t, d, 1)
+
+	var stdout, stderr bytes.Buffer
+	code, err := runWorkspaceRename([]string{workspace.ID, "shell-work"}, d.paths, &stdout, &stderr)
+	if err != nil || code != 0 || !strings.Contains(stdout.String(), workspace.ID+"\tshell-work") {
+		t.Fatalf("rename: code=%d err=%v stdout=%q stderr=%q", code, err, stdout.String(), stderr.String())
+	}
+	renamed, err := NewAPI(d.paths).Workspace(context.Background(), workspace.ID)
+	if err != nil || renamed.Name != "shell-work" {
+		t.Fatalf("renamed workspace = %#v, %v", renamed, err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code, err = runWorkspaceKill([]string{workspace.ID}, d.paths, &stdout, &stderr)
+	if err != nil || code != 0 || !strings.Contains(stdout.String(), workspace.ID+"\tshell-work") {
+		t.Fatalf("kill: code=%d err=%v stdout=%q stderr=%q", code, err, stdout.String(), stderr.String())
+	}
+	if _, err := NewAPI(d.paths).Workspace(context.Background(), workspace.ID); err == nil {
+		t.Fatal("killed workspace remained visible")
 	}
 }

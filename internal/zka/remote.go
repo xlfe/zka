@@ -67,15 +67,17 @@ func (m *RemoteManager) client(host string) (*remoteClient, error) {
 		return nil, err
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return nil, context.Canceled
 	}
 	if client := m.clients[host]; client != nil {
+		m.mu.Unlock()
 		return client, nil
 	}
 	client := newRemoteClient(m, host)
 	m.clients[host] = client
+	m.mu.Unlock()
 	m.daemon.startWorker(func(ctx context.Context) { client.supervise(ctx) })
 	return client, nil
 }
@@ -110,11 +112,9 @@ func (m *RemoteManager) cacheResult(host, op string, result json.RawMessage) {
 	case "list":
 		var workspaces []*Workspace
 		if json.Unmarshal(result, &workspaces) == nil {
-			for _, workspace := range workspaces {
-				m.daemon.cacheRemoteWorkspace(host, workspace)
-			}
+			m.daemon.cacheRemoteSnapshot(host, workspaces)
 		}
-	case "get", "update_attachment", "update_manifest", "detach_attachment", "seen":
+	case "get", "update_attachment", "update_manifest", "detach_attachment", "seen", "rename_workspace", "close_panes":
 		var workspace Workspace
 		if json.Unmarshal(result, &workspace) == nil {
 			m.daemon.cacheRemoteWorkspace(host, &workspace)
@@ -129,16 +129,38 @@ func (m *RemoteManager) cacheResult(host, op string, result json.RawMessage) {
 		if json.Unmarshal(result, &response) == nil {
 			m.daemon.cacheRemoteWorkspace(host, response.Workspace)
 		}
+	case "kill_workspace":
+		var response workspaceDeletionResponse
+		if json.Unmarshal(result, &response) == nil && response.DeletedWorkspaceID != "" {
+			m.daemon.evictRemoteWorkspace(host, response.DeletedWorkspaceID)
+		}
 	}
 }
 
-func (m *RemoteManager) cacheEvent(host string, payload json.RawMessage) {
-	var workspace Workspace
-	if err := json.Unmarshal(payload, &workspace); err != nil {
-		m.daemon.logger.Printf("decode remote workspace event from %s: %v", host, err)
-		return
+func (m *RemoteManager) cacheEvent(host, op string, payload json.RawMessage) {
+	switch op {
+	case "snapshot":
+		var workspaces []*Workspace
+		if err := json.Unmarshal(payload, &workspaces); err != nil {
+			m.daemon.logger.Printf("decode remote workspace snapshot from %s: %v", host, err)
+			return
+		}
+		m.daemon.cacheRemoteSnapshot(host, workspaces)
+	case "workspace":
+		var workspace Workspace
+		if err := json.Unmarshal(payload, &workspace); err != nil {
+			m.daemon.logger.Printf("decode remote workspace event from %s: %v", host, err)
+			return
+		}
+		m.daemon.cacheRemoteWorkspace(host, &workspace)
+	case "deleted_workspace":
+		var response workspaceDeletionResponse
+		if err := json.Unmarshal(payload, &response); err != nil {
+			m.daemon.logger.Printf("decode remote workspace deletion from %s: %v", host, err)
+			return
+		}
+		m.daemon.evictRemoteWorkspace(host, response.DeletedWorkspaceID)
 	}
-	m.daemon.cacheRemoteWorkspace(host, &workspace)
 }
 
 var errRemoteDisconnected = errors.New("remote SSH control connection disconnected")
@@ -200,10 +222,12 @@ func (c *remoteClient) supervise(ctx context.Context) {
 		c.process, c.stdin, c.encoder = cmd, stdin, json.NewEncoder(stdin)
 		c.mu.Unlock()
 		readerDone := make(chan struct{})
-		c.manager.daemon.startWorker(func(workerCtx context.Context) {
+		if !c.manager.daemon.startWorker(func(workerCtx context.Context) {
 			defer close(readerDone)
 			c.readLoop(workerCtx, stdout)
-		})
+		}) {
+			close(readerDone)
+		}
 		waitErr := cmd.Wait()
 		<-readerDone
 		c.mu.Lock()
@@ -299,7 +323,7 @@ func (c *remoteClient) readLoop(ctx context.Context, input io.Reader) {
 				waiter <- message
 			}
 		case "event":
-			c.manager.cacheEvent(c.host, message.Payload)
+			c.manager.cacheEvent(c.host, message.Op, message.Payload)
 		}
 		select {
 		case <-ctx.Done():
@@ -444,7 +468,7 @@ func (w *remoteControlWriter) send(message remoteEnvelope) error {
 
 func runRemoteControl(ctx context.Context, paths Paths, stdin io.Reader, stdout io.Writer) error {
 	writer := &remoteControlWriter{enc: json.NewEncoder(stdout)}
-	if err := writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "hello", Capabilities: []string{"workspace-snapshots", "events", "two-phase-move", "revocation"}}); err != nil {
+	if err := writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "hello", Capabilities: []string{"workspace-snapshots", "events", "two-phase-move", "revocation", "workspace-lifecycle"}}); err != nil {
 		return err
 	}
 	api := NewAPI(paths)
@@ -490,10 +514,20 @@ func streamRemoteEvents(ctx context.Context, api API, writer *remoteControlWrite
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	seen := map[string]string{}
+	first := true
 	for {
 		workspaces, err := authoritativeWorkspaces(ctx, api)
 		if err == nil {
+			if first {
+				payload, _ := json.Marshal(workspaces)
+				if writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "event", Op: "snapshot", Payload: payload}) != nil {
+					return
+				}
+				first = false
+			}
+			current := map[string]bool{}
 			for _, workspace := range workspaces {
+				current[workspace.ID] = true
 				fingerprint := fmt.Sprintf("%d:%s:%s", workspace.Revision, workspace.UpdatedAt.Format(time.RFC3339Nano), workspace.Attention)
 				if seen[workspace.ID] == fingerprint {
 					continue
@@ -501,6 +535,16 @@ func streamRemoteEvents(ctx context.Context, api API, writer *remoteControlWrite
 				seen[workspace.ID] = fingerprint
 				payload, _ := json.Marshal(workspace)
 				if writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "event", Op: "workspace", Payload: payload}) != nil {
+					return
+				}
+			}
+			for id := range seen {
+				if current[id] {
+					continue
+				}
+				delete(seen, id)
+				payload, _ := json.Marshal(workspaceDeletionResponse{DeletedWorkspaceID: id})
+				if writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "event", Op: "deleted_workspace", Payload: payload}) != nil {
 					return
 				}
 			}
@@ -584,6 +628,44 @@ func dispatchRemoteControl(ctx context.Context, api API, op string, raw json.Raw
 		}
 		workspace, err := api.UpdateManifest(ctx, req)
 		value = workspace
+		if err != nil {
+			return nil, err
+		}
+	case "rename_workspace":
+		var req renameWorkspaceRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		if err := requireAuthoritative(ctx, api, req.Workspace); err != nil {
+			return nil, err
+		}
+		workspace, err := api.RenameWorkspace(ctx, req)
+		value = workspace
+		if err != nil {
+			return nil, err
+		}
+	case "close_panes":
+		var req closePanesRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		if err := requireAuthoritative(ctx, api, req.Workspace); err != nil {
+			return nil, err
+		}
+		workspace, err := api.ClosePanes(ctx, req)
+		value = workspace
+		if err != nil {
+			return nil, err
+		}
+	case "kill_workspace":
+		var req killWorkspaceRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		killAPI := api
+		killAPI.client.Timeout = 15 * time.Second
+		result, err := killAPI.KillWorkspace(ctx, req.WorkspaceID)
+		value = result
 		if err != nil {
 			return nil, err
 		}
@@ -697,6 +779,7 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) *Workspace
 	var changedPanes []string
 	var pendingDetaches []string
 	var revokedEndpoints []string
+	var deletingEndpoints []string
 	existing := d.state.Workspaces[clone.ID]
 	if existing != nil {
 		for paneID, pane := range clone.Panes {
@@ -723,6 +806,12 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) *Workspace
 				local.Role = authoritative.Role
 				local.Revoked = authoritative.Revoked
 				local.ClientHeartbeats = authoritative.ClientHeartbeats
+				for paneID := range local.Views {
+					pane := clone.Panes[paneID]
+					if pane == nil || pane.RemovalPending {
+						delete(local.Views, paneID)
+					}
+				}
 				if authoritative.Status == AttachmentDetached && local.Status != AttachmentDetached {
 					local.Revoked = true
 				}
@@ -732,7 +821,7 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) *Workspace
 				if local.Revoked && !local.RevocationClosed && local.Status != AttachmentDetached {
 					revokedEndpoints = append(revokedEndpoints, local.Endpoint)
 				}
-				if authoritative.Role == AttachmentPrimary && authoritative.AppliedRevision == clone.Revision {
+				if authoritative.AppliedRevision == clone.Revision {
 					local.AppliedRevision = clone.Revision
 				}
 				if local.Status == AttachmentDetached && authoritative.Status != AttachmentDetached {
@@ -741,6 +830,9 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) *Workspace
 				clone.Attachments[id] = local
 			} else {
 				clone.Attachments[id] = localAttachment.Clone()
+			}
+			if clone.DeletionPending && localAttachment.Status != AttachmentDetached {
+				deletingEndpoints = append(deletingEndpoints, localAttachment.Endpoint)
 			}
 		}
 	}
@@ -775,6 +867,77 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) *Workspace
 		for _, endpoint := range revokedEndpoints {
 			d.scheduleCapture(endpoint)
 		}
+		for _, endpoint := range deletingEndpoints {
+			endpoint := endpoint
+			d.startWorker(func(ctx context.Context) {
+				callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				_ = d.kitty.CloseWorkspace(callCtx, endpoint, result.ID)
+				cancel()
+			})
+		}
 	}
 	return result
+}
+
+func (d *Daemon) cacheRemoteSnapshot(host string, workspaces []*Workspace) {
+	present := map[string]bool{}
+	for _, workspace := range workspaces {
+		if workspace == nil || workspace.ID == "" {
+			continue
+		}
+		present[workspace.ID] = true
+		d.cacheRemoteWorkspace(host, workspace)
+	}
+	d.mu.Lock()
+	staleSet := map[string]bool{}
+	if cache := d.state.Remotes[host]; cache != nil {
+		for id := range cache.Workspaces {
+			if !present[id] {
+				staleSet[id] = true
+			}
+		}
+	}
+	for id, workspace := range d.state.Workspaces {
+		if workspace.RemoteHost == host && !present[id] {
+			staleSet[id] = true
+		}
+	}
+	d.mu.Unlock()
+	for id := range staleSet {
+		d.evictRemoteWorkspace(host, id)
+	}
+}
+
+func (d *Daemon) evictRemoteWorkspace(host, workspaceID string) {
+	if workspaceID == "" {
+		return
+	}
+	d.mu.Lock()
+	var endpoints []string
+	workspace := d.state.Workspaces[workspaceID]
+	if workspace != nil && workspace.RemoteHost == host {
+		for _, attachment := range workspace.Attachments {
+			if attachment.Node.ID == d.state.Node.ID && attachment.Status != AttachmentDetached && strings.HasPrefix(attachment.Endpoint, "unix:") {
+				attachment.Status = AttachmentDetached
+				attachment.Views = map[string]RuntimeView{}
+				endpoints = append(endpoints, attachment.Endpoint)
+			}
+		}
+		delete(d.state.Workspaces, workspaceID)
+	}
+	if cache := d.state.Remotes[host]; cache != nil {
+		delete(cache.Workspaces, workspaceID)
+		cache.UpdatedAt = time.Now().UTC()
+	}
+	_ = d.store.Save(d.state)
+	d.mu.Unlock()
+	_ = d.store.RemoveWorkspaceSessions(workspaceID)
+	for _, endpoint := range endpoints {
+		endpoint := endpoint
+		d.startWorker(func(ctx context.Context) {
+			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			_ = d.kitty.CloseWorkspace(callCtx, endpoint, workspaceID)
+			cancel()
+		})
+	}
 }

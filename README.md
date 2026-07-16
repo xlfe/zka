@@ -29,7 +29,7 @@ only persistent PTY owner.
 
 ## Status
 
-Version 0.2 implements the workspace-centric workflow:
+Version 0.3 implements the workspace-centric workflow:
 
 - one dedicated Kitty process and remote-control socket per attachment;
 - one automatically managed `zmx` backend per pane;
@@ -39,13 +39,17 @@ Version 0.2 implements the workspace-centric workflow:
 - primary and mirror attachments with idempotent open and two-phase move;
 - destination-initiated remote open/move over a supervised SSH control channel;
 - remote state mirroring, lease revocation, reconnect, and full-snapshot resync;
+- explicit workspace rename and kill operations, locally and over SSH;
+- view-owned zmx lifecycle cleanup with durable retry after partial failures;
 - Codex lifecycle attention state, Kitty notifications, and important
   `ntfy-send` notifications;
 - daemon-owned cancellation and deterministic worker shutdown.
 
-Schema v1 is intentionally reset on first v0.2 start. It represented individual
-process sessions and was never deployed; translating it into whole workspaces
-would invent topology that did not exist.
+State schemas v1 and v2 are intentionally reset on first v0.3 start because v3
+changes process ownership. The reset removes zka state and generated Kitty
+sessions, but does not kill old zmx sessions. Those sessions become unmanaged
+orphans and can be inspected or removed directly with zmx. Existing Kitty
+processes are not signalled by the reset either.
 
 ## NixOS setup
 
@@ -102,8 +106,12 @@ zka kitty --name example-project --cwd ~/example-project -- --class managed-kitt
 ```
 
 Every ordinary new tab or split in that dedicated Kitty instance uses its
-forced managed shell and becomes a new hidden zmx-backed pane. Closing the Kitty
-views leaves the pane processes in zmx.
+forced managed shell and becomes a new hidden zmx-backed pane. Closing a Kitty
+split or tab removes the corresponding pane and kills its zmx session. Closing
+the final pane, the managed OS window, or confirming Kitty quit kills the whole
+workspace. If Kitty crashes or its socket becomes unreachable without a
+confirmed close event, zka preserves the zmx sessions and marks the attachment
+unhealthy.
 
 Workspace operations are intentionally workspace-level:
 
@@ -115,7 +123,15 @@ zka workspace move example-project
 zka workspace focus example-project --pane PANE_ID
 zka workspace seen example-project
 zka workspace detach example-project
+zka workspace rename example-project shell-work
+zka workspace kill shell-work
 ```
+
+`detach` is the intentional persistence boundary: it closes the local Kitty
+attachment while leaving every zmx session alive for a later `open`. `kill` is
+immediate and non-interactive. Cleanup state is persisted before zmx is
+signalled, and failed kills are retried by the daemon until absence is
+confirmed.
 
 Opening an already attached workspace focuses and reuses it. Restoration
 recreates the logical OS-window/tab/split hierarchy, layout state, titles,
@@ -156,6 +172,8 @@ zka workspace list --origin devbox.example
 zka workspace inspect devbox.example:example-project
 zka workspace open devbox.example:example-project
 zka workspace move devbox.example:example-project
+zka workspace rename devbox.example:example-project shell-work
+zka workspace kill devbox.example:shell-work
 ```
 
 `open` creates or focuses a mirror. `move` performs a two-phase handoff:

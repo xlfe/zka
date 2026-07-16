@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"time"
 )
@@ -51,15 +52,31 @@ func (d *Daemon) topologyLoop(ctx context.Context) {
 	defer check.Stop()
 	defer fallback.Stop()
 	pending := map[string]debounceEntry{}
+	closing := map[string]map[string]bool{}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case event := <-d.events:
 			if event.Kind == "quit" {
-				delete(pending, event.Endpoint)
-				d.noteEndpointQuit(event.Endpoint)
+				if event.Confirmed && !event.Aborted {
+					delete(pending, event.Endpoint)
+					delete(closing, event.Endpoint)
+					d.scheduleEndpointDeletion(event.Endpoint)
+				}
 				continue
+			}
+			if event.Kind == "close" && event.PaneID != "" {
+				if closing[event.Endpoint] == nil {
+					closing[event.Endpoint] = map[string]bool{}
+				}
+				closing[event.Endpoint][event.PaneID] = true
+				if d.closeEventsCoverWorkspace(event.Endpoint, closing[event.Endpoint]) {
+					delete(pending, event.Endpoint)
+					delete(closing, event.Endpoint)
+					d.scheduleEndpointDeletion(event.Endpoint)
+					continue
+				}
 			}
 			now := time.Now()
 			entry, exists := pending[event.Endpoint]
@@ -109,6 +126,9 @@ func (d *Daemon) attachmentEndpoints() []string {
 	seen := map[string]bool{}
 	var endpoints []string
 	for _, workspace := range d.state.Workspaces {
+		if workspace.DeletionPending {
+			continue
+		}
 		for _, attachment := range workspace.Attachments {
 			if attachment.Endpoint == "" || attachment.Status == AttachmentDetached {
 				continue
@@ -129,6 +149,9 @@ func (d *Daemon) endpointAttachment(endpoint string) (*Workspace, *Attachment) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, workspace := range d.state.Workspaces {
+		if workspace.DeletionPending {
+			continue
+		}
 		for _, attachment := range workspace.Attachments {
 			if attachment.Endpoint == endpoint && attachment.Status != AttachmentDetached {
 				return workspace.Clone(), attachment.Clone()
@@ -197,6 +220,41 @@ func (d *Daemon) captureEndpoint(ctx context.Context, endpoint string) {
 		}
 		return
 	}
+	closed := closedPaneIDs(workspace, attachment, views)
+	if len(closed) != 0 {
+		request := closePanesRequest{
+			Workspace: workspace.ID, Attachment: attachment.ID,
+			ExpectedRevision: workspace.Revision, Panes: closed,
+			Manifest: manifest, Views: views,
+		}
+		if workspace.RemoteHost != "" {
+			remoteCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			_, err = d.remotes.Call(remoteCtx, workspace.RemoteHost, "close_panes", request)
+			cancel()
+		} else {
+			_, err = d.closePanes(ctx, request)
+		}
+		if err != nil {
+			if strings.Contains(err.Error(), "revision changed") || strings.Contains(err.Error(), "missing ready pane") {
+				d.scheduleFreshCapture(endpoint)
+			} else {
+				d.markAttachmentUnhealthy(workspace.ID, attachment.ID, err)
+			}
+			return
+		}
+		for paneID, view := range views {
+			if view.Focused {
+				if workspace.RemoteHost != "" {
+					seenCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					_, _ = d.remotes.Call(seenCtx, workspace.RemoteHost, "seen", workspacePaneRequest{Workspace: workspace.ID, Pane: paneID})
+					cancel()
+				} else {
+					_, _ = d.markSeen(workspace.ID, paneID)
+				}
+			}
+		}
+		return
+	}
 	if workspace.RemoteHost != "" && attachment.Role == AttachmentPrimary && workspace.PrimaryAttachmentID == attachment.ID {
 		remoteCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		_, err = d.remotes.Call(remoteCtx, workspace.RemoteHost, "update_manifest", manifestUpdateRequest{
@@ -247,6 +305,73 @@ func (d *Daemon) captureEndpoint(ctx context.Context, endpoint string) {
 	}
 }
 
+func (d *Daemon) scheduleFreshCapture(endpoint string) {
+	d.startWorker(func(ctx context.Context) {
+		select {
+		case <-ctx.Done():
+		case <-time.After(50 * time.Millisecond):
+			d.scheduleCapture(endpoint)
+		}
+	})
+}
+
+func closedPaneIDs(workspace *Workspace, attachment *Attachment, views map[string]RuntimeView) []string {
+	var closed []string
+	for paneID := range attachment.Views {
+		pane := workspace.Panes[paneID]
+		if pane == nil || pane.RemovalPending {
+			continue
+		}
+		if _, present := views[paneID]; !present {
+			closed = append(closed, paneID)
+		}
+	}
+	sort.Strings(closed)
+	return closed
+}
+
+func (d *Daemon) closeEventsCoverWorkspace(endpoint string, closed map[string]bool) bool {
+	workspace, attachment := d.endpointAttachment(endpoint)
+	if workspace == nil || attachment == nil || attachment.Status != AttachmentReady || attachment.Revoked {
+		return false
+	}
+	active := 0
+	for paneID, pane := range workspace.Panes {
+		if pane.RemovalPending {
+			continue
+		}
+		if _, owned := attachment.Views[paneID]; !owned {
+			return false
+		}
+		active++
+		if !closed[paneID] {
+			return false
+		}
+	}
+	return active != 0
+}
+
+func (d *Daemon) scheduleEndpointDeletion(endpoint string) {
+	workspace, attachment := d.endpointAttachment(endpoint)
+	if workspace == nil || attachment == nil || attachment.Status == AttachmentDetached || attachment.Revoked {
+		return
+	}
+	d.startWorker(func(ctx context.Context) {
+		callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		if workspace.RemoteHost != "" {
+			_, err := d.remotes.Call(callCtx, workspace.RemoteHost, "kill_workspace", killWorkspaceRequest{WorkspaceID: workspace.ID})
+			if err != nil {
+				d.logger.Printf("delete remote workspace %s after Kitty close: %v", workspace.ID, err)
+			}
+			return
+		}
+		if _, err := d.killWorkspace(callCtx, workspace.ID); err != nil {
+			d.logger.Printf("delete workspace %s after Kitty close: %v", workspace.ID, err)
+		}
+	})
+}
+
 func (d *Daemon) markAttachmentUnhealthy(workspaceRef, attachmentID string, cause error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -277,45 +402,6 @@ func (d *Daemon) markRevocationClosed(workspaceRef, attachmentID string) {
 		attachment.UpdatedAt = time.Now().UTC()
 		workspace.UpdatedAt = attachment.UpdatedAt
 		_ = d.store.Save(d.state)
-	}
-}
-
-func (d *Daemon) noteEndpointQuit(endpoint string) {
-	d.mu.Lock()
-	changed := false
-	type remoteDetach struct{ host, workspace, attachment string }
-	var remoteDetaches []remoteDetach
-	for _, workspace := range d.state.Workspaces {
-		for _, attachment := range workspace.Attachments {
-			if attachment.Endpoint != endpoint {
-				continue
-			}
-			attachment.Status = AttachmentDetached
-			attachment.Views = map[string]RuntimeView{}
-			attachment.UpdatedAt = time.Now().UTC()
-			workspace.UpdatedAt = attachment.UpdatedAt
-			if workspace.PrimaryAttachmentID == attachment.ID && workspace.RemoteHost == "" {
-				workspace.PrimaryAttachmentID = ""
-				workspace.Revision++
-			}
-			workspace.PendingRevocations = removeString(workspace.PendingRevocations, attachment.ID)
-			if workspace.RemoteHost != "" {
-				remoteDetaches = append(remoteDetaches, remoteDetach{workspace.RemoteHost, workspace.ID, attachment.ID})
-			}
-			changed = true
-		}
-	}
-	if changed {
-		_ = d.store.Save(d.state)
-	}
-	d.mu.Unlock()
-	for _, item := range remoteDetaches {
-		item := item
-		d.startWorker(func(ctx context.Context) {
-			remoteCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			_, _ = d.remotes.Call(remoteCtx, item.host, "detach_attachment", attachmentRefRequest{Workspace: item.workspace, Attachment: item.attachment})
-			cancel()
-		})
 	}
 }
 

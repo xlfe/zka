@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	stateSchemaVersion = 2
-	protocolVersion    = 2
+	stateSchemaVersion = 3
+	protocolVersion    = 3
 	remoteProtocolName = "zka.workspace"
 	remoteProtocolMax  = 1 << 20
 )
@@ -112,6 +112,8 @@ type Pane struct {
 	BackendCreated bool                          `json:"backend_created"`
 	BackendReady   bool                          `json:"backend_ready"`
 	BackendStart   bool                          `json:"backend_starting,omitempty"`
+	RemovalPending bool                          `json:"removal_pending,omitempty"`
+	RemovalError   string                        `json:"removal_error,omitempty"`
 	CreatedAt      time.Time                     `json:"created_at"`
 	UpdatedAt      time.Time                     `json:"updated_at"`
 }
@@ -205,6 +207,8 @@ type Workspace struct {
 	PrimaryAttachmentID string                 `json:"primary_attachment_id,omitempty"`
 	PendingRevocations  []string               `json:"pending_revocations,omitempty"`
 	Attention           AgentState             `json:"attention"`
+	DeletionPending     bool                   `json:"deletion_pending,omitempty"`
+	DeletionError       string                 `json:"deletion_error,omitempty"`
 	CreatedAt           time.Time              `json:"created_at"`
 	UpdatedAt           time.Time              `json:"updated_at"`
 }
@@ -296,6 +300,9 @@ type WatcherEvent struct {
 	Workspace string    `json:"workspace,omitempty"`
 	Kind      string    `json:"kind"`
 	WindowID  int64     `json:"window_id,omitempty"`
+	PaneID    string    `json:"pane_id,omitempty"`
+	Confirmed bool      `json:"confirmed,omitempty"`
+	Aborted   bool      `json:"aborted,omitempty"`
 	Timestamp time.Time `json:"timestamp,omitempty"`
 }
 
