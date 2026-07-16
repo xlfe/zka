@@ -113,6 +113,58 @@ func TestDeadPaneMessageWaitsForCtrlC(t *testing.T) {
 	}
 }
 
+func TestFinishLocalPaneAttachDoesNotTombstoneCleanExit(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+	workspace := createTestWorkspace(t, d, 2)
+	panes := workspace.SortedPanes()
+	api := NewAPI(d.paths)
+	for index, pane := range panes {
+		if _, err := api.Event(context.Background(), Event{
+			WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "process_started", Source: "pane-host", PID: 40 + index,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code := 0
+	if _, err := api.Event(context.Background(), Event{
+		WorkspaceID: workspace.ID, PaneID: panes[0].ID, Kind: "process_exit", Source: "pane-host",
+		ExitCode: &code, Detail: "exit code 0",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	gotCode, err := finishLocalPaneAttach(
+		api,
+		Config{},
+		KittyClient{Runner: &fakeRunner{}, Command: "kitten-test"},
+		"unix:/kitty",
+		42,
+		workspace,
+		panes[0],
+		nil,
+		bytes.NewReader([]byte{3}),
+		&output,
+	)
+	if err != nil || gotCode != 0 {
+		t.Fatalf("code=%d err=%v", gotCode, err)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("clean exit rendered a tombstone: %q", output.String())
+	}
+	fresh, err := api.Workspace(context.Background(), workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fresh.Panes[panes[0].ID].Evidence.Event; got != "process_exit" {
+		t.Fatalf("clean exit was reclassified as %q", got)
+	}
+}
+
 func TestAttachmentIDIsStablePerNodeWorkspace(t *testing.T) {
 	a := localAttachmentID("node", "workspace")
 	if a != localAttachmentID("node", "workspace") || a == localAttachmentID("other", "workspace") {

@@ -199,7 +199,12 @@ func (d *Daemon) sendDesktop(ctx context.Context, attachment *Attachment, view R
 		choice = strings.TrimSpace(choice)
 		if choice == "0" || choice == "1" {
 			focusCtx, cancel := context.WithTimeout(workerCtx, 3*time.Second)
-			_ = d.kitty.FocusPane(focusCtx, attachment.Endpoint, workspace.ID, pane.ID)
+			if err := d.kitty.FocusPane(focusCtx, attachment.Endpoint, workspace.ID, pane.ID); err != nil {
+				d.logger.Printf("focus Kitty pane from notification: %v", err)
+			}
+			if err := focusSwayWindow(focusCtx, d.runner, attachment.PID); err != nil {
+				d.logger.Printf("focus Sway window from notification: %v", err)
+			}
 			if workspace.RemoteHost != "" {
 				_, _ = d.remotes.Call(focusCtx, workspace.RemoteHost, "seen", workspacePaneRequest{Workspace: workspace.ID, Pane: pane.ID})
 			} else {
