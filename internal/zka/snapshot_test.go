@@ -77,6 +77,40 @@ func TestCanonicalizerNeverRestartsForegroundProgram(t *testing.T) {
 	}
 }
 
+func TestCanonicalizerAcceptsKittySerializationMetadataBeforeOptions(t *testing.T) {
+	workspace := templateWorkspace()
+	delete(workspace.Panes, "pane-b")
+	native := `launch 'kitty-unserialize-data={"id": 1}' --env=ZKA_WORKSPACE_ID=workspace --var=zka_workspace=workspace --var=zka_pane=pane-a --var=zka_ready=1 --title=One /nix/store/zka/bin/zka pane --workspace workspace --pane pane-a` + "\n"
+	got, err := CanonicalizeKittySession(native, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"kitty-unserialize-data", "/nix/store/zka"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("canonical output contains %q:\n%s", forbidden, got)
+		}
+	}
+	if !strings.Contains(got, "zka pane --workspace workspace --pane pane-a") {
+		t.Fatalf("canonical output lost managed pane:\n%s", got)
+	}
+}
+
+func TestKittyNativeSessionCapturesDedicatedInstanceWithoutMatch(t *testing.T) {
+	runner := &fakeRunner{}
+	kitty := KittyClient{Runner: runner, Command: "kitten-test"}
+	if _, err := kitty.NativeSession(context.Background(), "unix:/kitty"); err != nil {
+		t.Fatal(err)
+	}
+	calls := runner.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("calls = %#v", calls)
+	}
+	joined := strings.Join(calls[0].Args, "|")
+	if strings.Contains(joined, "--match") || !strings.Contains(joined, "--output-format=session") {
+		t.Fatalf("native session args = %#v", calls[0].Args)
+	}
+}
+
 func TestRenderRemoteAttachmentUsesSSHViewWrapperOnly(t *testing.T) {
 	workspace := templateWorkspace()
 	template, _ := ParseSessionTemplate("launch\nlaunch --location vsplit\n")

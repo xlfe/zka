@@ -308,7 +308,11 @@ func CanonicalizeKittySession(content string, workspace *Workspace) (string, err
 			writeRawDirective(&out, trimmed)
 			continue
 		}
-		options, _, err := parseLaunch(tokens[1:])
+		launchTokens := tokens[1:]
+		if len(launchTokens) > 0 && strings.HasPrefix(launchTokens[0], "kitty-unserialize-data=") {
+			launchTokens = launchTokens[1:]
+		}
+		options, _, err := parseLaunch(launchTokens)
 		if err != nil {
 			return "", fmt.Errorf("kitty session line %d: %w", lineNumber+1, err)
 		}
@@ -407,7 +411,7 @@ func CaptureManifest(ctx context.Context, kitty KittyClient, endpoint string, wo
 	if err != nil {
 		return Manifest{}, nil, err
 	}
-	native, err := kitty.NativeSession(ctx, endpoint, workspace.ID)
+	native, err := kitty.NativeSession(ctx, endpoint)
 	if err != nil {
 		return Manifest{}, nil, fmt.Errorf("capture kitty session: %w", err)
 	}

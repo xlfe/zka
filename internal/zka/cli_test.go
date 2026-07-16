@@ -1,8 +1,11 @@
 package zka
 
 import (
+	"bytes"
 	"flag"
 	"io"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +37,24 @@ func TestAttachmentIDIsStablePerNodeWorkspace(t *testing.T) {
 	a := localAttachmentID("node", "workspace")
 	if a != localAttachmentID("node", "workspace") || a == localAttachmentID("other", "workspace") {
 		t.Fatalf("attachment ids are not deterministic: %q", a)
+	}
+}
+
+func TestRunKittyReportsPrelaunchFailureWithoutPanic(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+	t.Setenv("ZKA_KITTY_WATCHER", filepath.Join(t.TempDir(), "missing-watcher.py"))
+
+	var stdout, stderr bytes.Buffer
+	code, err := runKitty(nil, d.paths, &stdout, &stderr)
+	if code != 1 || err == nil || !strings.Contains(err.Error(), "Kitty watcher not found") {
+		t.Fatalf("code=%d err=%v stdout=%q stderr=%q", code, err, stdout.String(), stderr.String())
+	}
+	if workspaces := d.listWorkspaces(); len(workspaces) != 0 {
+		t.Fatalf("failed prelaunch retained workspaces: %#v", workspaces)
 	}
 }
 

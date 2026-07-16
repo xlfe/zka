@@ -84,8 +84,11 @@ func (k KittyClient) List(ctx context.Context, endpoint string) ([]kittyOSWindow
 	return windows, nil
 }
 
-func (k KittyClient) NativeSession(ctx context.Context, endpoint, workspaceID string) (string, error) {
-	return k.rc(ctx, endpoint, "ls", "--match", "var:zka_workspace="+workspaceID, "--output-format=session")
+func (k KittyClient) NativeSession(ctx context.Context, endpoint string) (string, error) {
+	// Each attachment owns a dedicated Kitty process. Kitty 0.47 returns JSON
+	// when --match is combined with --output-format=session, so capture the
+	// entire process and let CaptureManifest validate its workspace tags.
+	return k.rc(ctx, endpoint, "ls", "--output-format=session")
 }
 
 func (k KittyClient) Version(ctx context.Context) string {

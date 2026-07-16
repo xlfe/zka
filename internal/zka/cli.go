@@ -205,7 +205,7 @@ func runKitty(args []string, paths Paths, stdout, stderr io.Writer) (int, error)
 		ID: attachmentID, Node: workspace.Origin, Transport: Transport{Kind: "local"},
 		Endpoint: attachmentEndpoint(paths, attachmentID),
 	}
-	workspace, err = launchManagedKitty(ctx, paths, cfg, api, launchAttachmentOptions{
+	launchedWorkspace, err := launchManagedKitty(ctx, paths, cfg, api, launchAttachmentOptions{
 		Workspace: workspace, Attachment: attachment, Session: session, KittyArgs: fs.Args(),
 	})
 	if err != nil {
@@ -215,6 +215,7 @@ func runKitty(args []string, paths Paths, stdout, stderr io.Writer) (int, error)
 		_ = api.DeleteWorkspace(context.Background(), workspace.ID)
 		return 1, err
 	}
+	workspace = launchedWorkspace
 	fmt.Fprintf(stdout, "%s\t%s\n", workspace.ID, workspace.Name)
 	return 0, nil
 }
