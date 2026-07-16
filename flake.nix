@@ -21,16 +21,28 @@
         rec {
           zka = pkgs.buildGoModule {
             pname = "zka";
-            version = "0.4.0";
+            version = "0.5.0";
             src = ./.;
-            vendorHash = null;
-            subPackages = [ "cmd/zka" ];
-            env.CGO_ENABLED = 0;
+            vendorHash = "sha256-IhE5JsdUYV1sRGOA2reDd7iLSJ7xF2IAqLpgD7JBXH0=";
+            subPackages = [
+              "cmd/zka"
+              "cmd/zka-launch"
+            ];
+            tags = [ "nox11" ];
+            env.CGO_ENABLED = 1;
             ldflags = [ "-s" "-w" ];
+
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [
+              pkgs.libglvnd
+              pkgs.libxkbcommon
+              pkgs.vulkan-headers
+              pkgs.wayland
+            ];
 
             checkPhase = ''
               runHook preCheck
-              go test ./...
+              go test -tags nox11 ./...
               runHook postCheck
             '';
 
@@ -74,6 +86,7 @@
             grep -q 'kitty-watcher.py' "$runtimeConfig"
             grep -q 'hook codex' "$requirements"
             grep -q 'managed_dir' "$requirements"
+            test -x ${self.packages.${system}.zka}/bin/zka-launch
             touch "$out"
           '';
         }

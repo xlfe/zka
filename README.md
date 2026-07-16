@@ -29,8 +29,10 @@ only persistent PTY owner.
 
 ## Status
 
-Version 0.4 implements the workspace-centric workflow:
+Version 0.5 implements the workspace-centric workflow:
 
+- an external, keyboard-first Gio launcher for choosing local/remote workspaces
+  or creating a named workspace before Kitty starts;
 - one dedicated Kitty process and remote-control socket per attachment;
 - one automatically managed `zmx` backend per pane;
 - topology-only Kitty templates;
@@ -95,6 +97,18 @@ services.zka = {
 configuration. zka never reads or transports its token.
 
 ## Local workflow
+
+Open the graphical workspace launcher from Sway or another desktop binding:
+
+```sh
+zka launch
+```
+
+The launcher runs as its own Gio/Wayland process, outside every managed Kitty
+pane. It offers local workspaces directly, accepts an SSH alias before listing
+remote workspaces, and creates a workspace with an optional name. Kitty is not
+started until a choice is made. The launcher deliberately composes the same
+commands available below: `zka kitty` and `zka workspace attach`.
 
 Create a workspace without choosing a name:
 
@@ -234,11 +248,15 @@ in `zka workspace inspect`.
 ## Suggested example-project integration
 
 After enabling the module, make the normal Sway terminal binding create a
-managed workspace:
+workspace through the external launcher:
 
 ```text
-bindsym $mod+Return exec zka kitty
+bindsym $mod+Return exec zka launch
 ```
+
+Because Sway starts the launcher directly, attaching does not first create a
+temporary managed terminal. Running `zka launch` from an existing pane is still
+supported, but the compositor binding is the intended entry point.
 
 Keep mappings such as `new_window_with_cwd` and `new_tab_with_cwd` (including a
 custom Ctrl-T mapping). The managed instance redirects those action names

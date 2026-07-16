@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const Version = "0.4.0"
+const Version = "0.5.0"
 
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
@@ -36,6 +36,9 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) 
 	}
 	if args[0] == "hook" && (os.Getenv("ZKA_WORKSPACE_ID") == "" || os.Getenv("ZKA_PANE_ID") == "") {
 		return hookSuccess(stdout)
+	}
+	if args[0] == "launch" {
+		return runLauncher(args[1:], stdin, stdout, stderr)
 	}
 	paths, err := DefaultPaths()
 	if err != nil {
@@ -84,12 +87,46 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `usage: zka COMMAND [OPTIONS]
 
 Commands:
+  launch      Choose or create a workspace in the graphical launcher
   kitty       Create a managed Kitty workspace
   workspace   List, inspect, attach, move, detach, rename, kill, focus, or acknowledge workspaces
   doctor      Check local or remote integration
   daemon      Run zkad (normally via systemd --user)
 
 Internal commands: pane, pane-host, remote-pane, remote-attach, remote-control, hook`)
+}
+
+func runLauncher(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	if len(args) != 0 {
+		return 2, fmt.Errorf("launch accepts no arguments")
+	}
+	command := os.Getenv("ZKA_LAUNCHER_COMMAND")
+	if command == "" {
+		command = siblingExecutable("zka-launch")
+	}
+	cmd := exec.Command(command)
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return processExitCode(err), nil
+		}
+		return 1, fmt.Errorf("start graphical launcher: %w", err)
+	}
+	return 0, nil
+}
+
+func siblingExecutable(name string) string {
+	executable, err := os.Executable()
+	if err == nil {
+		candidate := filepath.Join(filepath.Dir(executable), name)
+		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate
+		}
+	}
+	return name
 }
 
 func newFlagSet(name string, stderr io.Writer) *flag.FlagSet {

@@ -42,6 +42,36 @@ func TestWorkspaceAttachIsTheOnlyAttachCommand(t *testing.T) {
 	}
 }
 
+func TestLaunchIsAStandaloneTopLevelCommand(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code, err := Run([]string{"launch", "unexpected"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 || err == nil || err.Error() != "launch accepts no arguments" {
+		t.Fatalf("code=%d err=%v stdout=%q stderr=%q", code, err, stdout.String(), stderr.String())
+	}
+	printUsage(&stdout)
+	if !strings.Contains(stdout.String(), "launch      Choose or create a workspace") {
+		t.Fatalf("top-level usage does not advertise the launcher: %q", stdout.String())
+	}
+}
+
+func TestLauncherProxyReturnsHelperExitStatus(t *testing.T) {
+	for _, test := range []struct {
+		command string
+		want    int
+	}{
+		{command: "true", want: 0},
+		{command: "false", want: 1},
+	} {
+		t.Run(test.command, func(t *testing.T) {
+			t.Setenv("ZKA_LAUNCHER_COMMAND", test.command)
+			code, err := runLauncher(nil, strings.NewReader(""), io.Discard, io.Discard)
+			if err != nil || code != test.want {
+				t.Fatalf("code=%d err=%v, want code %d", code, err, test.want)
+			}
+		})
+	}
+}
+
 func TestKittyPassthroughRejectsManagedProcessOptions(t *testing.T) {
 	for _, args := range [][]string{{"--listen-on", "unix:/other"}, {"--session=x"}, {"--detach"}, {"--override", "shell=bash"}, {"bash"}} {
 		if err := validateKittyPassthrough(args); err == nil {
