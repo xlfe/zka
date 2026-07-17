@@ -110,6 +110,13 @@ remote workspaces, and creates a workspace with an optional name. Kitty is not
 started until a choice is made. The launcher deliberately composes the same
 commands available below: `zka kitty` and `zka workspace attach`.
 
+The home list groups local and previously connected remote workspaces into
+`ATTACHED` and `DETACHED` sections. Selecting an attached workspace switches to
+its existing Sway window; selecting a detached workspace recreates its Kitty
+view. Use the row's `Detach` button or press `D` to close that view while
+leaving its zmx sessions alive. Each row also shows the workspace-wide agent
+state, detected agent processes, and its pane/tab/window counts.
+
 Create a workspace without choosing a name:
 
 ```sh

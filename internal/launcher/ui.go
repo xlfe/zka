@@ -39,11 +39,14 @@ const (
 	resultLocal resultKind = iota
 	resultRemote
 	resultLaunch
+	resultDetach
 )
 
 type asyncResult struct {
 	kind       resultKind
 	token      uint64
+	node       zka.Host
+	workspace  string
 	workspaces []*zka.Workspace
 	err        error
 }
@@ -75,6 +78,8 @@ type ui struct {
 	remote       []*zka.Workspace
 	remoteHosts  []string
 	remoteHost   string
+	localNodeID  string
+	selectOnLoad string
 	selected     int
 	localLoading bool
 	localError   string
@@ -113,6 +118,8 @@ type unavailableBackend struct{ err error }
 func (b unavailableBackend) Workspaces(context.Context, string) ([]*zka.Workspace, error) {
 	return nil, b.err
 }
+
+func (b unavailableBackend) Node(context.Context) (zka.Host, error) { return zka.Host{}, b.err }
 
 func (b unavailableBackend) Execute(context.Context, []string) error { return b.err }
 
@@ -186,8 +193,13 @@ func (ui *ui) loadLocal() {
 	go func() {
 		ctx, cancel := context.WithTimeout(ui.ctx, 10*time.Second)
 		defer cancel()
+		node, err := ui.backend.Node(ctx)
+		if err != nil {
+			ui.deliver(asyncResult{kind: resultLocal, err: err})
+			return
+		}
 		workspaces, err := ui.backend.Workspaces(ctx, "")
-		ui.deliver(asyncResult{kind: resultLocal, workspaces: workspaces, err: err})
+		ui.deliver(asyncResult{kind: resultLocal, node: node, workspaces: workspaces, err: err})
 	}()
 }
 
@@ -217,6 +229,14 @@ func (ui *ui) loadRemote(host string) {
 }
 
 func (ui *ui) launch(args []string, status string) {
+	ui.execute(resultLaunch, "", args, status)
+}
+
+func (ui *ui) detachWorkspace(workspace *zka.Workspace) {
+	ui.execute(resultDetach, workspace.ID, detachArgs(workspace), "Detaching "+workspace.Name+"…")
+}
+
+func (ui *ui) execute(kind resultKind, workspace string, args []string, status string) {
 	if ui.busy {
 		return
 	}
@@ -224,14 +244,14 @@ func (ui *ui) launch(args []string, status string) {
 	ui.operationToken++
 	token := ui.operationToken
 	ui.busy = true
-	ui.operationKind = resultLaunch
+	ui.operationKind = kind
 	ui.status = status
 	ui.errorMessage = ""
 	ctx, cancel := context.WithTimeout(ui.ctx, 60*time.Second)
 	ui.operationCancel = cancel
 	go func() {
 		err := ui.backend.Execute(ctx, args)
-		ui.deliver(asyncResult{kind: resultLaunch, token: token, err: err})
+		ui.deliver(asyncResult{kind: kind, token: token, workspace: workspace, err: err})
 	}()
 }
 
@@ -259,11 +279,22 @@ func (ui *ui) drainResults() {
 			case resultLocal:
 				ui.localLoading = false
 				if result.err != nil {
-					ui.localError = "Could not load local workspaces: " + result.err.Error()
+					ui.localError = "Could not load workspaces: " + result.err.Error()
+					ui.selectOnLoad = ""
 					continue
 				}
-				ui.local, ui.remoteHosts = splitWorkspaces(result.workspaces)
+				ui.localNodeID = result.node.ID
+				ui.local, ui.remoteHosts = splitWorkspaces(result.workspaces, ui.localNodeID)
 				ui.localError = ""
+				if ui.selectOnLoad != "" {
+					for index, workspace := range ui.local {
+						if workspace.ID == ui.selectOnLoad {
+							ui.selected = index + 2
+							break
+						}
+					}
+					ui.selectOnLoad = ""
+				}
 				ui.clampSelection()
 			case resultRemote:
 				if result.token != ui.operationToken {
@@ -291,6 +322,20 @@ func (ui *ui) drainResults() {
 					continue
 				}
 				ui.window.Perform(system.ActionClose)
+			case resultDetach:
+				if result.token != ui.operationToken {
+					continue
+				}
+				ui.cancelOperation()
+				ui.busy = false
+				ui.status = ""
+				if result.err != nil {
+					ui.errorMessage = result.err.Error()
+					continue
+				}
+				ui.errorMessage = ""
+				ui.selectOnLoad = result.workspace
+				ui.loadLocal()
 			}
 		default:
 			return
@@ -307,6 +352,9 @@ func (ui *ui) handleKeys(gtx layout.Context) {
 			key.Filter{Name: key.NameReturn},
 			key.Filter{Name: key.NameEnter},
 		)
+	}
+	if ui.screen == screenHome {
+		filters = append(filters, key.Filter{Name: "D"}, key.Filter{Name: key.NameDeleteForward})
 	}
 	for {
 		raw, ok := gtx.Event(filters...)
@@ -330,6 +378,8 @@ func (ui *ui) handleKeys(gtx layout.Context) {
 			}
 		case key.NameReturn, key.NameEnter:
 			ui.activateSelection()
+		case "D", key.NameDeleteForward:
+			ui.detachSelection()
 		}
 	}
 }
@@ -381,8 +431,13 @@ func (ui *ui) handleClicks(gtx layout.Context) {
 			return
 		}
 		for _, workspace := range ui.local {
-			if ui.row("local:" + workspace.ID).Clicked(gtx) {
-				ui.launch(attachArgs("", workspace), "Attaching to "+workspace.Name+"…")
+			key := "home:" + workspace.RemoteHost + ":" + workspace.ID
+			if workspaceAttachedToNode(workspace, ui.localNodeID) && ui.row("detach:"+key).Clicked(gtx) {
+				ui.detachWorkspace(workspace)
+				return
+			}
+			if ui.row(key).Clicked(gtx) {
+				ui.activateWorkspace(workspace)
 				return
 			}
 		}
@@ -446,7 +501,7 @@ func (ui *ui) openRemoteHost() {
 }
 
 func (ui *ui) back() {
-	if ui.busy && ui.operationKind == resultLaunch {
+	if ui.busy && (ui.operationKind == resultLaunch || ui.operationKind == resultDetach) {
 		return
 	}
 	switch ui.screen {
@@ -482,8 +537,7 @@ func (ui *ui) activateSelection() {
 		default:
 			index := ui.selected - 2
 			if index >= 0 && index < len(ui.local) {
-				workspace := ui.local[index]
-				ui.launch(attachArgs("", workspace), "Attaching to "+workspace.Name+"…")
+				ui.activateWorkspace(ui.local[index])
 			}
 		}
 	case screenRemoteList:
@@ -491,6 +545,29 @@ func (ui *ui) activateSelection() {
 			workspace := ui.remote[ui.selected]
 			ui.launch(attachArgs(ui.remoteHost, workspace), "Attaching to "+workspace.Name+"…")
 		}
+	}
+}
+
+func (ui *ui) activateWorkspace(workspace *zka.Workspace) {
+	attached := workspaceAttachedToNode(workspace, ui.localNodeID)
+	status := "Attaching to " + workspace.Name + "…"
+	if attached {
+		status = "Switching to " + workspace.Name + "…"
+	}
+	ui.launch(attachArgs(workspace.RemoteHost, workspace), status)
+}
+
+func (ui *ui) detachSelection() {
+	if ui.busy || ui.screen != screenHome {
+		return
+	}
+	index := ui.selected - 2
+	if index < 0 || index >= len(ui.local) {
+		return
+	}
+	workspace := ui.local[index]
+	if workspaceAttachedToNode(workspace, ui.localNodeID) {
+		ui.detachWorkspace(workspace)
 	}
 }
 
@@ -531,7 +608,7 @@ func (ui *ui) layout(gtx layout.Context) layout.Dimensions {
 }
 
 func (ui *ui) layoutHome(gtx layout.Context) layout.Dimensions {
-	return ui.page(gtx, "Workspaces", "Attach to a running workspace or start a new one.", false, func(gtx layout.Context) layout.Dimensions {
+	return ui.page(gtx, "Workspaces", "Switch attached workspaces, attach detached ones, or start a new one.", false, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return ui.actionRow(gtx, &ui.newButton, "New workspace", "Start a new managed Kitty workspace", ui.selected == 0)
@@ -539,13 +616,7 @@ func (ui *ui) layoutHome(gtx layout.Context) layout.Dimensions {
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return ui.actionRow(gtx, &ui.remoteButton, "Remote workspace", "Connect through an SSH host alias", ui.selected == 1)
 			}),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layout.Inset{Top: 14, Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					label := material.Subtitle2(ui.theme, "LOCAL WORKSPACES")
-					label.Color = ui.colors.muted
-					return label.Layout(gtx)
-				})
-			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.operationMessage(gtx) }),
 			layout.Flexed(1, ui.layoutLocalList),
 		)
 	})
@@ -556,7 +627,7 @@ func (ui *ui) layoutLocalList(gtx layout.Context) layout.Dimensions {
 		return ui.centeredMessage(gtx, "Loading local workspaces…")
 	}
 	if len(ui.local) == 0 {
-		message := "No local workspaces yet."
+		message := "No local or previously connected workspaces yet."
 		if ui.localError != "" {
 			message = ui.localError
 		}
@@ -572,9 +643,22 @@ func (ui *ui) layoutLocalList(gtx layout.Context) layout.Dimensions {
 			}),
 		)
 	}
-	return material.List(ui.theme, &ui.localList).Layout(gtx, len(ui.local), func(gtx layout.Context, index int) layout.Dimensions {
-		workspace := ui.local[index]
-		return ui.workspaceRow(gtx, ui.row("local:"+workspace.ID), workspace, ui.selected == index+2)
+	items := localWorkspaceItems(ui.local, ui.localNodeID)
+	return material.List(ui.theme, &ui.localList).Layout(gtx, len(items), func(gtx layout.Context, index int) layout.Dimensions {
+		item := items[index]
+		if item.workspace == nil {
+			return ui.workspaceSectionHeader(gtx, item.label)
+		}
+		workspace := item.workspace
+		attached := workspaceAttachedToNode(workspace, ui.localNodeID)
+		key := "home:" + workspace.RemoteHost + ":" + workspace.ID
+		action := "Attach →"
+		var detachButton *widget.Clickable
+		if attached {
+			action = "Switch →"
+			detachButton = ui.row("detach:" + key)
+		}
+		return ui.workspaceRow(gtx, ui.row(key), detachButton, workspace, action, ui.selected == item.selection+2)
 	})
 }
 
@@ -663,7 +747,7 @@ func (ui *ui) layoutRemoteList(gtx layout.Context) layout.Dimensions {
 		}
 		return material.List(ui.theme, &ui.remoteList).Layout(gtx, len(ui.remote), func(gtx layout.Context, index int) layout.Dimensions {
 			workspace := ui.remote[index]
-			return ui.workspaceRow(gtx, ui.row("remote:"+ui.remoteHost+":"+workspace.ID), workspace, ui.selected == index)
+			return ui.workspaceRow(gtx, ui.row("remote:"+ui.remoteHost+":"+workspace.ID), nil, workspace, "Attach →", ui.selected == index)
 		})
 	})
 }
@@ -709,39 +793,79 @@ func (ui *ui) page(gtx layout.Context, title, subtitle string, back bool, conten
 	)
 }
 
-func (ui *ui) workspaceRow(gtx layout.Context, button *widget.Clickable, workspace *zka.Workspace, selected bool) layout.Dimensions {
-	return ui.actionRow(gtx, button, workspace.Name, workspaceSummary(workspace), selected)
+func (ui *ui) workspaceSectionHeader(gtx layout.Context, label string) layout.Dimensions {
+	return layout.Inset{Top: 14, Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		style := material.Subtitle2(ui.theme, label)
+		style.Color = ui.colors.muted
+		return style.Layout(gtx)
+	})
+}
+
+func (ui *ui) workspaceRow(gtx layout.Context, button, detachButton *widget.Clickable, workspace *zka.Workspace, action string, selected bool) layout.Dimensions {
+	return layout.Inset{Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				return ui.actionCard(gtx, button, workspace.Name, workspaceSummary(workspace), action, selected)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				if detachButton == nil {
+					return layout.Dimensions{}
+				}
+				return layout.Inset{Left: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return ui.detachButton(gtx, detachButton)
+				})
+			}),
+		)
+	})
 }
 
 func (ui *ui) actionRow(gtx layout.Context, button *widget.Clickable, title, subtitle string, selected bool) layout.Dimensions {
 	return layout.Inset{Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		background := ui.colors.surface
-		if selected {
-			background = ui.colors.selected
-		}
-		style := material.ButtonLayout(ui.theme, button)
-		style.Background = background
-		style.CornerRadius = 12
-		return style.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			gtx.Constraints.Min.X = gtx.Constraints.Max.X
-			return layout.Inset{Top: 12, Right: 14, Bottom: 12, Left: 14}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						label := material.Subtitle1(ui.theme, title)
-						if selected {
-							label.Color = ui.colors.accent
-						}
-						return label.Layout(gtx)
-					}),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return layout.Inset{Top: 3}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-							label := material.Caption(ui.theme, subtitle)
-							label.Color = ui.colors.muted
+		return ui.actionCard(gtx, button, title, subtitle, "", selected)
+	})
+}
+
+func (ui *ui) actionCard(gtx layout.Context, button *widget.Clickable, title, subtitle, action string, selected bool) layout.Dimensions {
+	background := ui.colors.surface
+	if selected {
+		background = ui.colors.selected
+	}
+	style := material.ButtonLayout(ui.theme, button)
+	style.Background = background
+	style.CornerRadius = 12
+	return style.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		gtx.Constraints.Min.X = gtx.Constraints.Max.X
+		return layout.Inset{Top: 12, Right: 14, Bottom: 12, Left: 14}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+					return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							label := material.Subtitle1(ui.theme, title)
+							if selected {
+								label.Color = ui.colors.accent
+							}
 							return label.Layout(gtx)
-						})
-					}),
-				)
-			})
+						}),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return layout.Inset{Top: 3}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								label := material.Caption(ui.theme, subtitle)
+								label.Color = ui.colors.muted
+								return label.Layout(gtx)
+							})
+						}),
+					)
+				}),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					if action == "" {
+						return layout.Dimensions{}
+					}
+					return layout.Inset{Left: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						label := material.Body2(ui.theme, action)
+						label.Color = ui.colors.accent
+						return label.Layout(gtx)
+					})
+				}),
+			)
 		})
 	})
 }
@@ -779,6 +903,15 @@ func (ui *ui) secondaryButton(gtx layout.Context, button *widget.Clickable, labe
 	return style.Layout(gtx)
 }
 
+func (ui *ui) detachButton(gtx layout.Context, button *widget.Clickable) layout.Dimensions {
+	style := material.Button(ui.theme, button, "Detach")
+	style.Background = ui.colors.surface
+	style.Color = ui.colors.danger
+	style.CornerRadius = 9
+	style.Inset = layout.Inset{Top: 10, Right: 12, Bottom: 10, Left: 12}
+	return style.Layout(gtx)
+}
+
 func (ui *ui) operationMessage(gtx layout.Context) layout.Dimensions {
 	if ui.errorMessage != "" {
 		return layout.Inset{Top: 14}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -809,7 +942,11 @@ func (ui *ui) centeredMessage(gtx layout.Context, message string) layout.Dimensi
 }
 
 func (ui *ui) footer(gtx layout.Context) layout.Dimensions {
-	label := material.Caption(ui.theme, "↑↓ Navigate    Enter Select    Esc Back")
+	text := "↑↓ Navigate    Enter Select    Esc Back"
+	if ui.screen == screenHome {
+		text = "↑↓ Navigate    Enter Switch/Attach    D Detach    Esc Close"
+	}
+	label := material.Caption(ui.theme, text)
 	label.Color = ui.colors.muted
 	return label.Layout(gtx)
 }

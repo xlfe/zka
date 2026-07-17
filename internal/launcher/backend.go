@@ -16,6 +16,7 @@ import (
 // Backend supplies the launcher's read-only workspace data and executes the
 // existing zka CLI primitives selected by the user.
 type Backend interface {
+	Node(context.Context) (zka.Host, error)
 	Workspaces(context.Context, string) ([]*zka.Workspace, error)
 	Execute(context.Context, []string) error
 }
@@ -46,6 +47,10 @@ func (b *commandBackend) Workspaces(ctx context.Context, host string) ([]*zka.Wo
 		return nil, err
 	}
 	return workspaces, nil
+}
+
+func (b *commandBackend) Node(ctx context.Context) (zka.Host, error) {
+	return b.api.Node(ctx)
 }
 
 func (b *commandBackend) Execute(ctx context.Context, args []string) error {
