@@ -48,6 +48,34 @@ func (a API) Workspaces(ctx context.Context) ([]*Workspace, error) {
 	return out, err
 }
 
+func (a API) Attention(ctx context.Context) (AttentionSnapshot, error) {
+	var out AttentionSnapshot
+	err := a.client.Call(ctx, "attention_snapshot", nil, &out)
+	return out, err
+}
+
+func (a API) WatchAttention(ctx context.Context, yield func(AttentionSnapshot) error) error {
+	return a.client.WatchAttention(ctx, yield)
+}
+
+func (a API) PauseAttention(ctx context.Context) (AttentionSnapshot, error) {
+	var out AttentionSnapshot
+	err := a.client.Call(ctx, "pause_attention", nil, &out)
+	return out, err
+}
+
+func (a API) ResumeAttention(ctx context.Context) (AttentionSnapshot, error) {
+	var out AttentionSnapshot
+	err := a.client.Call(ctx, "resume_attention", nil, &out)
+	return out, err
+}
+
+func (a API) ToggleAttention(ctx context.Context) (AttentionSnapshot, error) {
+	var out AttentionSnapshot
+	err := a.client.Call(ctx, "toggle_attention", nil, &out)
+	return out, err
+}
+
 func (a API) PreparePane(ctx context.Context, workspace, pane, cwd string) (preparePaneResponse, error) {
 	var out preparePaneResponse
 	err := a.client.Call(ctx, "prepare_pane", workspacePaneRequest{Workspace: workspace, Pane: pane, CWD: cwd}, &out)

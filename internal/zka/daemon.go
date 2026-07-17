@@ -17,11 +17,12 @@ import (
 )
 
 type Daemon struct {
-	mu        sync.Mutex
-	lifeMu    sync.Mutex
-	captureMu sync.Mutex
-	cleanupMu sync.Mutex
-	wg        sync.WaitGroup
+	mu          sync.Mutex
+	lifeMu      sync.Mutex
+	attentionMu sync.Mutex
+	captureMu   sync.Mutex
+	cleanupMu   sync.Mutex
+	wg          sync.WaitGroup
 
 	paths  Paths
 	store  *Store
@@ -31,20 +32,21 @@ type Daemon struct {
 	kitty  KittyClient
 	logger *log.Logger
 
-	ctx       context.Context
-	cancel    context.CancelFunc
-	listener  net.Listener
-	watcher   *net.UnixConn
-	conns     map[net.Conn]struct{}
-	started   bool
-	closed    bool
-	workerErr error
-	events    chan WatcherEvent
-	capturing map[string]bool
-	cleaning  map[string]bool
-	cleanups  map[string]*sync.Mutex
-	deleted   map[string]string
-	remotes   *RemoteManager
+	ctx           context.Context
+	cancel        context.CancelFunc
+	listener      net.Listener
+	watcher       *net.UnixConn
+	conns         map[net.Conn]struct{}
+	started       bool
+	closed        bool
+	workerErr     error
+	events        chan WatcherEvent
+	capturing     map[string]bool
+	cleaning      map[string]bool
+	cleanups      map[string]*sync.Mutex
+	deleted       map[string]string
+	remotes       *RemoteManager
+	attentionSubs map[chan struct{}]struct{}
 }
 
 func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, error) {
@@ -108,16 +110,18 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 			Runner:  runner,
 			Command: cfg.Kitty.KittenCommand,
 		},
-		logger:    logger,
-		ctx:       ctx,
-		cancel:    cancel,
-		events:    make(chan WatcherEvent, 128),
-		capturing: map[string]bool{},
-		cleaning:  map[string]bool{},
-		cleanups:  map[string]*sync.Mutex{},
-		deleted:   map[string]string{},
-		conns:     map[net.Conn]struct{}{},
+		logger:        logger,
+		ctx:           ctx,
+		cancel:        cancel,
+		events:        make(chan WatcherEvent, 128),
+		capturing:     map[string]bool{},
+		cleaning:      map[string]bool{},
+		cleanups:      map[string]*sync.Mutex{},
+		deleted:       map[string]string{},
+		conns:         map[net.Conn]struct{}{},
+		attentionSubs: map[chan struct{}]struct{}{},
 	}
+	store.SetOnSave(d.signalAttention)
 	d.remotes = NewRemoteManager(d)
 	return d, nil
 }
@@ -288,6 +292,10 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
+	if req.Op == "watch_attention" {
+		d.watchAttention(ctx, conn)
+		return
+	}
 	callCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	data, err := d.dispatch(callCtx, req.Op, req.Payload)
@@ -458,6 +466,14 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		return d.getWorkspace(req.Ref)
 	case "list_workspaces":
 		return d.listWorkspaces(), nil
+	case "attention_snapshot":
+		return d.attentionSnapshot(), nil
+	case "pause_attention":
+		return d.setAttentionPaused(true)
+	case "resume_attention":
+		return d.setAttentionPaused(false)
+	case "toggle_attention":
+		return d.toggleAttentionPaused()
 	case "prepare_pane":
 		var req workspacePaneRequest
 		if err := decodePayload(raw, &req); err != nil {

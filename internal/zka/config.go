@@ -10,6 +10,9 @@ import (
 )
 
 type Config struct {
+	Attention struct {
+		States []AgentState `json:"states"`
+	} `json:"attention"`
 	Shell struct {
 		Command []string `json:"command"`
 	} `json:"shell"`
@@ -27,7 +30,9 @@ type Config struct {
 		Options []string `json:"options"`
 	} `json:"ssh"`
 	Notifications struct {
-		NtfyCommand string `json:"ntfy_command"`
+		DesktopEnabled bool   `json:"desktop_enabled"`
+		NtfyEnabled    bool   `json:"ntfy_enabled"`
+		NtfyCommand    string `json:"ntfy_command"`
 	} `json:"notifications"`
 }
 
@@ -44,6 +49,9 @@ func defaultConfig() Config {
 		"-o", "ServerAliveCountMax=3",
 		"-o", "BatchMode=yes",
 	}
+	cfg.Attention.States = []AgentState{StateBlocked, StateError, StateDone}
+	cfg.Notifications.DesktopEnabled = true
+	cfg.Notifications.NtfyEnabled = true
 	cfg.Notifications.NtfyCommand = "ntfy-send"
 	return cfg
 }
@@ -63,6 +71,19 @@ func LoadConfig() (Config, error) {
 	applyConfigEnvironment(&cfg)
 	if len(cfg.Shell.Command) == 0 || cfg.Shell.Command[0] == "" {
 		return Config{}, fmt.Errorf("shell.command must contain an executable")
+	}
+	if len(cfg.Attention.States) == 0 {
+		return Config{}, fmt.Errorf("attention.states must contain at least one state")
+	}
+	seenStates := map[AgentState]bool{}
+	for _, state := range cfg.Attention.States {
+		if state != StateBlocked && state != StateError && state != StateDone {
+			return Config{}, fmt.Errorf("attention.states contains unsupported state %q", state)
+		}
+		if seenStates[state] {
+			return Config{}, fmt.Errorf("attention.states contains duplicate state %q", state)
+		}
+		seenStates[state] = true
 	}
 	for label, command := range map[string]string{
 		"kitty.command":              cfg.Kitty.Command,

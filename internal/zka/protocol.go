@@ -79,6 +79,52 @@ func (c Client) Call(ctx context.Context, op string, payload, out any) error {
 	return nil
 }
 
+// WatchAttention owns a long-lived daemon connection and calls yield for the
+// initial snapshot and each subsequent update. Reconnection policy belongs to
+// the consumer so it can expose an unavailable state between daemon restarts.
+func (c Client) WatchAttention(ctx context.Context, yield func(AttentionSnapshot) error) error {
+	timeout := c.Timeout
+	if timeout == 0 {
+		timeout = 3 * time.Second
+	}
+	dialer := net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "unix", c.Socket)
+	if err != nil {
+		return fmt.Errorf("connect to zkad at %s: %w", c.Socket, err)
+	}
+	defer conn.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
+	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	if err := json.NewEncoder(conn).Encode(request{Version: protocolVersion, Op: "watch_attention"}); err != nil {
+		return fmt.Errorf("send attention watch request: %w", err)
+	}
+	_ = conn.SetDeadline(time.Time{})
+	decoder := json.NewDecoder(conn)
+	for {
+		var res response
+		if err := decoder.Decode(&res); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("read attention update: %w", err)
+		}
+		if res.Version != protocolVersion {
+			return fmt.Errorf("unsupported daemon protocol %d", res.Version)
+		}
+		if !res.OK {
+			return errors.New(res.Error)
+		}
+		var snapshot AttentionSnapshot
+		if err := json.Unmarshal(res.Data, &snapshot); err != nil {
+			return fmt.Errorf("decode attention update: %w", err)
+		}
+		if err := yield(snapshot); err != nil {
+			return err
+		}
+	}
+}
+
 func listenUnix(path string) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create runtime directory: %w", err)

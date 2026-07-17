@@ -12,6 +12,7 @@ func TestStoreRoundTripAndPermissions(t *testing.T) {
 	store := NewStore(paths)
 	state := newStateData()
 	state.Node = Host{ID: "node", Name: "devbox.example"}
+	state.AttentionPaused = true
 	state.Workspaces["abc"] = &Workspace{
 		ID: "abc", Name: "test", Origin: state.Node, Revision: 1,
 		Panes: map[string]*Pane{}, Attachments: map[string]*Attachment{},
@@ -31,7 +32,7 @@ func TestStoreRoundTripAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Workspaces["abc"].Name != "test" || loaded.Node.Name != "devbox.example" {
+	if loaded.Workspaces["abc"].Name != "test" || loaded.Node.Name != "devbox.example" || !loaded.AttentionPaused {
 		t.Fatalf("loaded = %#v", loaded)
 	}
 }

@@ -71,6 +71,126 @@ func TestNotificationDedupeIsPerPane(t *testing.T) {
 	}
 }
 
+func TestAttentionPauseDefersCurrentNotificationsUntilResume(t *testing.T) {
+	runner := quietRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	if _, err := d.setAttentionPaused(true); err != nil {
+		t.Fatal(err)
+	}
+	workspace, pane := setPaneForNotification(t, d, workspace, StateBlocked, "turn-paused")
+	d.afterTransition(context.Background(), StateWorking, workspace, pane.ID)
+	if hasCommand(runner.Calls(), "ntfy-send") {
+		t.Fatal("paused attention delivered ntfy")
+	}
+	if _, err := d.setAttentionPaused(false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return hasCommand(runner.Calls(), "ntfy-send") })
+	if _, err := d.setAttentionPaused(false); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	count := 0
+	for _, call := range runner.Calls() {
+		if call.Name == "ntfy-send" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("resume deliveries = %d, want 1", count)
+	}
+}
+
+func TestAttentionResolvedWhilePausedDoesNotNotifyOnResume(t *testing.T) {
+	runner := quietRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	if _, err := d.setAttentionPaused(true); err != nil {
+		t.Fatal(err)
+	}
+	workspace, pane = setPaneForNotification(t, d, workspace, StateBlocked, "turn-resolved")
+	d.afterTransition(context.Background(), StateWorking, workspace, pane.ID)
+	workspace, pane = setPaneForNotification(t, d, workspace, StateWorking, "turn-resolved")
+	d.afterTransition(context.Background(), StateBlocked, workspace, pane.ID)
+	if _, err := d.setAttentionPaused(false); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if hasCommand(runner.Calls(), "ntfy-send") {
+		t.Fatal("resolved attention item notified on resume")
+	}
+}
+
+func TestNotificationChannelsCanBeDisabledIndependently(t *testing.T) {
+	t.Run("ntfy", func(t *testing.T) {
+		runner := quietRunner()
+		d, err := newTestDaemon(t, t.TempDir(), runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d.config.Notifications.NtfyEnabled = false
+		workspace := createTestWorkspace(t, d, 1)
+		workspace, pane := setPaneForNotification(t, d, workspace, StateError, "turn-disabled")
+		d.afterTransition(context.Background(), StateWorking, workspace, pane.ID)
+		if hasCommand(runner.Calls(), "ntfy-send") {
+			t.Fatal("disabled ntfy channel was invoked")
+		}
+	})
+	t.Run("desktop", func(t *testing.T) {
+		runner := quietRunner()
+		d, err := newTestDaemon(t, t.TempDir(), runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d.config.Notifications.DesktopEnabled = false
+		d.config.Notifications.NtfyEnabled = false
+		workspace := createTestWorkspace(t, d, 1)
+		pane := firstPane(workspace)
+		d.mu.Lock()
+		actual := d.state.Workspaces[workspace.ID]
+		actual.Attachments["local"] = &Attachment{
+			ID: "local", Endpoint: "unix:/kitty", Status: AttachmentReady,
+			Views: readyView(pane.ID, 7),
+		}
+		if err := d.store.Save(d.state); err != nil {
+			d.mu.Unlock()
+			t.Fatal(err)
+		}
+		workspace = actual.Clone()
+		d.mu.Unlock()
+		workspace, pane = setPaneForNotification(t, d, workspace, StateBlocked, "turn-desktop-disabled")
+		d.afterTransition(context.Background(), StateWorking, workspace, pane.ID)
+		for _, call := range runner.Calls() {
+			if call.Name == "kitten" && strings.Contains(strings.Join(call.Args, " "), " notify ") {
+				t.Fatalf("disabled desktop channel invoked Kitty notify: %#v", call.Args)
+			}
+		}
+	})
+}
+
+func TestStatesExcludedFromAttentionDoNotNotify(t *testing.T) {
+	runner := quietRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Attention.States = []AgentState{StateBlocked, StateError}
+	workspace := createTestWorkspace(t, d, 1)
+	workspace, pane := setPaneForNotification(t, d, workspace, StateDone, "turn-finished")
+	d.afterTransition(context.Background(), StateWorking, workspace, pane.ID)
+	if hasCommand(runner.Calls(), "ntfy-send") {
+		t.Fatal("excluded done state delivered a notification")
+	}
+}
+
 func TestRemoteMirrorUsesKittyNotificationButNeverDuplicatesNtfy(t *testing.T) {
 	runner := quietRunner()
 	d, err := newTestDaemon(t, t.TempDir(), runner)

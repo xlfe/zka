@@ -25,8 +25,12 @@ func notificationBody(workspace *Workspace, pane *Pane) string {
 	if detail == "" {
 		detail = pane.Evidence.Event
 	}
-	return fmt.Sprintf("%s\nOrigin: %s\nWorkspace: %s\nPane: %s\nFocus: zka workspace focus %s --pane %s",
-		detail, workspace.Origin.Name, workspace.ID, pane.ID, workspace.ID, pane.ID)
+	reference := workspace.ID
+	if workspace.RemoteHost != "" {
+		reference = workspace.RemoteHost + ":" + workspace.ID
+	}
+	return fmt.Sprintf("%s\nOrigin: %s\nWorkspace: %s\nPane: %s\nOpen: zka workspace attach %s --pane %s",
+		detail, workspace.Origin.Name, workspace.ID, pane.ID, reference, pane.ID)
 }
 
 func (d *Daemon) afterTransition(ctx context.Context, before AgentState, workspace *Workspace, paneID string) {
@@ -34,26 +38,29 @@ func (d *Daemon) afterTransition(ctx context.Context, before AgentState, workspa
 	if pane == nil {
 		return
 	}
-	if pane.State == StateBlocked || pane.State == StateError || pane.State == StateDone {
+	if d.attentionStateEnabled(pane.State) {
 		d.reconcile(ctx)
 		if fresh, err := d.getWorkspace(workspace.ID); err == nil {
 			workspace = fresh
 			pane = fresh.Panes[paneID]
 		}
-		if pane == nil || (pane.State != StateBlocked && pane.State != StateError && pane.State != StateDone) {
+		if pane == nil || !d.attentionStateEnabled(pane.State) {
 			return
 		}
 	}
 	d.updateKittyState(ctx, workspace)
-	if pane.State != StateBlocked && pane.State != StateError && pane.State != StateDone {
+	_, focused := attentionPaneView(workspace, paneID)
+	if !d.attentionStateEnabled(pane.State) || (pane.State == StateDone && focused) {
 		d.closeDesktopNotifications(ctx, workspace, paneID)
 		return
 	}
-	if attachment, view := firstUnfocusedView(workspace, paneID); attachment != nil {
-		d.sendDesktop(ctx, attachment, view, workspace, pane)
+	if d.config.Notifications.DesktopEnabled {
+		if attachment, view := firstUnfocusedView(workspace, paneID); attachment != nil {
+			d.sendDesktop(ctx, attachment, view, workspace, pane)
+		}
 	}
 	important := pane.State == StateBlocked || pane.State == StateError || (pane.State == StateDone && !paneAttached(workspace, paneID))
-	if important {
+	if important && d.config.Notifications.NtfyEnabled {
 		d.sendNtfy(ctx, workspace, pane)
 	}
 	_ = before
@@ -65,12 +72,49 @@ func (d *Daemon) afterRemoteTransition(ctx context.Context, workspace *Workspace
 		return
 	}
 	d.updateKittyState(ctx, workspace)
-	if pane.State != StateBlocked && pane.State != StateError && pane.State != StateDone {
+	_, focused := attentionPaneView(workspace, paneID)
+	if !d.attentionStateEnabled(pane.State) || (pane.State == StateDone && focused) {
 		d.closeDesktopNotifications(ctx, workspace, paneID)
 		return
 	}
-	if attachment, view := firstUnfocusedView(workspace, paneID); attachment != nil {
-		d.sendDesktop(ctx, attachment, view, workspace, pane)
+	if d.config.Notifications.DesktopEnabled {
+		if attachment, view := firstUnfocusedView(workspace, paneID); attachment != nil {
+			d.sendDesktop(ctx, attachment, view, workspace, pane)
+		}
+	}
+}
+
+// resumeAttentionNotifications projects the current actionable set back onto
+// delivery channels. Notification records de-duplicate anything delivered
+// before focus mode, while items that resolved during focus mode are absent.
+func (d *Daemon) resumeAttentionNotifications(ctx context.Context) {
+	snapshot := d.attentionSnapshot()
+	if snapshot.Paused {
+		return
+	}
+	for _, item := range snapshot.Items {
+		d.mu.Lock()
+		workspace := d.state.Workspaces[item.WorkspaceID]
+		if workspace != nil {
+			workspace = workspace.Clone()
+		}
+		d.mu.Unlock()
+		if workspace == nil {
+			continue
+		}
+		pane := workspace.Panes[item.PaneID]
+		if pane == nil {
+			continue
+		}
+		if d.config.Notifications.DesktopEnabled {
+			if attachment, view := firstUnfocusedView(workspace, pane.ID); attachment != nil {
+				d.sendDesktop(ctx, attachment, view, workspace, pane)
+			}
+		}
+		important := pane.State == StateBlocked || pane.State == StateError || (pane.State == StateDone && !paneAttached(workspace, pane.ID))
+		if workspace.RemoteHost == "" && important && d.config.Notifications.NtfyEnabled {
+			d.sendNtfy(ctx, workspace, pane)
+		}
 	}
 }
 
@@ -275,6 +319,15 @@ func eventIdentity(pane *Pane) string {
 func (d *Daemon) reserveNotification(workspaceID, paneID, key, channel string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.state.AttentionPaused {
+		return false
+	}
+	if channel == "kitty" && !d.config.Notifications.DesktopEnabled {
+		return false
+	}
+	if channel == "ntfy" && !d.config.Notifications.NtfyEnabled {
+		return false
+	}
 	workspace := d.state.Workspaces[workspaceID]
 	if workspace == nil || workspace.Panes[paneID] == nil {
 		return false

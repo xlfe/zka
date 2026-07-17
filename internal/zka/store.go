@@ -11,10 +11,16 @@ import (
 )
 
 type Store struct {
-	paths Paths
+	paths  Paths
+	onSave func()
 }
 
 func NewStore(paths Paths) *Store { return &Store{paths: paths} }
+
+// SetOnSave installs an optional daemon-only change signal. Standalone store
+// users remain unaware of subscriptions, and the callback runs only after a
+// durable state replacement succeeds.
+func (s *Store) SetOnSave(callback func()) { s.onSave = callback }
 
 func (s *Store) Ensure() error {
 	for _, dir := range []string{s.paths.StateDir, s.paths.GeneratedDir, s.paths.AttachmentDir} {
@@ -113,7 +119,13 @@ func (s *Store) Save(state StateData) error {
 		return fmt.Errorf("encode state: %w", err)
 	}
 	b = append(b, '\n')
-	return atomicWrite(s.paths.StateFile, b, 0o600)
+	if err := atomicWrite(s.paths.StateFile, b, 0o600); err != nil {
+		return err
+	}
+	if s.onSave != nil {
+		s.onSave()
+	}
+	return nil
 }
 
 func (s *Store) SessionPath(workspaceID, suffix string) string {

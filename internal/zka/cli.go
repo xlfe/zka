@@ -54,6 +54,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) 
 		return normalizeFlagHelp(runKitty(args[1:], paths, stdout, stderr))
 	case "workspace":
 		return normalizeFlagHelp(runWorkspace(args[1:], paths, stdout, stderr))
+	case "attention":
+		return normalizeFlagHelp(runAttention(args[1:], paths, stdin, stdout, stderr))
 	case "pane":
 		return normalizeFlagHelp(runPane(args[1:], paths, stdin, stdout, stderr))
 	case "pane-host":
@@ -88,6 +90,7 @@ func printUsage(w io.Writer) {
 
 Commands:
   launch      Choose or create a workspace in the graphical launcher
+  attention   Show, watch, focus, or defer panes that need you
   kitty       Create a managed Kitty workspace
   workspace   List, inspect, attach, move, detach, rename, kill, focus, or acknowledge workspaces
   doctor      Check local or remote integration
@@ -100,11 +103,19 @@ func runLauncher(args []string, stdin io.Reader, stdout, stderr io.Writer) (int,
 	if len(args) != 0 {
 		return 2, fmt.Errorf("launch accepts no arguments")
 	}
+	return runLauncherMode("", stdin, stdout, stderr)
+}
+
+func runLauncherMode(mode string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	command := os.Getenv("ZKA_LAUNCHER_COMMAND")
 	if command == "" {
 		command = siblingExecutable("zka-launch")
 	}
-	cmd := exec.Command(command)
+	var args []string
+	if mode != "" {
+		args = []string{mode}
+	}
+	cmd := exec.Command(command, args...)
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr

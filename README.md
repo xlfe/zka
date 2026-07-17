@@ -46,8 +46,8 @@ Version 0.5 implements the workspace-centric workflow:
 - dead-backend placeholders for partial failures and automatic reclamation when
   a workspace has no surviving zmx sessions;
 - same-directory tab/window creation through Kitty's last reported shell CWD;
-- Codex lifecycle attention state, Kitty notifications, and important
-  `ntfy-send` notifications;
+- Codex lifecycle state with a streaming Waybar/Sway attention surface, an
+  attention-only Gio popup, and configurable desktop/`ntfy-send` notifications;
 - daemon-owned cancellation and deterministic worker shutdown.
 
 State schemas v1 and v2 are intentionally reset on first v0.3 start because v3
@@ -83,13 +83,18 @@ Useful options include:
 
 ```nix
 services.zka = {
+  attention.states = [ "blocked" "error" "done" ];
   kitty.extraArgs = [ "--class" "managed-kitty" ];
   ssh.options = [
     "-o" "ServerAliveInterval=5"
     "-o" "ServerAliveCountMax=3"
     "-o" "BatchMode=yes"
   ];
-  notifications.ntfyCommand = "ntfy-send";
+  notifications = {
+    desktopEnabled = true;
+    ntfyEnabled = true;
+    ntfyCommand = "ntfy-send";
+  };
 };
 ```
 
@@ -247,10 +252,78 @@ Each pane records explainable agent evidence and one of `unknown`, `idle`,
 aggregate. Codex hooks identify the hidden pane through `ZKA_WORKSPACE_ID` and
 `ZKA_PANE_ID`.
 
-Kitty titles and local notifications reflect pane state. zka invokes
-`ntfy-send` for every `blocked` or `error` transition and for `done` when the
-pane has no attached view. Delivery is deduplicated and failures are retained
-in `zka workspace inspect`.
+Kitty titles and local notifications reflect pane state. By default, zka
+invokes `ntfy-send` for every `blocked` or `error` transition and for `done`
+when the pane has no attached view. Delivery is deduplicated and failures are
+retained in `zka workspace inspect`.
+
+`zka attention` exposes the same state as a live, attention-only queue. It is a
+projection of what needs you now, not a notification history: resolved items
+disappear automatically, and a finished pane disappears while that exact pane
+is focused. The queue orders waiting panes first, then failures, then finished
+work, oldest first within each state.
+
+```sh
+zka attention show             # Gio popup with only actionable panes
+zka attention status           # one human-readable snapshot
+zka attention status --json    # versioned machine-readable snapshot
+zka attention focus-next       # attach/switch and focus the next exact pane
+zka attention pause            # defer interruptions; agents keep running
+zka attention resume
+zka attention toggle
+```
+
+Pause is persistent across daemon restarts. It suppresses locally generated
+desktop and ntfy notifications while agents and remote synchronization keep
+running. The live pending count remains visible, and resuming delivers only
+items that still need attention and were not delivered previously. Each remote
+origin keeps its own pause and ntfy policy; a local pause is not propagated over
+SSH.
+
+### Waybar and Sway attention surface
+
+Waybar can keep one streaming subscription to zkad; no polling interval or
+per-update process is involved. Add `custom/zka` to the desired Waybar module
+list and configure it like this:
+
+```jsonc
+"custom/zka": {
+  "exec": "zka attention watch --waybar",
+  "return-type": "json",
+  "restart-interval": 2,
+  "format": "zka {text}",
+  "tooltip": true,
+  "on-click": "zka attention show",
+  "on-click-middle": "zka attention focus-next",
+  "on-click-right": "zka attention toggle"
+}
+```
+
+The module always prints a count, including `0`, so it remains a clickable
+ambient entry point. It emits the CSS classes `clear`, `blocked`, `error`,
+`done`, `paused`, and `unavailable`; for example:
+
+```css
+#custom-zka { color: #99a8b8; }
+#custom-zka.blocked, #custom-zka.error { color: #ff8f91; }
+#custom-zka.done { color: #6ed5c0; }
+#custom-zka.paused { color: #7b8794; }
+#custom-zka.unavailable { color: #d2a8ff; }
+```
+
+Every mouse action has a stable command for Sway or scripts:
+
+```text
+bindsym $mod+a exec zka attention show
+bindsym $mod+Shift+a exec zka attention focus-next
+bindsym $mod+Ctrl+a exec zka attention toggle
+```
+
+The attention popup updates from the same daemon stream. Up/Down selects an
+item, Enter or a row click restores and focuses its exact local or remote pane,
+`P` pauses or resumes interruptions, and Escape closes it. Its Wayland app ID
+is the same stable `zka-launch` ID as the workspace launcher; its window title
+is `zka attention` if a compositor rule needs to distinguish the two modes.
 
 ## Suggested example-project integration
 

@@ -2,6 +2,7 @@ package launcher
 
 import (
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"strings"
@@ -100,10 +101,21 @@ type ui struct {
 	hostEditor    widget.Editor
 }
 
-func Run(w *app.Window) error {
+func Run(w *app.Window, modes ...string) error {
 	backend, err := newCommandBackend()
 	if err != nil {
 		backend = unavailableBackend{err: err}
+	}
+	if len(modes) > 1 || (len(modes) == 1 && modes[0] != "attention") {
+		return fmt.Errorf("unknown launcher mode %q", strings.Join(modes, " "))
+	}
+	if len(modes) == 1 {
+		application := newAttentionUI(backend)
+		w.Option(
+			app.Title("zka attention"),
+			app.Size(unit.Dp(720), unit.Dp(560)),
+		)
+		return application.run(w)
 	}
 	application := newUI(backend)
 	w.Option(
@@ -120,6 +132,14 @@ func (b unavailableBackend) Workspaces(context.Context, string) ([]*zka.Workspac
 }
 
 func (b unavailableBackend) Node(context.Context) (zka.Host, error) { return zka.Host{}, b.err }
+
+func (b unavailableBackend) Attention(context.Context) (zka.AttentionSnapshot, error) {
+	return zka.AttentionSnapshot{}, b.err
+}
+
+func (b unavailableBackend) WatchAttention(context.Context, func(zka.AttentionSnapshot) error) error {
+	return b.err
+}
 
 func (b unavailableBackend) Execute(context.Context, []string) error { return b.err }
 

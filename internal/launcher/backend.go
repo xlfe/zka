@@ -18,6 +18,8 @@ import (
 type Backend interface {
 	Node(context.Context) (zka.Host, error)
 	Workspaces(context.Context, string) ([]*zka.Workspace, error)
+	Attention(context.Context) (zka.AttentionSnapshot, error)
+	WatchAttention(context.Context, func(zka.AttentionSnapshot) error) error
 	Execute(context.Context, []string) error
 }
 
@@ -51,6 +53,14 @@ func (b *commandBackend) Workspaces(ctx context.Context, host string) ([]*zka.Wo
 
 func (b *commandBackend) Node(ctx context.Context) (zka.Host, error) {
 	return b.api.Node(ctx)
+}
+
+func (b *commandBackend) Attention(ctx context.Context) (zka.AttentionSnapshot, error) {
+	return b.api.Attention(ctx)
+}
+
+func (b *commandBackend) WatchAttention(ctx context.Context, yield func(zka.AttentionSnapshot) error) error {
+	return b.api.WatchAttention(ctx, yield)
 }
 
 func (b *commandBackend) Execute(ctx context.Context, args []string) error {

@@ -12,7 +12,7 @@ import (
 func main() {
 	go func() {
 		window := new(app.Window)
-		if err := launcher.Run(window); err != nil {
+		if err := launcher.Run(window, os.Args[1:]...); err != nil {
 			fmt.Fprintf(os.Stderr, "zka-launch: %v\n", err)
 			os.Exit(1)
 		}

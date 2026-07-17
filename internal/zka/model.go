@@ -270,10 +270,11 @@ type RemoteCache struct {
 }
 
 type StateData struct {
-	SchemaVersion int                     `json:"schema_version"`
-	Node          Host                    `json:"node"`
-	Workspaces    map[string]*Workspace   `json:"workspaces"`
-	Remotes       map[string]*RemoteCache `json:"remotes,omitempty"`
+	SchemaVersion   int                     `json:"schema_version"`
+	Node            Host                    `json:"node"`
+	Workspaces      map[string]*Workspace   `json:"workspaces"`
+	Remotes         map[string]*RemoteCache `json:"remotes,omitempty"`
+	AttentionPaused bool                    `json:"attention_paused,omitempty"`
 }
 
 func newStateData() StateData {

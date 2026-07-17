@@ -53,6 +53,7 @@ let
     else
       "${cfg.zmx.package}/bin/zmx";
   runtimeConfig = json.generate "zka-config.json" {
+    attention.states = cfg.attention.states;
     shell.command = cfg.shell.command;
     kitty = {
       command = "${cfg.kitty.package}/bin/kitty";
@@ -65,7 +66,11 @@ let
       command = "${cfg.ssh.package}/bin/ssh";
       options = cfg.ssh.options;
     };
-    notifications.ntfy_command = cfg.notifications.ntfyCommand;
+    notifications = {
+      desktop_enabled = cfg.notifications.desktopEnabled;
+      ntfy_enabled = cfg.notifications.ntfyEnabled;
+      ntfy_command = cfg.notifications.ntfyCommand;
+    };
   };
   servicePath = [
     cfg.package
@@ -141,6 +146,24 @@ in
       type = lib.types.listOf lib.types.package;
       default = [ ];
       description = "Additional packages made available to zkad, such as the host's ntfy-send package.";
+    };
+
+    attention.states = lib.mkOption {
+      type = lib.types.nonEmptyListOf (lib.types.enum [ "blocked" "error" "done" ]);
+      default = [ "blocked" "error" "done" ];
+      description = "Agent states included in the live attention surface.";
+    };
+
+    notifications.desktopEnabled = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Whether newly actionable panes raise local desktop notifications.";
+    };
+
+    notifications.ntfyEnabled = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Whether newly actionable local panes are sent through ntfy.";
     };
 
     notifications.ntfyCommand = lib.mkOption {
