@@ -252,7 +252,11 @@ workspace through the external launcher:
 
 ```text
 bindsym $mod+Return exec zka launch
+for_window [app_id="^zka-launch$"] floating enable, resize set width 680 px height 560 px, move position center
 ```
+
+The Gio launcher exposes the stable Wayland app ID `zka-launch`, so the
+`for_window` rule floats and centers only the launcher window.
 
 Because Sway starts the launcher directly, attaching does not first create a
 temporary managed terminal. Running `zka launch` from an existing pane is still
