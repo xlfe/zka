@@ -11,6 +11,7 @@ import (
 func TestBuildAttentionSnapshotOrdersLiveItemsAndSuppressesFocusedDone(t *testing.T) {
 	base := time.Date(2026, 7, 17, 9, 0, 0, 0, time.UTC)
 	state := newStateData()
+	state.Node = Host{ID: "local-node", Name: "local"}
 	state.AttentionPaused = true
 	state.Workspaces["local"] = &Workspace{
 		ID: "local", Name: "example-project", Origin: Host{Name: "devbox.example"},
@@ -21,7 +22,7 @@ func TestBuildAttentionSnapshotOrdersLiveItemsAndSuppressesFocusedDone(t *testin
 			"working":      {ID: "working", State: StateWorking, Evidence: Evidence{Timestamp: base}},
 		},
 		Attachments: map[string]*Attachment{"local": {
-			Endpoint: "unix:/tmp/kitty.sock", Status: AttachmentReady,
+			Node: Host{ID: "local-node"}, Endpoint: "unix:/tmp/kitty.sock", Status: AttachmentReady,
 			Views: map[string]RuntimeView{
 				"blocked-new":  {PaneID: "blocked-new", Ready: true},
 				"blocked-old":  {PaneID: "blocked-old", Ready: true, Focused: true},
@@ -56,6 +57,24 @@ func TestBuildAttentionSnapshotOrdersLiveItemsAndSuppressesFocusedDone(t *testin
 	}
 	if got, want := snapshot.Items[2].WorkspaceRef(), "laptop.example:remote"; got != want {
 		t.Fatalf("remote ref = %q, want %q", got, want)
+	}
+}
+
+func TestBuildAttentionSnapshotOnlyMarksViewsOnThisNodeAttached(t *testing.T) {
+	state := newStateData()
+	state.Node = Host{ID: "local-node"}
+	state.Workspaces["remote"] = &Workspace{
+		ID: "remote", Name: "remote", RemoteHost: "devbox.example", Origin: Host{ID: "origin-node"},
+		Panes: map[string]*Pane{"pane": {ID: "pane", State: StateError}},
+		Attachments: map[string]*Attachment{"origin": {
+			Node: Host{ID: "origin-node"}, Endpoint: "unix:/origin/kitty.sock", Status: AttachmentReady,
+			Views: map[string]RuntimeView{"pane": {PaneID: "pane", WindowID: 1, Ready: true, Focused: true}},
+		}},
+	}
+
+	snapshot := buildAttentionSnapshot(state, []AgentState{StateError})
+	if len(snapshot.Items) != 1 || snapshot.Items[0].Attached || !snapshot.Items[0].Focused {
+		t.Fatalf("remote origin view looked locally attached: %#v", snapshot.Items)
 	}
 }
 

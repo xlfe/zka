@@ -203,6 +203,55 @@ func TestPreferredLocalAttachmentReusesReadyAlternateInstance(t *testing.T) {
 	}
 }
 
+func TestFocusableLocalAttachmentKeepsUnhealthyAttachedPaneInExistingKitty(t *testing.T) {
+	workspace := &Workspace{
+		ID: "workspace", PrimaryAttachmentID: "existing",
+		Attachments: map[string]*Attachment{
+			"existing": {
+				ID: "existing", Node: Host{ID: "node"}, Endpoint: "unix:/existing", Status: AttachmentUnhealthy,
+				Views: map[string]RuntimeView{"pane": {PaneID: "pane", WindowID: 9, Ready: true}},
+			},
+		},
+	}
+	if got := focusableLocalAttachment(workspace, "node", "pane"); got == nil || got.ID != "existing" {
+		t.Fatalf("focusable attachment = %#v", got)
+	}
+}
+
+func TestWorkspaceAttachRefusesRequestedPaneAfterZMXReconcileMarksItDead(t *testing.T) {
+	runner := newLifecycleRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 2)
+	panes := workspace.SortedPanes()
+	for _, pane := range panes {
+		if _, err := d.applyEvent(context.Background(), Event{
+			WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "process_started", Source: "test", PID: 42,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner.setSession(panes[0].Backend.Ref, true)
+	workspace, existing := readyWorkspaceAttachment(t, d, workspace, "existing")
+	d.markAttachmentUnhealthy(workspace.ID, existing.ID, errors.New("stale capture after pane exit"))
+	serveTestDaemon(t, d)
+
+	var stdout, stderr bytes.Buffer
+	code, err := runWorkspaceAttach([]string{workspace.ID, "--pane", panes[1].ID}, d.paths, false, &stdout, &stderr)
+	if code != 1 || err == nil || !strings.Contains(err.Error(), "zmx backend is dead") {
+		t.Fatalf("code=%d err=%v stdout=%q stderr=%q", code, err, stdout.String(), stderr.String())
+	}
+	fresh, getErr := NewAPI(d.paths).Workspace(context.Background(), workspace.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if len(fresh.Attachments) != 1 || fresh.Attachments[existing.ID] == nil {
+		t.Fatalf("dead pane attach duplicated the existing Kitty attachment: %#v", fresh.Attachments)
+	}
+}
+
 func TestWorkspaceRenameAndKillCLI(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {

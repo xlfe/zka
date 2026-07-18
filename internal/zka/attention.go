@@ -75,7 +75,8 @@ func buildAttentionSnapshot(state StateData, enabled []AgentState) AttentionSnap
 			if pane == nil || !allowed[pane.State] {
 				continue
 			}
-			attached, focused := attentionPaneView(workspace, pane.ID)
+			attached, _ := attentionPaneViewOnNode(state.Node.ID, workspace, pane.ID)
+			_, focused := attentionPaneView(workspace, pane.ID)
 			if pane.State == StateDone && focused {
 				continue
 			}
@@ -160,8 +161,13 @@ func attentionPriority(state AgentState) int {
 }
 
 func attentionPaneView(workspace *Workspace, paneID string) (attached, focused bool) {
+	return attentionPaneViewOnNode("", workspace, paneID)
+}
+
+func attentionPaneViewOnNode(nodeID string, workspace *Workspace, paneID string) (attached, focused bool) {
 	for _, attachment := range workspace.Attachments {
-		if attachment == nil || attachment.Status == AttachmentDetached || !strings.HasPrefix(attachment.Endpoint, "unix:") {
+		if attachment == nil || (nodeID != "" && attachment.Node.ID != nodeID) || attachment.Status == AttachmentDetached ||
+			attachment.Revoked || !strings.HasPrefix(attachment.Endpoint, "unix:") {
 			continue
 		}
 		if view, ok := attachment.Views[paneID]; ok && view.Ready {

@@ -23,25 +23,35 @@ func TestAttentionItemSummaryExplainsStateAgentOriginAgeAndEvidence(t *testing.T
 	}
 }
 
-func TestAttentionAttachArgsTargetExactLocalOrRemotePane(t *testing.T) {
+func TestAttentionActionArgsFocusAttachedPaneWithoutReattaching(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		item zka.AttentionItem
 		want []string
 	}{
 		{
-			name: "local",
+			name: "detached local",
 			item: zka.AttentionItem{WorkspaceID: "workspace", PaneID: "pane"},
 			want: []string{"workspace", "attach", "workspace", "--pane", "pane"},
 		},
 		{
-			name: "remote",
+			name: "detached remote",
 			item: zka.AttentionItem{WorkspaceID: "workspace", PaneID: "pane", RemoteHost: "devbox.example"},
 			want: []string{"workspace", "attach", "devbox.example:workspace", "--pane", "pane"},
 		},
+		{
+			name: "attached local",
+			item: zka.AttentionItem{WorkspaceID: "workspace", PaneID: "pane", Attached: true},
+			want: []string{"workspace", "focus", "workspace", "--pane", "pane"},
+		},
+		{
+			name: "attached remote cache",
+			item: zka.AttentionItem{WorkspaceID: "workspace", PaneID: "pane", RemoteHost: "devbox.example", Attached: true},
+			want: []string{"workspace", "focus", "workspace", "--pane", "pane"},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := attentionAttachArgs(test.item); !reflect.DeepEqual(got, test.want) {
+			if got := attentionActionArgs(test.item); !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("args = %#v, want %#v", got, test.want)
 			}
 		})

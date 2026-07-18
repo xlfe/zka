@@ -427,8 +427,13 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 		return 1, fmt.Errorf("workspace %q is being deleted", workspace.Name)
 	}
 	if *paneRef != "" {
-		if _, err := resolvePaneFromCopy(workspace, *paneRef); err != nil {
+		pane, err := resolvePaneFromCopy(workspace, *paneRef)
+		if err != nil {
 			return 1, err
+		}
+		*paneRef = pane.ID
+		if pane.BackendDead {
+			return 1, fmt.Errorf("pane %q cannot be opened: zmx backend is dead", pane.Title)
 		}
 	}
 	node, err := api.Node(ctx)
@@ -564,6 +569,31 @@ func preferredLocalAttachment(workspace *Workspace, nodeID string) *Attachment {
 		}
 	}
 	return nil
+}
+
+func focusableLocalAttachment(workspace *Workspace, nodeID, paneID string) *Attachment {
+	preferred := preferredLocalAttachment(workspace, nodeID)
+	if localAttachmentCanFocus(preferred, nodeID, paneID) {
+		return preferred
+	}
+	for _, attachment := range workspace.SortedAttachments() {
+		if localAttachmentCanFocus(attachment, nodeID, paneID) {
+			return workspace.Attachments[attachment.ID]
+		}
+	}
+	return nil
+}
+
+func localAttachmentCanFocus(attachment *Attachment, nodeID, paneID string) bool {
+	if attachment == nil || attachment.Node.ID != nodeID || attachment.Status == AttachmentDetached ||
+		attachment.Revoked || !strings.HasPrefix(attachment.Endpoint, "unix:") {
+		return false
+	}
+	if paneID == "" {
+		return true
+	}
+	view, ok := attachment.Views[paneID]
+	return ok && view.Ready
 }
 
 func readyRemoteAttachment(ctx context.Context, api API, host string, workspace *Workspace, attachment *Attachment) (*Workspace, error) {
@@ -789,9 +819,9 @@ func runWorkspaceFocus(args []string, paths Paths, stdout, stderr io.Writer) (in
 	if err != nil {
 		return 1, err
 	}
-	attachment := preferredLocalAttachment(workspace, node.ID)
-	if !attachmentUsable(attachment) {
-		return 1, fmt.Errorf("workspace has no ready attachment on this node")
+	attachment := focusableLocalAttachment(workspace, node.ID, *pane)
+	if attachment == nil {
+		return 1, fmt.Errorf("workspace has no attached pane on this node")
 	}
 	if err := focusAttachment(ctx, paths, workspace, attachment, *pane); err != nil {
 		return 1, err

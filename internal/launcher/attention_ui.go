@@ -251,12 +251,17 @@ func (ui *attentionUI) activateSelection() {
 	go func() {
 		ctx, cancel := context.WithTimeout(ui.ctx, 60*time.Second)
 		defer cancel()
-		err := ui.backend.Execute(ctx, attentionAttachArgs(item))
+		err := ui.backend.Execute(ctx, attentionActionArgs(item))
 		ui.deliver(attentionResult{action: true, err: err})
 	}()
 }
 
-func attentionAttachArgs(item zka.AttentionItem) []string {
+func attentionActionArgs(item zka.AttentionItem) []string {
+	if item.Attached {
+		// Remote workspaces attached on this node live in the local cache, so
+		// focus the local workspace ID instead of asking the origin to attach.
+		return []string{"workspace", "focus", item.WorkspaceID, "--pane", item.PaneID}
+	}
 	return []string{"workspace", "attach", item.WorkspaceRef(), "--pane", item.PaneID}
 }
 

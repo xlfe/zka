@@ -187,6 +187,9 @@ func runAttentionFocusNext(args []string, paths Paths, stdout, stderr io.Writer)
 	if !ok {
 		return 0, nil
 	}
+	if item.Attached {
+		return runWorkspaceFocus([]string{item.WorkspaceID, "--pane", item.PaneID}, paths, stdout, stderr)
+	}
 	return runWorkspaceAttach([]string{item.WorkspaceRef(), "--pane", item.PaneID}, paths, false, stdout, stderr)
 }
 
