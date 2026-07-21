@@ -114,7 +114,7 @@ func (k KittyClient) FocusPane(ctx context.Context, endpoint, workspaceID, paneI
 }
 
 func (k KittyClient) CloseWorkspace(ctx context.Context, endpoint, workspaceID string) error {
-	_, err := k.rc(ctx, endpoint, "close-window", "--match", "var:zka_workspace="+workspaceID)
+	_, err := k.rc(ctx, endpoint, "close-window", "--no-response", "--match", "var:zka_workspace="+workspaceID)
 	return err
 }
 

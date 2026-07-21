@@ -3,6 +3,7 @@ package zka
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -15,6 +16,23 @@ func TestKittyFocusUsesStablePaneVariable(t *testing.T) {
 	}
 	calls := runner.Calls()
 	if len(calls) != 1 || calls[0].Name != "kitten-test" || !strings.Contains(strings.Join(calls[0].Args, "|"), "var:zka_pane=pane") {
+		t.Fatalf("calls = %#v", calls)
+	}
+}
+
+func TestKittyCloseWorkspaceDoesNotWaitForFinalWindowResponse(t *testing.T) {
+	runner := &fakeRunner{handler: func(_ context.Context, _ string, args ...string) (string, string, error) {
+		if !strings.Contains(strings.Join(args, " "), "--no-response") {
+			return "", "Error: EOF", errors.New("exit status 1")
+		}
+		return "", "", nil
+	}}
+	kitty := KittyClient{Runner: runner, Command: "kitten-test"}
+	if err := kitty.CloseWorkspace(context.Background(), "unix:/kitty", "workspace"); err != nil {
+		t.Fatalf("close workspace = %v", err)
+	}
+	calls := runner.Calls()
+	if len(calls) != 1 || !strings.Contains(strings.Join(calls[0].Args, "|"), "close-window|--no-response|--match|var:zka_workspace=workspace") {
 		t.Fatalf("calls = %#v", calls)
 	}
 }
