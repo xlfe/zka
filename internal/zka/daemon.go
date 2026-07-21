@@ -296,7 +296,14 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 		d.watchAttention(ctx, conn)
 		return
 	}
-	callCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	callDeadline := time.Now().Add(60 * time.Second)
+	if req.DeadlineUnixNano > 0 {
+		requestDeadline := time.Unix(0, req.DeadlineUnixNano)
+		if requestDeadline.Before(callDeadline) {
+			callDeadline = requestDeadline
+		}
+	}
+	callCtx, cancel := context.WithDeadline(ctx, callDeadline)
 	defer cancel()
 	data, err := d.dispatch(callCtx, req.Op, req.Payload)
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))

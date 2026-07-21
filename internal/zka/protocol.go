@@ -14,10 +14,15 @@ import (
 
 const maxProtocolMessage = 1 << 20
 
+// Leave enough time for zkad to serialize an operation deadline error before
+// the client-side socket/context deadline closes the connection.
+const daemonResponseGrace = 100 * time.Millisecond
+
 type request struct {
-	Version int             `json:"version"`
-	Op      string          `json:"op"`
-	Payload json.RawMessage `json:"payload,omitempty"`
+	Version          int             `json:"version"`
+	Op               string          `json:"op"`
+	Payload          json.RawMessage `json:"payload,omitempty"`
+	DeadlineUnixNano int64           `json:"deadline_unix_nano,omitempty"`
 }
 
 type response struct {
@@ -50,6 +55,10 @@ func (c Client) Call(ctx context.Context, op string, payload, out any) error {
 		deadline = contextDeadline
 	}
 	_ = conn.SetDeadline(deadline)
+	daemonDeadline := deadline
+	if time.Until(deadline) > 2*daemonResponseGrace {
+		daemonDeadline = deadline.Add(-daemonResponseGrace)
+	}
 	var raw json.RawMessage
 	if payload != nil {
 		raw, err = json.Marshal(payload)
@@ -57,12 +66,15 @@ func (c Client) Call(ctx context.Context, op string, payload, out any) error {
 			return fmt.Errorf("encode request: %w", err)
 		}
 	}
-	if err := json.NewEncoder(conn).Encode(request{Version: protocolVersion, Op: op, Payload: raw}); err != nil {
+	if err := json.NewEncoder(conn).Encode(request{Version: protocolVersion, Op: op, Payload: raw, DeadlineUnixNano: daemonDeadline.UnixNano()}); err != nil {
 		return fmt.Errorf("send request: %w", err)
 	}
 	var res response
 	dec := json.NewDecoder(io.LimitReader(conn, maxProtocolMessage))
 	if err := dec.Decode(&res); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("read response: %w", err)
 	}
 	if res.Version != protocolVersion {

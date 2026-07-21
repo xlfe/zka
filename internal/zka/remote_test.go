@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -219,6 +221,120 @@ func TestUnreachableSSHControlReturnsWithoutMutatingWorkspace(t *testing.T) {
 	}
 	if len(d.state.Workspaces) != 0 {
 		t.Fatalf("unexpected state mutation: %#v", d.state.Workspaces)
+	}
+}
+
+func TestInitialSSHExit255ReturnsDiagnostic(t *testing.T) {
+	t.Setenv("GO_WANT_ZKA_SSH_HELPER", "exit255")
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.SSH.Command = os.Args[0]
+	d.config.SSH.Options = []string{"-test.run=TestZKASSHHelperProcess", "--"}
+	var logs boundedTailBuffer
+	d.logger.SetOutput(&logs)
+	serveTestDaemon(t, d)
+	api := NewAPI(d.paths)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	started := time.Now()
+	err = api.RemoteCall(ctx, "devbox.example", "list", nil, new([]*Workspace))
+	if err == nil || !strings.Contains(err.Error(), "status 255") || !strings.Contains(err.Error(), "Permission denied (publickey)") {
+		t.Fatalf("error = %v", err)
+	}
+	if time.Since(started) >= time.Second {
+		t.Fatalf("initial authentication failure was retried for %s", time.Since(started))
+	}
+	if !strings.Contains(logs.String(), "Permission denied (publickey)") {
+		t.Fatalf("daemon log = %q", logs.String())
+	}
+	if retryErr := api.RemoteCall(ctx, "devbox.example", "list", nil, new([]*Workspace)); retryErr == nil {
+		t.Fatal("retry unexpectedly succeeded")
+	}
+	if strings.Count(logs.String(), "Permission denied (publickey)") != 2 {
+		t.Fatalf("a corrected agent could not start a fresh SSH attempt; daemon log = %q", logs.String())
+	}
+}
+
+func TestRemoteCallDeadlineReturnsDaemonErrorInsteadOfSocketTimeout(t *testing.T) {
+	t.Setenv("GO_WANT_ZKA_SSH_HELPER", "hang")
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.SSH.Command = os.Args[0]
+	d.config.SSH.Options = []string{"-test.run=TestZKASSHHelperProcess", "--"}
+	serveTestDaemon(t, d)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = NewAPI(d.paths).RemoteCall(ctx, "devbox.example", "list", nil, new([]*Workspace))
+	if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("error = %v", err)
+	}
+	if strings.Contains(err.Error(), "read response") || strings.Contains(err.Error(), "i/o timeout") {
+		t.Fatalf("remote failure was obscured by local socket error: %v", err)
+	}
+	d.remotes.mu.Lock()
+	_, retained := d.remotes.clients["devbox.example"]
+	d.remotes.mu.Unlock()
+	if retained {
+		t.Fatal("timed-out initial SSH process remained cached and blocked a fresh attempt")
+	}
+}
+
+func TestEstablishedSSHExit255RetriesAndPreservesLastFailure(t *testing.T) {
+	t.Setenv("GO_WANT_ZKA_SSH_HELPER", "hello-exit255")
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.SSH.Command = os.Args[0]
+	d.config.SSH.Options = []string{"-test.run=TestZKASSHHelperProcess", "--"}
+	var logs boundedTailBuffer
+	d.logger.SetOutput(&logs)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	_, err = d.remotes.Call(ctx, "devbox.example", "list", nil)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "status 255") || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("error = %v", err)
+	}
+	if strings.Count(logs.String(), "connection reset") < 2 {
+		t.Fatalf("established connection was not retried; daemon log = %q", logs.String())
+	}
+}
+
+func TestZKASSHHelperProcess(t *testing.T) {
+	switch os.Getenv("GO_WANT_ZKA_SSH_HELPER") {
+	case "exit255":
+		_, _ = io.WriteString(os.Stderr, "sign_and_send_pubkey: signing failed: agent refused operation\nPermission denied (publickey).\n")
+		os.Exit(255)
+	case "hang":
+		for {
+			time.Sleep(time.Hour)
+		}
+	case "hello-exit255":
+		_ = json.NewEncoder(os.Stdout).Encode(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "hello"})
+		_, _ = io.WriteString(os.Stderr, "client_loop: send disconnect: connection reset\n")
+		time.Sleep(25 * time.Millisecond)
+		os.Exit(255)
+	}
+}
+
+func TestSSHStderrCaptureIsBoundedAndKeepsTail(t *testing.T) {
+	var stderr boundedTailBuffer
+	prefix := strings.Repeat("x", maxSSHStderr+100)
+	_, _ = stderr.Write([]byte(prefix))
+	_, _ = stderr.Write([]byte("Permission denied (publickey)."))
+	detail := stderr.String()
+	if !strings.Contains(detail, "stderr truncated") || !strings.HasSuffix(detail, "Permission denied (publickey).") {
+		t.Fatalf("captured stderr = %q", detail)
+	}
+	if len(detail) > maxSSHStderr+100 {
+		t.Fatalf("captured %d bytes, want bounded near %d", len(detail), maxSSHStderr)
 	}
 }
 

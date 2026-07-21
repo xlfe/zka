@@ -240,10 +240,41 @@ arrives. Pane terminal traffic is separate and attaches directly on the origin:
 ssh -tt -- devbox.example exec zka remote-attach --workspace W --pane P --attachment A
 ```
 
-OpenSSH server-alive checks detect dead TCP sessions. zka retries only SSH exit
-status 255, with exponential backoff from 250 ms to 30 seconds, then reattaches
-to the same zmx session. It never restarts a missing foreground process; a
-missing backend becomes the same removable static placeholder used locally.
+OpenSSH server-alive checks detect dead TCP sessions. After a control connection
+has completed its protocol handshake, zka retries SSH exit status 255 with
+exponential backoff from 250 ms to 30 seconds, then reattaches to the same zmx
+session. Exit 255 before the first handshake is treated as an authentication or
+configuration failure instead. zkad logs the exit status and the last 8 KiB of
+SSH stderr, and returns both to the caller. It never restarts a missing
+foreground process; a missing backend becomes the same removable static
+placeholder used locally.
+
+### SSH agents and hardware-backed keys
+
+Control SSH runs inside `zkad`, so it inherits the systemd user manager's
+environment rather than the environment of the shell that opened the launcher.
+Check the value visible to user services with:
+
+```sh
+systemctl --user show-environment | rg '^SSH_AUTH_SOCK='
+```
+
+If the interactive shell has the intended agent socket, import it before
+restarting the daemon:
+
+```sh
+systemctl --user import-environment SSH_AUTH_SOCK DISPLAY WAYLAND_DISPLAY
+systemctl --user restart zkad
+```
+
+The default `BatchMode=yes` prevents SSH from opening password, host-key, or
+private-key passphrase prompts. Hardware-backed agent keys can still work when
+the agent can complete signing from zkad's environment, including hardware token touch
+or a separately configured graphical pinentry. zka has no controlling terminal
+and does not relay PIN or touch prompts through the launcher. Unlock the key or
+configure graphical pinentry first; an unavailable identity or refused signing
+request is then reported from SSH stderr instead of appearing as a local socket
+timeout. Use `journalctl --user-unit zkad` for the same bounded diagnostic.
 
 ## Attention and notifications
 

@@ -73,21 +73,26 @@ func (m *RemoteManager) client(host string) (*remoteClient, error) {
 		return nil, context.Canceled
 	}
 	if client := m.clients[host]; client != nil {
+		client.mu.Lock()
+		client.activeCalls++
+		client.mu.Unlock()
 		m.mu.Unlock()
 		return client, nil
 	}
 	client := newRemoteClient(m, host)
+	client.activeCalls = 1
 	m.clients[host] = client
 	m.mu.Unlock()
 	m.daemon.startWorker(func(ctx context.Context) { client.supervise(ctx) })
 	return client, nil
 }
 
-func (m *RemoteManager) Call(ctx context.Context, host, op string, payload any) (json.RawMessage, error) {
+func (m *RemoteManager) Call(ctx context.Context, host, op string, payload any) (result json.RawMessage, resultErr error) {
 	client, err := m.client(host)
 	if err != nil {
 		return nil, err
 	}
+	defer func() { m.releaseClient(host, client, resultErr) }()
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("encode remote request: %w", err)
@@ -102,9 +107,26 @@ func (m *RemoteManager) Call(ctx context.Context, host, op string, payload any) 
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, client.contextError(ctx.Err())
 		case <-time.After(100 * time.Millisecond):
 		}
+	}
+}
+
+func (m *RemoteManager) releaseClient(host string, client *remoteClient, callErr error) {
+	m.mu.Lock()
+	client.mu.Lock()
+	client.activeCalls--
+	terminalFailure := client.terminal != nil && errors.Is(callErr, client.terminal)
+	abandonInitial := client.activeCalls == 0 && !client.everConnected &&
+		(errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded))
+	if m.clients[host] == client && (terminalFailure || abandonInitial) {
+		delete(m.clients, host)
+	}
+	client.mu.Unlock()
+	m.mu.Unlock()
+	if abandonInitial {
+		client.stop()
 	}
 }
 
@@ -166,22 +188,61 @@ func (m *RemoteManager) cacheEvent(host, op string, payload json.RawMessage) {
 
 var errRemoteDisconnected = errors.New("remote SSH control connection disconnected")
 
+const maxSSHStderr = 8 << 10
+
+type boundedTailBuffer struct {
+	mu        sync.Mutex
+	data      []byte
+	truncated bool
+}
+
+func (b *boundedTailBuffer) Write(p []byte) (int, error) {
+	written := len(p)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(p) >= maxSSHStderr {
+		b.data = append(b.data[:0], p[len(p)-maxSSHStderr:]...)
+		b.truncated = true
+		return written, nil
+	}
+	if overflow := len(b.data) + len(p) - maxSSHStderr; overflow > 0 {
+		copy(b.data, b.data[overflow:])
+		b.data = b.data[:len(b.data)-overflow]
+		b.truncated = true
+	}
+	b.data = append(b.data, p...)
+	return written, nil
+}
+
+func (b *boundedTailBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	detail := string(b.data)
+	if b.truncated {
+		return fmt.Sprintf("[SSH stderr truncated; showing last %d bytes]\n%s", maxSSHStderr, detail)
+	}
+	return detail
+}
+
 type remoteClient struct {
 	manager *RemoteManager
 	host    string
 
-	mu        sync.Mutex
-	writeMu   sync.Mutex
-	stdin     io.WriteCloser
-	encoder   *json.Encoder
-	process   *exec.Cmd
-	connected bool
-	terminal  error
-	stateCh   chan struct{}
-	pending   map[string]chan remoteEnvelope
-	sequence  atomic.Uint64
-	stopCh    chan struct{}
-	stopOnce  sync.Once
+	mu            sync.Mutex
+	writeMu       sync.Mutex
+	stdin         io.WriteCloser
+	encoder       *json.Encoder
+	process       *exec.Cmd
+	connected     bool
+	everConnected bool
+	activeCalls   int
+	terminal      error
+	lastFailure   error
+	stateCh       chan struct{}
+	pending       map[string]chan remoteEnvelope
+	sequence      atomic.Uint64
+	stopCh        chan struct{}
+	stopOnce      sync.Once
 }
 
 func newRemoteClient(manager *RemoteManager, host string) *remoteClient {
@@ -214,7 +275,7 @@ func (c *remoteClient) supervise(ctx context.Context) {
 			return
 		default:
 		}
-		cmd, stdin, stdout, err := c.startSSH(ctx)
+		cmd, stdin, stdout, stderr, err := c.startSSH(ctx)
 		if err != nil {
 			c.setTerminal(fmt.Errorf("start SSH control connection to %s: %w", c.host, err))
 			return
@@ -233,8 +294,10 @@ func (c *remoteClient) supervise(ctx context.Context) {
 		<-readerDone
 		c.mu.Lock()
 		wasConnected := c.connected
+		everConnected := c.everConnected
 		c.mu.Unlock()
-		c.disconnected(waitErr)
+		failure := sshConnectionError(c.host, waitErr, stderr.String())
+		c.disconnected(failure)
 		if wasConnected {
 			backoff = 250 * time.Millisecond
 		}
@@ -246,8 +309,13 @@ func (c *remoteClient) supervise(ctx context.Context) {
 			return
 		default:
 		}
+		c.manager.daemon.logger.Printf("%v", failure)
 		if sshExitCode(waitErr) != 255 {
-			c.setTerminal(fmt.Errorf("SSH control connection to %s exited: %w", c.host, waitErr))
+			c.setTerminal(failure)
+			return
+		}
+		if !everConnected {
+			c.setTerminal(failure)
 			return
 		}
 		select {
@@ -266,22 +334,24 @@ func (c *remoteClient) supervise(ctx context.Context) {
 	}
 }
 
-func (c *remoteClient) startSSH(ctx context.Context) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
+func (c *remoteClient) startSSH(ctx context.Context) (*exec.Cmd, io.WriteCloser, io.ReadCloser, *boundedTailBuffer, error) {
 	args := append([]string(nil), c.manager.daemon.config.SSH.Options...)
 	args = append(args, "-T", "--", c.host, "exec", "zka", "remote-control")
 	cmd := exec.CommandContext(ctx, c.manager.daemon.config.SSH.Command, args...)
+	stderr := &boundedTailBuffer{}
+	cmd.Stderr = stderr
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return cmd, stdin, stdout, nil
+	return cmd, stdin, stdout, stderr, nil
 }
 
 func (c *remoteClient) readLoop(ctx context.Context, input io.Reader) {
@@ -309,7 +379,9 @@ func (c *remoteClient) readLoop(ctx context.Context, input io.Reader) {
 			}
 			c.mu.Lock()
 			c.connected = true
+			c.everConnected = true
 			c.terminal = nil
+			c.lastFailure = nil
 			c.signalStateLocked()
 			c.mu.Unlock()
 			continue
@@ -337,6 +409,7 @@ func (c *remoteClient) readLoop(ctx context.Context, input io.Reader) {
 func (c *remoteClient) disconnected(cause error) {
 	c.mu.Lock()
 	c.connected = false
+	c.lastFailure = cause
 	c.process, c.stdin, c.encoder = nil, nil, nil
 	for id, waiter := range c.pending {
 		delete(c.pending, id)
@@ -344,12 +417,12 @@ func (c *remoteClient) disconnected(cause error) {
 	}
 	c.signalStateLocked()
 	c.mu.Unlock()
-	_ = cause
 }
 
 func (c *remoteClient) setTerminal(err error) {
 	c.mu.Lock()
 	c.terminal = err
+	c.lastFailure = err
 	c.connected = false
 	c.signalStateLocked()
 	c.mu.Unlock()
@@ -392,7 +465,7 @@ func (c *remoteClient) call(ctx context.Context, op string, payload json.RawMess
 				c.mu.Lock()
 				delete(c.pending, id)
 				c.mu.Unlock()
-				return nil, ctx.Err()
+				return nil, c.contextError(ctx.Err())
 			case <-c.stopCh:
 				return nil, context.Canceled
 			}
@@ -402,11 +475,35 @@ func (c *remoteClient) call(ctx context.Context, op string, payload json.RawMess
 		select {
 		case <-stateCh:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, c.contextError(ctx.Err())
 		case <-c.stopCh:
 			return nil, context.Canceled
 		}
 	}
+}
+
+func (c *remoteClient) contextError(cause error) error {
+	c.mu.Lock()
+	lastFailure := c.lastFailure
+	c.mu.Unlock()
+	if lastFailure == nil {
+		return cause
+	}
+	return fmt.Errorf("remote SSH control connection to %s: %w; last failure: %v", c.host, cause, lastFailure)
+}
+
+func sshConnectionError(host string, waitErr error, stderr string) error {
+	status := sshExitCode(waitErr)
+	summary := fmt.Sprintf("SSH control connection to %s exited", host)
+	if status >= 0 {
+		summary = fmt.Sprintf("%s with status %d", summary, status)
+	} else if waitErr != nil {
+		summary = fmt.Sprintf("%s: %v", summary, waitErr)
+	}
+	if detail := strings.TrimSpace(stderr); detail != "" {
+		return fmt.Errorf("%s: %s", summary, detail)
+	}
+	return errors.New(summary)
 }
 
 func sshExitCode(err error) int {
