@@ -67,6 +67,8 @@
                 nixpkgs.hostPlatform = system;
                 system.stateVersion = "26.05";
                 services.zka.enable = true;
+                services.zka.ssh.identityAgent = "/run/user/%i/ssh-agent.socket";
+                services.zka.ssh.extraOptions = [ "-o" "IdentitiesOnly=yes" ];
               }
             ];
           };
@@ -83,6 +85,8 @@
             test -n "$execStart"
             grep -q '"fish"' "$runtimeConfig"
             grep -q 'ServerAliveInterval=5' "$runtimeConfig"
+            grep -q 'IdentitiesOnly=yes' "$runtimeConfig"
+            grep -q '/run/user/%i/ssh-agent.socket' "$runtimeConfig"
             grep -q 'kitty-watcher.py' "$runtimeConfig"
             grep -q '"desktop_enabled": *true' "$runtimeConfig"
             grep -q '"ntfy_enabled": *true' "$runtimeConfig"

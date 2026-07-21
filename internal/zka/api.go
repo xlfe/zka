@@ -3,6 +3,7 @@ package zka
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"time"
 )
 
@@ -23,6 +24,12 @@ func (a API) Ping(ctx context.Context) (map[string]any, error) {
 func (a API) Node(ctx context.Context) (Host, error) {
 	var out Host
 	err := a.client.Call(ctx, "node", nil, &out)
+	return out, err
+}
+
+func (a API) SSHAgent(ctx context.Context) (sshAgentInfo, error) {
+	var out sshAgentInfo
+	err := a.client.Call(ctx, "ssh_agent", nil, &out)
 	return out, err
 }
 
@@ -176,7 +183,7 @@ func (a API) RemoteCall(ctx context.Context, host, op string, payload, out any) 
 		raw = encoded
 	}
 	var response json.RawMessage
-	if err := a.client.Call(ctx, "remote_call", remoteDaemonRequest{Host: host, Op: op, Payload: raw}, &response); err != nil {
+	if err := a.client.Call(ctx, "remote_call", remoteDaemonRequest{Host: host, Op: op, Payload: raw, CallerSSHAuthSock: os.Getenv("SSH_AUTH_SOCK")}, &response); err != nil {
 		return err
 	}
 	if out != nil && len(response) > 0 {

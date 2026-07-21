@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -26,8 +28,9 @@ type Config struct {
 		Command string `json:"command"`
 	} `json:"zmx"`
 	SSH struct {
-		Command string   `json:"command"`
-		Options []string `json:"options"`
+		Command       string   `json:"command"`
+		Options       []string `json:"options"`
+		IdentityAgent string   `json:"identity_agent"`
 	} `json:"ssh"`
 	Notifications struct {
 		DesktopEnabled bool   `json:"desktop_enabled"`
@@ -96,7 +99,102 @@ func LoadConfig() (Config, error) {
 			return Config{}, fmt.Errorf("%s must not be empty", label)
 		}
 	}
+	if cfg.SSH.IdentityAgent != "" {
+		cfg.SSH.Options = append([]string{"-o", "IdentityAgent=" + cfg.SSH.IdentityAgent}, cfg.SSH.Options...)
+	}
 	return cfg, nil
+}
+
+type sshAgentInfo struct {
+	InheritedSocket string `json:"inherited_socket,omitempty"`
+	IdentityAgent   string `json:"identity_agent,omitempty"`
+	EffectiveSocket string `json:"effective_socket,omitempty"`
+}
+
+func newSSHAgentInfo(cfg Config, inheritedSocket string) sshAgentInfo {
+	identityAgent := cfg.SSH.IdentityAgent
+	if identityAgent == "" {
+		identityAgent = sshIdentityAgentOption(cfg.SSH.Options)
+	}
+	effectiveSocket := inheritedSocket
+	if identityAgent != "" {
+		effectiveSocket = expandSSHIdentityAgent(identityAgent, inheritedSocket)
+	}
+	return sshAgentInfo{
+		InheritedSocket: inheritedSocket,
+		IdentityAgent:   identityAgent,
+		EffectiveSocket: effectiveSocket,
+	}
+}
+
+func sshIdentityAgentOption(options []string) string {
+	for index := 0; index < len(options); index++ {
+		option := options[index]
+		if option == "-o" && index+1 < len(options) {
+			if value := sshConfigOptionValue(options[index+1], "IdentityAgent"); value != "" {
+				return value
+			}
+			index++
+			continue
+		}
+		if strings.HasPrefix(option, "-o") {
+			if value := sshConfigOptionValue(strings.TrimPrefix(option, "-o"), "IdentityAgent"); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func sshConfigOptionValue(option, name string) string {
+	parts := strings.FieldsFunc(strings.TrimSpace(option), func(r rune) bool { return r == '=' || r == ' ' || r == '\t' })
+	if len(parts) == 2 && strings.EqualFold(parts[0], name) {
+		return parts[1]
+	}
+	return ""
+}
+
+func expandSSHIdentityAgent(value, inheritedSocket string) string {
+	switch value {
+	case "SSH_AUTH_SOCK", "$SSH_AUTH_SOCK", "${SSH_AUTH_SOCK}":
+		return inheritedSocket
+	}
+	const escapedPercent = "\x00"
+	expanded := strings.ReplaceAll(value, "%%", escapedPercent)
+	expanded = strings.ReplaceAll(expanded, "%i", strconv.Itoa(os.Getuid()))
+	return strings.ReplaceAll(expanded, escapedPercent, "%")
+}
+
+func sameSSHAgentSocket(left, right string) bool {
+	if left == right {
+		return true
+	}
+	if left == "" || right == "" || left == "none" || right == "none" {
+		return false
+	}
+	return filepath.Clean(left) == filepath.Clean(right)
+}
+
+func withSSHAgentMismatchHint(err error, daemonAgent sshAgentInfo, callerSocket string) error {
+	if err == nil || !sshAuthenticationFailure(err) || sameSSHAgentSocket(daemonAgent.EffectiveSocket, callerSocket) {
+		return err
+	}
+	return fmt.Errorf("%w\nSSH agent mismatch: zkad uses %s; caller uses %s. Configure services.zka.ssh.identityAgent or import SSH_AUTH_SOCK and restart zkad", err, displaySSHAgentSocket(daemonAgent.EffectiveSocket), displaySSHAgentSocket(callerSocket))
+}
+
+func sshAuthenticationFailure(err error) bool {
+	detail := strings.ToLower(err.Error())
+	return strings.Contains(detail, "permission denied") || strings.Contains(detail, "agent refused operation")
+}
+
+func displaySSHAgentSocket(socket string) string {
+	if socket == "" {
+		return "SSH_AUTH_SOCK is not set"
+	}
+	if socket == "none" {
+		return "no agent (IdentityAgent=none)"
+	}
+	return socket
 }
 
 func applyConfigEnvironment(cfg *Config) {

@@ -1,6 +1,7 @@
 package zka
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -40,5 +41,45 @@ func TestAttentionConfigRejectsUnsupportedState(t *testing.T) {
 	_, err := LoadConfig()
 	if err == nil || !strings.Contains(err.Error(), "unsupported state") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSSHIdentityAgentPrecedesOtherOptions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"ssh":{"identity_agent":"/run/user/%i/ssh-agent.socket","options":["-o","BatchMode=yes"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", path)
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(cfg.SSH.Options, " ")
+	if !strings.HasPrefix(joined, "-o IdentityAgent=/run/user/%i/ssh-agent.socket ") {
+		t.Fatalf("ssh options = %q", joined)
+	}
+}
+
+func TestSSHAgentInfoExpandsUIDAndHintsOnlyForAuthentication(t *testing.T) {
+	var cfg Config
+	cfg.SSH.IdentityAgent = "/run/user/%i/ssh-agent.socket"
+	agent := newSSHAgentInfo(cfg, "/run/user/1234/agent-a.socket")
+	if strings.Contains(agent.EffectiveSocket, "%i") || !strings.HasSuffix(agent.EffectiveSocket, "/agent/S.ssh-agent.ssh") {
+		t.Fatalf("agent info = %#v", agent)
+	}
+	authErr := errors.New("Permission denied (publickey)")
+	hinted := withSSHAgentMismatchHint(authErr, agent, "/run/user/1234/agent-a.socket")
+	if !strings.Contains(hinted.Error(), "SSH agent mismatch") {
+		t.Fatalf("hinted error = %v", hinted)
+	}
+	plainErr := errors.New("connection refused")
+	if got := withSSHAgentMismatchHint(plainErr, agent, "/different/agent"); got != plainErr {
+		t.Fatalf("non-authentication error changed: %v", got)
+	}
+	var optionConfig Config
+	optionConfig.SSH.Options = []string{"-o", "IdentityAgent=/run/user/%i/option-agent", "-o", "BatchMode=yes"}
+	optionAgent := newSSHAgentInfo(optionConfig, "/inherited")
+	if optionAgent.IdentityAgent != "/run/user/%i/option-agent" || strings.Contains(optionAgent.EffectiveSocket, "%i") {
+		t.Fatalf("agent selected through ssh options = %#v", optionAgent)
 	}
 }

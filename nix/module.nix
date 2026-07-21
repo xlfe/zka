@@ -64,7 +64,8 @@ let
     zmx.command = zmxCommand;
     ssh = {
       command = "${cfg.ssh.package}/bin/ssh";
-      options = cfg.ssh.options;
+      options = cfg.ssh.options ++ cfg.ssh.extraOptions;
+      identity_agent = cfg.ssh.identityAgent;
     };
     notifications = {
       desktop_enabled = cfg.notifications.desktopEnabled;
@@ -128,6 +129,13 @@ in
     ssh = {
       package = lib.mkPackageOption pkgs "openssh" { };
 
+      identityAgent = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/run/user/%i/ssh-agent.socket";
+        description = "Persistent OpenSSH IdentityAgent used by zkad and remote pane attachments; supports OpenSSH tokens such as %i.";
+      };
+
       options = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [
@@ -139,6 +147,12 @@ in
           "BatchMode=yes"
         ];
         description = "OpenSSH options used for remote workspace control and pane attachment.";
+      };
+
+      extraOptions = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Additional OpenSSH options appended to the default ssh.options list.";
       };
     };
 

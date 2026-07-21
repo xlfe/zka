@@ -85,6 +85,8 @@ Useful options include:
 services.zka = {
   attention.states = [ "blocked" "error" "done" ];
   kitty.extraArgs = [ "--class" "managed-kitty" ];
+  ssh.identityAgent = "/run/user/%i/ssh-agent.socket";
+  ssh.extraOptions = [ "-o" "IdentitiesOnly=yes" ];
   ssh.options = [
     "-o" "ServerAliveInterval=5"
     "-o" "ServerAliveCountMax=3"
@@ -251,16 +253,25 @@ placeholder used locally.
 
 ### SSH agents and hardware-backed keys
 
-Control SSH runs inside `zkad`, so it inherits the systemd user manager's
-environment rather than the environment of the shell that opened the launcher.
-Check the value visible to user services with:
+Control SSH runs inside `zkad`, so without an explicit `IdentityAgent` it
+inherits the systemd user manager's environment rather than the environment of
+the shell that opened the launcher. Prefer a persistent NixOS selection for a
+GPG SSH agent; OpenSSH expands `%i` to the numeric user ID:
+
+```nix
+services.zka.ssh.identityAgent = "/run/user/%i/ssh-agent.socket";
+```
+
+`services.zka.ssh.extraOptions` appends options without replacing the default
+server-alive and batch-mode settings. To inspect an unconfigured service's
+current environment, run:
 
 ```sh
 systemctl --user show-environment | rg '^SSH_AUTH_SOCK='
 ```
 
-If the interactive shell has the intended agent socket, import it before
-restarting the daemon:
+As a temporary, session-dependent workaround, import the interactive shell's
+agent before restarting the daemon:
 
 ```sh
 systemctl --user import-environment SSH_AUTH_SOCK DISPLAY WAYLAND_DISPLAY
@@ -274,7 +285,10 @@ or a separately configured graphical pinentry. zka has no controlling terminal
 and does not relay PIN or touch prompts through the launcher. Unlock the key or
 configure graphical pinentry first; an unavailable identity or refused signing
 request is then reported from SSH stderr instead of appearing as a local socket
-timeout. Use `journalctl --user-unit zkad` for the same bounded diagnostic.
+timeout. `zka doctor --origin HOST` reports the effective zkad and caller agent
+sockets, verifies that each socket exists, lists their SHA256 public-key
+fingerprints, and fails `ssh-agent-match` when their identities differ. Use
+`journalctl --user-unit zkad` for the same bounded SSH diagnostic.
 
 ## Attention and notifications
 

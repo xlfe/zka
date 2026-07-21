@@ -26,9 +26,10 @@ type remoteEnvelope struct {
 }
 
 type remoteDaemonRequest struct {
-	Host    string          `json:"host"`
-	Op      string          `json:"op"`
-	Payload json.RawMessage `json:"payload,omitempty"`
+	Host              string          `json:"host"`
+	Op                string          `json:"op"`
+	Payload           json.RawMessage `json:"payload,omitempty"`
+	CallerSSHAuthSock string          `json:"caller_ssh_auth_sock,omitempty"`
 }
 
 type paneReadinessRequest struct {

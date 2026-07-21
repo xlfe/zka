@@ -24,13 +24,14 @@ type Daemon struct {
 	cleanupMu   sync.Mutex
 	wg          sync.WaitGroup
 
-	paths  Paths
-	store  *Store
-	state  StateData
-	config Config
-	runner CommandRunner
-	kitty  KittyClient
-	logger *log.Logger
+	paths    Paths
+	store    *Store
+	state    StateData
+	config   Config
+	runner   CommandRunner
+	kitty    KittyClient
+	logger   *log.Logger
+	sshAgent sshAgentInfo
 
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -111,6 +112,7 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 			Command: cfg.Kitty.KittenCommand,
 		},
 		logger:        logger,
+		sshAgent:      newSSHAgentInfo(cfg, os.Getenv("SSH_AUTH_SOCK")),
 		ctx:           ctx,
 		cancel:        cancel,
 		events:        make(chan WatcherEvent, 128),
@@ -453,6 +455,8 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		return map[string]any{"pid": os.Getpid(), "schema_version": stateSchemaVersion, "protocol_version": protocolVersion, "node": d.state.Node}, nil
 	case "node":
 		return d.state.Node, nil
+	case "ssh_agent":
+		return d.sshAgent, nil
 	case "create_workspace":
 		var req createWorkspaceRequest
 		if err := decodePayload(raw, &req); err != nil {
@@ -576,7 +580,8 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
-		return d.remotes.Call(ctx, req.Host, req.Op, json.RawMessage(req.Payload))
+		result, err := d.remotes.Call(ctx, req.Host, req.Op, json.RawMessage(req.Payload))
+		return result, withSSHAgentMismatchHint(err, d.sshAgent, req.CallerSSHAuthSock)
 	default:
 		return nil, fmt.Errorf("unknown operation %q", op)
 	}

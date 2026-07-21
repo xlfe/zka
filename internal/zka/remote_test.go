@@ -226,10 +226,12 @@ func TestUnreachableSSHControlReturnsWithoutMutatingWorkspace(t *testing.T) {
 
 func TestInitialSSHExit255ReturnsDiagnostic(t *testing.T) {
 	t.Setenv("GO_WANT_ZKA_SSH_HELPER", "exit255")
+	t.Setenv("SSH_AUTH_SOCK", "/run/user/1234/agent-a.socket")
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("SSH_AUTH_SOCK", "/run/user/1234/agent-b.socket")
 	d.config.SSH.Command = os.Args[0]
 	d.config.SSH.Options = []string{"-test.run=TestZKASSHHelperProcess", "--"}
 	var logs boundedTailBuffer
@@ -241,7 +243,7 @@ func TestInitialSSHExit255ReturnsDiagnostic(t *testing.T) {
 	defer cancel()
 	started := time.Now()
 	err = api.RemoteCall(ctx, "devbox.example", "list", nil, new([]*Workspace))
-	if err == nil || !strings.Contains(err.Error(), "status 255") || !strings.Contains(err.Error(), "Permission denied (publickey)") {
+	if err == nil || !strings.Contains(err.Error(), "status 255") || !strings.Contains(err.Error(), "Permission denied (publickey)") || !strings.Contains(err.Error(), "SSH agent mismatch") {
 		t.Fatalf("error = %v", err)
 	}
 	if time.Since(started) >= time.Second {
