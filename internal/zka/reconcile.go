@@ -66,16 +66,32 @@ func (d *Daemon) topologyLoop(ctx context.Context) {
 				}
 				continue
 			}
+			if event.Kind == "load" {
+				// Detach closes every pane, and a later attach reuses the same
+				// endpoint. A load starts a new Kitty view, so close hints from
+				// the previous view must not carry into this one.
+				delete(closing, event.Endpoint)
+			}
 			if event.Kind == "close" && event.PaneID != "" {
-				if closing[event.Endpoint] == nil {
-					closing[event.Endpoint] = map[string]bool{}
+				workspace, attachment := d.endpointAttachment(event.Endpoint)
+				owned := false
+				if attachment != nil {
+					_, owned = attachment.Views[event.PaneID]
 				}
-				closing[event.Endpoint][event.PaneID] = true
-				if d.closeEventsCoverWorkspace(event.Endpoint, closing[event.Endpoint]) {
-					delete(pending, event.Endpoint)
+				if workspace == nil || attachment == nil || attachment.Status != AttachmentReady || attachment.Revoked ||
+					(event.Workspace != "" && event.Workspace != workspace.ID) || !owned {
 					delete(closing, event.Endpoint)
-					d.scheduleEndpointDeletion(event.Endpoint)
-					continue
+				} else {
+					if closing[event.Endpoint] == nil {
+						closing[event.Endpoint] = map[string]bool{}
+					}
+					closing[event.Endpoint][event.PaneID] = true
+					if d.closeEventsCoverWorkspace(event.Endpoint, closing[event.Endpoint]) {
+						delete(pending, event.Endpoint)
+						delete(closing, event.Endpoint)
+						d.scheduleEndpointDeletion(event.Endpoint)
+						continue
+					}
 				}
 			}
 			now := time.Now()

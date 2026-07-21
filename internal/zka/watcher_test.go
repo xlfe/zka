@@ -125,3 +125,88 @@ func TestWatcherCloseRemovesPaneAndKillsItsZMXSession(t *testing.T) {
 		t.Fatalf("sessions after close: closed=%v remaining=%v", closedAlive, remainingAlive)
 	}
 }
+
+func TestWatcherDetachCloseEventsDoNotDeleteReattachedWorkspace(t *testing.T) {
+	var mu sync.Mutex
+	var workspaceID, closedPaneID, remainingPaneID string
+	firstPaneClosed := false
+	runner := &fakeRunner{handler: func(_ context.Context, name string, args ...string) (string, string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		joined := strings.Join(args, " ")
+		if name != "kitten" {
+			return "", "", nil
+		}
+		if joined == "--version" {
+			return "kitten 0.47.4\n", "", nil
+		}
+		paneIDs := []string{closedPaneID, remainingPaneID}
+		if firstPaneClosed {
+			paneIDs = paneIDs[1:]
+		}
+		if strings.Contains(joined, "--output-format=session") {
+			var session strings.Builder
+			for _, paneID := range paneIDs {
+				fmt.Fprintf(&session, "launch --var zka_workspace=%s --var zka_pane=%s fish\n", workspaceID, paneID)
+			}
+			return session.String(), "", nil
+		}
+		if strings.Contains(joined, " ls") {
+			var windows strings.Builder
+			for index, paneID := range paneIDs {
+				if index > 0 {
+					windows.WriteByte(',')
+				}
+				fmt.Fprintf(&windows, `{"id":%d,"title":"shell","cwd":"/work","user_vars":{"zka_workspace":"%s","zka_pane":"%s","zka_ready":"1"}}`, index+3, workspaceID, paneID)
+			}
+			return fmt.Sprintf(`[{"id":1,"tabs":[{"id":2,"layout":"splits","windows":[%s]}]}]`, windows.String()), "", nil
+		}
+		return "", "", nil
+	}}
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 2)
+	panes := workspace.SortedPanes()
+	workspaceID, closedPaneID, remainingPaneID = workspace.ID, panes[0].ID, panes[1].ID
+	workspace, attachment := readyWorkspaceAttachment(t, d, workspace, "local")
+	serveTestDaemon(t, d)
+
+	if _, err := d.detachAttachment(workspace.ID, attachment.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, paneID := range []string{closedPaneID, remainingPaneID} {
+		d.events <- WatcherEvent{Version: 1, Endpoint: attachment.Endpoint, Workspace: workspace.ID, Kind: "close", PaneID: paneID}
+	}
+	time.Sleep(250 * time.Millisecond)
+
+	workspace, err = d.getWorkspace(workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := d.registerAttachment(workspace.ID, Attachment{
+		ID: attachment.ID, Node: d.state.Node, Transport: Transport{Kind: "local"}, Endpoint: attachment.Endpoint,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err = d.updateManifest(manifestUpdateRequest{
+		Workspace: workspace.ID, Attachment: reopened.ID, ExpectedRevision: workspace.Revision,
+		Manifest: manifestForPanes(workspace, closedPaneID, remainingPaneID), Views: viewsForPanes(closedPaneID, remainingPaneID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.events <- WatcherEvent{Version: 1, Endpoint: attachment.Endpoint, Workspace: workspace.ID, Kind: "load", PaneID: closedPaneID}
+	time.Sleep(250 * time.Millisecond)
+
+	mu.Lock()
+	firstPaneClosed = true
+	mu.Unlock()
+	d.events <- WatcherEvent{Version: 1, Endpoint: attachment.Endpoint, Workspace: workspace.ID, Kind: "close", PaneID: closedPaneID}
+	waitFor(t, func() bool {
+		got, getErr := d.getWorkspace(workspace.ID)
+		return getErr == nil && got.Panes[closedPaneID] == nil && got.Panes[remainingPaneID] != nil
+	})
+}
