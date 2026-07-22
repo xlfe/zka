@@ -92,6 +92,7 @@
             grep -q 'kitty-watcher.py' "$runtimeConfig"
             grep -q '"desktop_enabled": *true' "$runtimeConfig"
             grep -q '"ntfy_enabled": *true' "$runtimeConfig"
+            grep -q '"ntfy_include_evidence": *false' "$runtimeConfig"
             grep -q '"blocked"' "$runtimeConfig"
             grep -q 'hook codex' "$requirements"
             grep -q 'managed_dir' "$requirements"

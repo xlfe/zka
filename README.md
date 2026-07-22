@@ -432,6 +432,7 @@ services.zka = {
   notifications = {
     desktopEnabled = true;
     ntfyEnabled = true;
+    ntfyIncludeEvidence = false;
     ntfyCommand = "ntfy-send";
   };
 
@@ -447,6 +448,10 @@ hooks.
 
 `ntfy-send` authentication remains in the helper's own configuration. zka never
 reads or transports its token.
+
+ntfy payloads omit raw agent evidence by default and include only a state summary
+plus workspace metadata. Set `notifications.ntfyIncludeEvidence = true` to include
+assistant output or tool descriptions; those details may contain sensitive data.
 
 ## Advanced SSH setup
 

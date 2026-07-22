@@ -9,6 +9,10 @@ import (
 )
 
 func setPaneForNotification(t *testing.T, d *Daemon, workspace *Workspace, state AgentState, turn string) (*Workspace, *Pane) {
+	return setPaneForNotificationWithDetail(t, d, workspace, state, turn, "")
+}
+
+func setPaneForNotificationWithDetail(t *testing.T, d *Daemon, workspace *Workspace, state AgentState, turn, detail string) (*Workspace, *Pane) {
 	t.Helper()
 	d.mu.Lock()
 	actual := d.state.Workspaces[workspace.ID]
@@ -19,7 +23,7 @@ func setPaneForNotification(t *testing.T, d *Daemon, workspace *Workspace, state
 	}
 	pane.State = state
 	pane.LastTurnID = turn
-	pane.Evidence = Evidence{Source: "test", Event: "transition", Timestamp: time.Now().UTC()}
+	pane.Evidence = Evidence{Source: "test", Event: "transition", Detail: detail, Timestamp: time.Now().UTC()}
 	actual.RecomputeAttention()
 	if err := d.store.Save(d.state); err != nil {
 		d.mu.Unlock()
@@ -28,6 +32,37 @@ func setPaneForNotification(t *testing.T, d *Daemon, workspace *Workspace, state
 	copy := actual.Clone()
 	d.mu.Unlock()
 	return copy, copy.Panes[pane.ID]
+}
+
+func TestNtfyEvidenceIsOptIn(t *testing.T) {
+	const rawEvidence = "approve production deploy with token secret-value"
+	for _, test := range []struct {
+		name            string
+		includeEvidence bool
+	}{
+		{name: "redacted by default", includeEvidence: false},
+		{name: "included when configured", includeEvidence: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := quietRunner()
+			d, err := newTestDaemon(t, t.TempDir(), runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.config.Notifications.NtfyIncludeEvidence = test.includeEvidence
+			workspace := createTestWorkspace(t, d, 1)
+			workspace, pane := setPaneForNotificationWithDetail(t, d, workspace, StateError, "turn-evidence", rawEvidence)
+			d.afterTransition(context.Background(), StateWorking, workspace, pane.ID)
+			call := firstCommand(runner.Calls(), "ntfy-send")
+			body := call.Args[len(call.Args)-1]
+			if strings.Contains(body, rawEvidence) != test.includeEvidence {
+				t.Fatalf("ntfy body evidence mismatch: %q", body)
+			}
+			if !test.includeEvidence && !strings.Contains(body, "State: error") {
+				t.Fatalf("redacted ntfy body lacks safe state summary: %q", body)
+			}
+		})
+	}
 }
 
 func TestImportantDetachedStatesUseNtfy(t *testing.T) {

@@ -34,9 +34,10 @@ type Config struct {
 		ForwardAgent  bool     `json:"forward_agent"`
 	} `json:"ssh"`
 	Notifications struct {
-		DesktopEnabled bool   `json:"desktop_enabled"`
-		NtfyEnabled    bool   `json:"ntfy_enabled"`
-		NtfyCommand    string `json:"ntfy_command"`
+		DesktopEnabled      bool   `json:"desktop_enabled"`
+		NtfyEnabled         bool   `json:"ntfy_enabled"`
+		NtfyIncludeEvidence bool   `json:"ntfy_include_evidence"`
+		NtfyCommand         string `json:"ntfy_command"`
 	} `json:"notifications"`
 }
 
@@ -56,6 +57,7 @@ func defaultConfig() Config {
 	cfg.Attention.States = []AgentState{StateBlocked, StateError, StateDone}
 	cfg.Notifications.DesktopEnabled = true
 	cfg.Notifications.NtfyEnabled = true
+	cfg.Notifications.NtfyIncludeEvidence = false
 	cfg.Notifications.NtfyCommand = "ntfy-send"
 	return cfg
 }

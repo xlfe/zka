@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+const (
+	remoteWorkspaceIDForTest       = "0123456789abcdef0123456789abcdef"
+	secondRemoteWorkspaceIDForTest = "fedcba9876543210fedcba9876543210"
+)
+
 func TestRemoteControlHelloAndWorkspaceSnapshot(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {
@@ -181,17 +186,22 @@ func TestRemoteCachePreservesLocalRuntimeMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	remote := &Workspace{
-		ID: "remote", Name: "example-project", Origin: Host{ID: "devbox.example", Name: "devbox.example"}, Revision: 4,
+		ID: remoteWorkspaceIDForTest, Name: "example-project", Origin: Host{ID: "devbox.example", Name: "devbox.example"}, Revision: 4,
 		Panes:       map[string]*Pane{"pane": {ID: "pane", Visible: true}},
 		Attachments: map[string]*Attachment{},
 	}
-	d.cacheRemoteWorkspace("devbox.example", remote)
+	if _, err := d.cacheRemoteWorkspace("devbox.example", remote); err != nil {
+		t.Fatal(err)
+	}
 	d.mu.Lock()
 	d.state.Workspaces[remote.ID].Attachments["local"] = &Attachment{ID: "local", Endpoint: "unix:/kitty", Node: d.state.Node, Views: readyView("pane", 9), Status: AttachmentReady}
 	d.mu.Unlock()
 	remote.Revision = 5
 	remote.Attachments["local"] = &Attachment{ID: "local", Endpoint: "ssh:laptop.example", Role: AttachmentPrimary, AppliedRevision: 5}
-	cached := d.cacheRemoteWorkspace("devbox.example", remote)
+	cached, err := d.cacheRemoteWorkspace("devbox.example", remote)
+	if err != nil {
+		t.Fatal(err)
+	}
 	local := cached.Attachments["local"]
 	if local.Endpoint != "unix:/kitty" || local.Views["pane"].WindowID != 9 || local.Role != AttachmentPrimary || local.AppliedRevision != 5 {
 		t.Fatalf("local attachment = %#v", local)
@@ -205,16 +215,20 @@ func TestRemoteSnapshotEvictsMissingWorkspaceAndClosesLocalView(t *testing.T) {
 		t.Fatal(err)
 	}
 	remote := &Workspace{
-		ID: "remote", Name: "example-project", Origin: Host{ID: "devbox.example", Name: "devbox.example"}, Revision: 4,
+		ID: remoteWorkspaceIDForTest, Name: "example-project", Origin: Host{ID: "devbox.example", Name: "devbox.example"}, Revision: 4,
 		Panes: map[string]*Pane{"pane": {ID: "pane", Visible: true}}, Attachments: map[string]*Attachment{},
 	}
-	d.cacheRemoteWorkspace("devbox.example", remote)
+	if _, err := d.cacheRemoteWorkspace("devbox.example", remote); err != nil {
+		t.Fatal(err)
+	}
 	d.mu.Lock()
 	d.state.Workspaces[remote.ID].Attachments["local"] = &Attachment{
 		ID: "local", Endpoint: "unix:/kitty", Node: d.state.Node, Status: AttachmentReady,
 	}
 	d.mu.Unlock()
-	d.cacheRemoteSnapshot("devbox.example", nil)
+	if err := d.cacheRemoteSnapshot("devbox.example", nil); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := d.getWorkspace(remote.ID); err == nil {
 		t.Fatal("workspace missing from a full snapshot remained cached")
 	}
@@ -232,6 +246,111 @@ func TestRemoteSnapshotEvictsMissingWorkspaceAndClosesLocalView(t *testing.T) {
 		}
 		return false
 	})
+}
+
+func TestRemoteCacheRejectsAuthoritativeLocalWorkspaceCollision(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := createTestWorkspace(t, d, 1)
+	spoof := local.Clone()
+	spoof.Name = "spoofed-remote-name"
+	if _, err := d.cacheRemoteWorkspace("devbox.example", spoof); err == nil || !strings.Contains(err.Error(), "authoritative local workspace") {
+		t.Fatalf("collision error = %v", err)
+	}
+	got, err := d.getWorkspace(local.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RemoteHost != "" || got.Name != local.Name {
+		t.Fatalf("local workspace was mutated: %#v", got)
+	}
+}
+
+func TestRemoteSnapshotRejectsCollisionBeforeCachingAnyEntry(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := createTestWorkspace(t, d, 1)
+	safeRemote := &Workspace{
+		ID: secondRemoteWorkspaceIDForTest, Name: "safe-remote",
+		Panes: map[string]*Pane{}, Attachments: map[string]*Attachment{},
+	}
+	spoof := local.Clone()
+	if err := d.cacheRemoteSnapshot("devbox.example", []*Workspace{safeRemote, spoof}); err == nil || !strings.Contains(err.Error(), "authoritative local workspace") {
+		t.Fatalf("snapshot collision error = %v", err)
+	}
+	if _, err := d.getWorkspace(safeRemote.ID); err == nil {
+		t.Fatal("snapshot cached an earlier entry before rejecting a collision")
+	}
+	got, err := d.getWorkspace(local.ID)
+	if err != nil || got.RemoteHost != "" {
+		t.Fatalf("local workspace after rejected snapshot = %#v, %v", got, err)
+	}
+}
+
+func TestRemoteDeletionCannotRemoveAuthoritativeLocalSessions(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := createTestWorkspace(t, d, 1)
+	sessionPath, err := d.store.WriteSession(local.ID, "local", "launch\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.evictRemoteWorkspace("devbox.example", local.ID)
+	if _, err := os.Stat(sessionPath); err != nil {
+		t.Fatalf("remote deletion removed an authoritative local session: %v", err)
+	}
+	got, err := d.getWorkspace(local.ID)
+	if err != nil || got.RemoteHost != "" {
+		t.Fatalf("local workspace after remote deletion = %#v, %v", got, err)
+	}
+}
+
+func TestRemoteCacheRejectsCrossHostWorkspaceCollision(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &Workspace{
+		ID: remoteWorkspaceIDForTest, Name: "example-project", Revision: 1,
+		Panes: map[string]*Pane{}, Attachments: map[string]*Attachment{},
+	}
+	if _, err := d.cacheRemoteWorkspace("first.example", remote); err != nil {
+		t.Fatal(err)
+	}
+	spoof := remote.Clone()
+	spoof.Name = "second-host-name"
+	if _, err := d.cacheRemoteWorkspace("second.example", spoof); err == nil || !strings.Contains(err.Error(), "cached from first.example") {
+		t.Fatalf("collision error = %v", err)
+	}
+	got, err := d.getWorkspace(remote.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RemoteHost != "first.example" || got.Name != remote.Name {
+		t.Fatalf("first remote workspace was mutated: %#v", got)
+	}
+}
+
+func TestRemoteCacheRejectsMalformedWorkspaceID(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &Workspace{ID: "../../local-*", Panes: map[string]*Pane{}, Attachments: map[string]*Attachment{}}
+	if _, err := d.cacheRemoteWorkspace("devbox.example", remote); err == nil || !strings.Contains(err.Error(), "lowercase hexadecimal") {
+		t.Fatalf("validation error = %v", err)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.state.Workspaces) != 0 || len(d.state.Remotes) != 0 {
+		t.Fatalf("malformed remote workspace mutated state: %#v", d.state)
+	}
 }
 
 func TestUnreachableSSHControlReturnsWithoutMutatingWorkspace(t *testing.T) {

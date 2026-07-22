@@ -20,10 +20,13 @@ func notificationTitle(workspace *Workspace, pane *Pane) string {
 	}
 }
 
-func notificationBody(workspace *Workspace, pane *Pane) string {
-	detail := pane.Evidence.Detail
-	if detail == "" {
-		detail = pane.Evidence.Event
+func notificationBody(workspace *Workspace, pane *Pane, includeEvidence bool) string {
+	detail := "State: " + string(pane.State)
+	if includeEvidence {
+		detail = pane.Evidence.Detail
+		if detail == "" {
+			detail = pane.Evidence.Event
+		}
 	}
 	reference := workspace.ID
 	if workspace.RemoteHost != "" {
@@ -286,7 +289,7 @@ func (d *Daemon) sendNtfy(ctx context.Context, workspace *Workspace, pane *Pane)
 	if pane.State == StateError {
 		priority, tag = "5", "rotating_light"
 	}
-	title, body := notificationTitle(workspace, pane), notificationBody(workspace, pane)
+	title, body := notificationTitle(workspace, pane), notificationBody(workspace, pane, d.config.Notifications.NtfyIncludeEvidence)
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)

@@ -15,11 +15,11 @@ func TestAttentionConfigDefaultsAndExplicitNotificationDisable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(cfg.Attention.States, []AgentState{StateBlocked, StateError, StateDone}) || !cfg.Notifications.DesktopEnabled || !cfg.Notifications.NtfyEnabled {
+	if !reflect.DeepEqual(cfg.Attention.States, []AgentState{StateBlocked, StateError, StateDone}) || !cfg.Notifications.DesktopEnabled || !cfg.Notifications.NtfyEnabled || cfg.Notifications.NtfyIncludeEvidence {
 		t.Fatalf("defaults = %#v", cfg)
 	}
 	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"notifications":{"desktop_enabled":false,"ntfy_enabled":false}}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"notifications":{"desktop_enabled":false,"ntfy_enabled":false,"ntfy_include_evidence":true}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("ZKA_CONFIG", path)
@@ -27,7 +27,7 @@ func TestAttentionConfigDefaultsAndExplicitNotificationDisable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Notifications.DesktopEnabled || cfg.Notifications.NtfyEnabled {
+	if cfg.Notifications.DesktopEnabled || cfg.Notifications.NtfyEnabled || !cfg.Notifications.NtfyIncludeEvidence {
 		t.Fatalf("explicit channel disable was ignored: %#v", cfg.Notifications)
 	}
 }

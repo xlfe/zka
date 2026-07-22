@@ -71,6 +71,7 @@ let
     notifications = {
       desktop_enabled = cfg.notifications.desktopEnabled;
       ntfy_enabled = cfg.notifications.ntfyEnabled;
+      ntfy_include_evidence = cfg.notifications.ntfyIncludeEvidence;
       ntfy_command = cfg.notifications.ntfyCommand;
     };
   };
@@ -185,6 +186,12 @@ in
       type = lib.types.bool;
       default = true;
       description = "Whether newly actionable local panes are sent through ntfy.";
+    };
+
+    notifications.ntfyIncludeEvidence = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Whether ntfy payloads include raw agent evidence such as assistant output and tool descriptions.";
     };
 
     notifications.ntfyCommand = lib.mkOption {

@@ -170,7 +170,7 @@ func (k KittyClient) Notify(ctx context.Context, view RuntimeView, endpoint stri
 		"--app-name", "zka", "--identifier", identifier,
 		"--urgency", urgency, "--icon", icon,
 		"--button", "Focus", "--wait-for-completion",
-		notificationTitle(workspace, pane), notificationBody(workspace, pane))
+		notificationTitle(workspace, pane), notificationBody(workspace, pane, true))
 }
 
 func (k KittyClient) CloseNotification(ctx context.Context, endpoint, workspaceID, paneID string) {
