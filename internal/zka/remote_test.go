@@ -136,7 +136,7 @@ func TestRemoteMessageLimit(t *testing.T) {
 }
 
 func TestSSHHostAliasIsSafeForKittyShellCommand(t *testing.T) {
-	for _, good := range []string{"devbox.example", "user@devbox.example", "network-host.example"} {
+	for _, good := range []string{"devbox.example", "user@devbox.example", "host-alias.example"} {
 		if err := validateSSHHost(good); err != nil {
 			t.Fatal(err)
 		}

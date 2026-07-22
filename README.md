@@ -19,13 +19,13 @@ The remote path is deliberately composed from existing tools:
 
 ```text
 local:  Kitty → zka → zmx
-remote: Kitty → zka → OpenSSH over private network → zmx on the origin
+remote: Kitty → zka → OpenSSH → zmx on the origin
 ```
 
-There is no `zmosh`, `zosh`, custom network protocol, PTY migration, or outer
-local `zmx` around an SSH connection. private network supplies reachability and stable
-host names, OpenSSH supplies authentication and transport, and `zmx` remains the
-only persistent PTY owner.
+There is no custom network protocol, PTY migration, or outer local `zmx` around
+an SSH connection. The configured network supplies reachability, OpenSSH
+supplies authentication and transport, and `zmx` remains the only persistent
+PTY owner.
 
 ## Status
 
@@ -200,9 +200,9 @@ stable pane IDs and canonical attach commands itself.
 
 ## Remote workflow
 
-Configure an ordinary OpenSSH host alias whose address resolves through your
-network. The same zka version and a running `zkad` must exist on the origin.
-Then, from the destination machine:
+Configure an ordinary OpenSSH host alias that resolves from the destination.
+The same zka version and a running `zkad` must exist on the origin. Then, from
+the destination machine:
 
 ```sh
 zka workspace list --origin devbox.example
@@ -251,12 +251,12 @@ SSH stderr, and returns both to the caller. It never restarts a missing
 foreground process; a missing backend becomes the same removable static
 placeholder used locally.
 
-### SSH agents and hardware-backed keys
+### SSH agents and interactive authentication
 
 Control SSH runs inside `zkad`, so without an explicit `IdentityAgent` it
 inherits the systemd user manager's environment rather than the environment of
-the shell that opened the launcher. Prefer a persistent NixOS selection for a
-GPG SSH agent; OpenSSH expands `%i` to the numeric user ID:
+the shell that opened the launcher. Prefer an explicitly selected persistent
+agent socket; OpenSSH expands `%i` to the numeric user ID:
 
 ```nix
 services.zka.ssh.identityAgent = "/run/user/%i/ssh-agent.socket";
@@ -279,16 +279,80 @@ systemctl --user restart zkad
 ```
 
 The default `BatchMode=yes` prevents SSH from opening password, host-key, or
-private-key passphrase prompts. Hardware-backed agent keys can still work when
-the agent can complete signing from zkad's environment, including hardware token touch
-or a separately configured graphical pinentry. zka has no controlling terminal
-and does not relay PIN or touch prompts through the launcher. Unlock the key or
-configure graphical pinentry first; an unavailable identity or refused signing
-request is then reported from SSH stderr instead of appearing as a local socket
+private-key passphrase prompts. Agent-backed keys still work when the agent can
+complete signing from `zkad`'s environment. Any interactive confirmation must
+be available independently because zka has no controlling terminal and does not
+relay prompts through the launcher. An unavailable identity or refused signing
+request is reported from SSH stderr instead of appearing as a local socket
 timeout. `zka doctor --origin HOST` reports the effective zkad and caller agent
 sockets, verifies that each socket exists, lists their SHA256 public-key
 fingerprints, and fails `ssh-agent-match` when their identities differ. Use
 `journalctl --user-unit zkad` for the same bounded SSH diagnostic.
+
+### Reuse SSH authentication
+
+The control connection and every remote pane are separate SSH sessions. Without
+connection sharing, each new pane performs its own SSH authentication even while
+the daemon already has an authenticated control connection to the same origin.
+OpenSSH multiplexing keeps those sessions as independent channels while carrying
+them over one authenticated network connection:
+
+```nix
+services.zka.ssh.extraOptions = [
+  "-o" "ControlMaster=auto"
+  "-o" "ControlPersist=10m"
+  "-o" "ControlPath=/run/user/%i/zka-ssh-%C"
+];
+```
+
+Append these entries if `ssh.extraOptions` already contains options such as
+`IdentitiesOnly=yes`. The first zka SSH session to an origin becomes the master;
+later control or pane sessions reuse it without another key or hardware-token
+operation. `ControlPersist=10m` retains an idle master for ten minutes, while
+`%C` gives each destination a short unique socket name. `/run/user/%i` is the
+local user's private runtime directory and is shared by `zkad` and the pane
+processes.
+
+All multiplexed channels share one TCP connection, so a failure interrupts them
+together. zka's existing control and pane reconnect paths then attach them to
+the same persistent zmx sessions.
+
+### Neovim clipboard over remote attachments
+
+`clipboard=unnamedplus` selects Neovim's `+` register, but it does not transport
+clipboard data between machines. In a remote zka pane, a `wl-copy` provider runs
+on the origin and therefore writes to the origin's Wayland clipboard, if one is
+available. Kitty selection copying works because the local Kitty process handles
+it without involving the remote Neovim process.
+
+For Neovim 0.10 or newer, force the built-in OSC 52 provider for zka-managed
+sessions. Set it before anything initializes the clipboard provider:
+
+```lua
+if vim.env.ZKA_WORKSPACE_ID then
+  vim.g.clipboard = "osc52"
+end
+
+vim.opt.clipboard = "unnamedplus"
+```
+
+OSC 52 sends clipboard data through the terminal stream for the displaying Kitty
+instance to place on its local system clipboard. Testing `SSH_CONNECTION` is not
+equivalent: a Neovim process may start in a local attachment and later be viewed
+remotely because zmx preserves it. Restart the Neovim process, rather than merely
+reattaching its zmx session, after changing the provider.
+
+To test the terminal path independently of Neovim, run this inside a remote zka
+pane; the local clipboard should become `zka-osc52-test`:
+
+```sh
+printf '\033]52;c;emthLW9zYzUyLXRlc3Q=\a'
+```
+
+Kitty permits clipboard writes by default. Reading the local clipboard through
+OSC 52 may raise Kitty's configured permission prompt; using Kitty's normal paste
+binding sends the clipboard as terminal input and avoids granting remote programs
+unconditional clipboard-read access.
 
 ## Attention and notifications
 
@@ -370,7 +434,7 @@ item, Enter or a row click restores and focuses its exact local or remote pane,
 is the same stable `zka-launch` ID as the workspace launcher; its window title
 is `zka attention` if a compositor rule needs to distinguish the two modes.
 
-## Suggested example-project integration
+## Suggested desktop integration
 
 After enabling the module, make the normal Sway terminal binding create a
 workspace through the external launcher:
@@ -393,9 +457,8 @@ through Kitty's last OSC-7-reported directory before its forced shell routes the
 new pane through zka. Point a quad-terminal binding at a topology template
 instead of launching four independent terminals.
 
-Leave utility terminals such as `audio-mixer`, `work-log`, and `system-monitor` on plain Kitty
-unless their processes should also persist. zka does not try to adopt an
-already-running PTY after the fact.
+Leave short-lived utility terminals on plain Kitty unless their processes should
+also persist. zka does not try to adopt an already-running PTY after the fact.
 
 ## Boundaries
 

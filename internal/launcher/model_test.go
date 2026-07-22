@@ -23,7 +23,7 @@ func TestSplitWorkspacesSeparatesLocalFromRemoteCache(t *testing.T) {
 	if got := []string{local[0].ID, local[1].ID}; !reflect.DeepEqual(got, []string{"local-a", "local-z"}) {
 		t.Fatalf("local workspaces = %#v", got)
 	}
-	if !reflect.DeepEqual(hosts, []string{"laptop.example", "devbox.example"}) {
+	if !reflect.DeepEqual(hosts, []string{"devbox.example", "laptop.example"}) {
 		t.Fatalf("remote hosts = %#v", hosts)
 	}
 }
@@ -49,7 +49,7 @@ func TestSplitWorkspacesIncludesWorkspacesPreviouslyConnectedToThisNode(t *testi
 	if got := []string{visible[0].ID, visible[1].ID}; !reflect.DeepEqual(got, []string{"remote-attached", "remote-detached"}) {
 		t.Fatalf("visible workspaces = %#v", got)
 	}
-	if !reflect.DeepEqual(hosts, []string{"other", "laptop.example", "devbox.example"}) {
+	if !reflect.DeepEqual(hosts, []string{"devbox.example", "laptop.example", "other"}) {
 		t.Fatalf("remote hosts = %#v", hosts)
 	}
 }

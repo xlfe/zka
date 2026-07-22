@@ -64,7 +64,7 @@ func TestSSHAgentInfoExpandsUIDAndHintsOnlyForAuthentication(t *testing.T) {
 	var cfg Config
 	cfg.SSH.IdentityAgent = "/run/user/%i/ssh-agent.socket"
 	agent := newSSHAgentInfo(cfg, "/run/user/1234/agent-a.socket")
-	if strings.Contains(agent.EffectiveSocket, "%i") || !strings.HasSuffix(agent.EffectiveSocket, "/agent/S.ssh-agent.ssh") {
+	if strings.Contains(agent.EffectiveSocket, "%i") || !strings.HasSuffix(agent.EffectiveSocket, "/ssh-agent.socket") {
 		t.Fatalf("agent info = %#v", agent)
 	}
 	authErr := errors.New("Permission denied (publickey)")
