@@ -66,6 +66,7 @@ let
       command = "${cfg.ssh.package}/bin/ssh";
       options = cfg.ssh.options ++ cfg.ssh.extraOptions;
       identity_agent = cfg.ssh.identityAgent;
+      forward_agent = cfg.ssh.forwardAgent;
     };
     notifications = {
       desktop_enabled = cfg.notifications.desktopEnabled;
@@ -134,6 +135,12 @@ in
         default = null;
         example = "/run/user/%i/ssh-agent.socket";
         description = "Persistent OpenSSH IdentityAgent used by zkad and remote pane attachments; supports OpenSSH tokens such as %i.";
+      };
+
+      forwardAgent = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Enable OpenSSH agent forwarding and stable per-workspace agent relay sockets for remote zka attachments.";
       };
 
       options = lib.mkOption {

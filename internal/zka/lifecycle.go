@@ -275,6 +275,7 @@ func (d *Daemon) cleanupWorkspaceOnce(ctx context.Context, workspaceID string) b
 	workspace := d.state.Workspaces[workspaceID]
 	if workspace == nil {
 		d.mu.Unlock()
+		d.agentRelays.remove(workspaceID)
 		return true
 	}
 	deleting := workspace.DeletionPending
@@ -362,6 +363,7 @@ func (d *Daemon) cleanupWorkspaceOnce(ctx context.Context, workspaceID string) b
 			}
 		}
 		d.mu.Unlock()
+		d.agentRelays.remove(workspaceID)
 		return true
 	}
 	if deleting {
@@ -377,6 +379,7 @@ func (d *Daemon) cleanupWorkspaceOnce(ctx context.Context, workspaceID string) b
 	}
 	before := current.Clone()
 	errorText := strings.Join(problems, "; ")
+	var removedPaneIDs []string
 	for _, pane := range targets {
 		currentPane := current.Panes[pane.ID]
 		if currentPane == nil || !currentPane.RemovalPending {
@@ -387,6 +390,7 @@ func (d *Daemon) cleanupWorkspaceOnce(ctx context.Context, workspaceID string) b
 			continue
 		}
 		delete(current.Panes, pane.ID)
+		removedPaneIDs = append(removedPaneIDs, pane.ID)
 		for _, attachment := range current.Attachments {
 			delete(attachment.Views, pane.ID)
 			delete(attachment.ClientHeartbeats, pane.ID)
@@ -407,6 +411,9 @@ func (d *Daemon) cleanupWorkspaceOnce(ctx context.Context, workspaceID string) b
 		}
 	}
 	d.mu.Unlock()
+	for _, paneID := range removedPaneIDs {
+		d.agentRelays.clearPane(workspaceID, paneID)
+	}
 	return done
 }
 

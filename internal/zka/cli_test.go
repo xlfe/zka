@@ -11,6 +11,52 @@ import (
 	"testing"
 )
 
+func TestPaneCommandEnvironmentUsesStableAgentOnlyForNewBackends(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "/tmp/ephemeral-agent.sock")
+	t.Setenv("ZKA_AGENT_RELAY_VERSION", "")
+	paths := testPaths(t.TempDir())
+	var cfg Config
+	cfg.SSH.ForwardAgent = true
+	created := paneCommandEnvironment(cfg, paths, "workspace", "pane", true)
+	if got := testEnvironmentValue(created, "SSH_AUTH_SOCK"); got != agentRelaySocketPath(paths.AgentDir, "workspace") {
+		t.Fatalf("created SSH_AUTH_SOCK = %q", got)
+	}
+	if got := testEnvironmentValue(created, "ZKA_AGENT_RELAY_VERSION"); got != "1" {
+		t.Fatalf("relay version = %q", got)
+	}
+	attached := paneCommandEnvironment(cfg, paths, "workspace", "pane", false)
+	if got := testEnvironmentValue(attached, "SSH_AUTH_SOCK"); got != "/tmp/ephemeral-agent.sock" {
+		t.Fatalf("reattach SSH_AUTH_SOCK = %q", got)
+	}
+}
+
+func testEnvironmentValue(environment []string, name string) string {
+	prefix := name + "="
+	for _, entry := range environment {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
+}
+
+func TestWorkspaceAgentStatusCLIReportsDisabledByDefault(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	serveTestDaemon(t, d)
+	var output bytes.Buffer
+	code, err := runWorkspaceAgent([]string{"status", "--json", workspace.ID}, d.paths, &output, io.Discard)
+	if err != nil || code != 0 {
+		t.Fatalf("status code = %d, err = %v", code, err)
+	}
+	if !strings.Contains(output.String(), `"state": "disabled"`) || !strings.Contains(output.String(), `"owner": "origin"`) {
+		t.Fatalf("status = %s", output.String())
+	}
+}
+
 func TestInterspersedWorkspaceFlagsMatchDocumentedSyntax(t *testing.T) {
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)

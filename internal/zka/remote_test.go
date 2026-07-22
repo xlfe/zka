@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -62,6 +63,32 @@ func TestRemoteControlHelloAndWorkspaceSnapshot(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("remote control did not stop")
+	}
+}
+
+func TestRemoteAgentForwardingDiagnosticOmitsSocketPath(t *testing.T) {
+	root := t.TempDir()
+	socket := filepath.Join(root, "agent.sock")
+	listenTestAgent(t, socket, "agent")
+	config := filepath.Join(root, "config.json")
+	if err := os.WriteFile(config, []byte(`{"ssh":{"forward_agent":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", config)
+	t.Setenv("SSH_AUTH_SOCK", socket)
+	payload, err := dispatchRemoteControl(context.Background(), API{}, "agent_forwarding", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status remoteAgentForwardingStatus
+	if err := json.Unmarshal(payload, &status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.Enabled || !status.ForwardedSocket || status.RelayVersion != agentRelayVersion {
+		t.Fatalf("diagnostic = %#v", status)
+	}
+	if strings.Contains(string(payload), socket) {
+		t.Fatal("diagnostic exposed forwarded socket path")
 	}
 }
 

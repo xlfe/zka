@@ -31,6 +31,7 @@ type Config struct {
 		Command       string   `json:"command"`
 		Options       []string `json:"options"`
 		IdentityAgent string   `json:"identity_agent"`
+		ForwardAgent  bool     `json:"forward_agent"`
 	} `json:"ssh"`
 	Notifications struct {
 		DesktopEnabled bool   `json:"desktop_enabled"`
@@ -101,6 +102,9 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.SSH.IdentityAgent != "" {
 		cfg.SSH.Options = append([]string{"-o", "IdentityAgent=" + cfg.SSH.IdentityAgent}, cfg.SSH.Options...)
+	}
+	if cfg.SSH.ForwardAgent {
+		cfg.SSH.Options = append([]string{"-o", "ForwardAgent=yes"}, cfg.SSH.Options...)
 	}
 	return cfg, nil
 }

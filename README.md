@@ -262,6 +262,9 @@ agent socket; OpenSSH expands `%i` to the numeric user ID:
 services.zka.ssh.identityAgent = "/run/user/%i/ssh-agent.socket";
 ```
 
+This socket is also the default agent for shells inside zka workspaces when the
+stable forwarding relay described below is enabled.
+
 `services.zka.ssh.extraOptions` appends options without replacing the default
 server-alive and batch-mode settings. To inspect an unconfigured service's
 current environment, run:
@@ -316,6 +319,72 @@ processes.
 All multiplexed channels share one TCP connection, so a failure interrupts them
 together. zka's existing control and pane reconnect paths then attach them to
 the same persistent zmx sessions.
+
+### Forward an agent into persistent workspaces
+
+Enable the managed forwarding path on both the origin and every destination
+that will display its workspaces:
+
+```nix
+services.zka.ssh.forwardAgent = true;
+```
+
+This option enables `ForwardAgent=yes` for zka's control and pane SSH sessions
+and enables an origin-side relay at a stable per-workspace path under
+`$XDG_RUNTIME_DIR/zka/agents`. Setting `ForwardAgent=yes` only through
+`ssh.extraOptions` does not enable the relay.
+
+New zmx backends receive the stable relay as `SSH_AUTH_SOCK`. The temporary
+socket created by each SSH connection is reported to origin `zkad` by the
+existing pane heartbeat and is never written to state or printed. Consequently,
+the shell's environment does not change when a pane SSH channel, ControlMaster,
+or control connection is replaced.
+
+With no explicit claim, the relay uses the origin `zkad` agent selected by
+`services.zka.ssh.identityAgent`. To use the agent from a destination, run the
+claim from a terminal on that destination after attaching:
+
+```sh
+zka workspace attach devbox.example:example-project
+zka workspace agent claim devbox.example:example-project
+zka workspace agent status devbox.example:example-project
+```
+
+The claim is workspace-wide and names that destination's attachment. It does
+not follow focus or silently switch when another machine attaches. To return to
+the origin agent:
+
+```sh
+zka workspace agent release devbox.example:example-project
+```
+
+A claim persists across detach and daemon restart, but the forwarded agent is
+usable only while that attachment has a live pane SSH connection. After its
+heartbeat is more than six seconds old, the relay closes active agent
+connections and fails closed: it does not fall back to the origin or another
+attached machine. Reattaching the same workspace refreshes the same attachment
+and restores the existing shells without changing their `SSH_AUTH_SOCK` or zmx
+process.
+
+Backends created before this feature do not have the stable socket in their
+environment. `workspace agent claim` rejects them and lists their pane IDs;
+recreate those panes or the workspace after enabling the option. Check both
+ends before troubleshooting a claim:
+
+```sh
+zka doctor --origin devbox.example
+```
+
+The doctor verifies the local and origin relay configuration and confirms that
+the current control SSH session received a dialable forwarded agent, without
+printing its temporary socket path.
+
+Agent forwarding gives processes with access to the remote account an
+opportunity to request signatures from the forwarded agent while the
+connection is live. Private key material is not copied, but a compromised
+origin can still use loaded identities. Prefer constrained or confirmation-
+requiring keys, claim only trusted workspaces, and release the claim when it is
+no longer needed.
 
 ### Neovim clipboard over remote attachments
 

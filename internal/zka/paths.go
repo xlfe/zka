@@ -12,6 +12,7 @@ type Paths struct {
 	StateFile     string
 	GeneratedDir  string
 	AttachmentDir string
+	AgentDir      string
 	Socket        string
 	WatcherSocket string
 }
@@ -52,6 +53,7 @@ func DefaultPaths() (Paths, error) {
 		StateFile:     filepath.Join(stateDir, "state.json"),
 		GeneratedDir:  filepath.Join(stateDir, "generated"),
 		AttachmentDir: filepath.Join(runtimeDir, "kitty"),
+		AgentDir:      filepath.Join(runtimeDir, "agents"),
 		Socket:        socket,
 		WatcherSocket: filepath.Join(runtimeDir, "watcher.sock"),
 	}, nil

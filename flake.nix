@@ -21,7 +21,7 @@
         rec {
           zka = pkgs.buildGoModule {
             pname = "zka";
-            version = "0.5.0";
+            version = "0.6.0";
             src = ./.;
             vendorHash = "sha256-IhE5JsdUYV1sRGOA2reDd7iLSJ7xF2IAqLpgD7JBXH0=";
             subPackages = [
@@ -68,6 +68,7 @@
                 system.stateVersion = "26.05";
                 services.zka.enable = true;
                 services.zka.ssh.identityAgent = "/run/user/%i/ssh-agent.socket";
+                services.zka.ssh.forwardAgent = true;
                 services.zka.ssh.extraOptions = [ "-o" "IdentitiesOnly=yes" ];
               }
             ];
@@ -87,6 +88,7 @@
             grep -q 'ServerAliveInterval=5' "$runtimeConfig"
             grep -q 'IdentitiesOnly=yes' "$runtimeConfig"
             grep -q '/run/user/%i/ssh-agent.socket' "$runtimeConfig"
+            grep -q '"forward_agent": *true' "$runtimeConfig"
             grep -q 'kitty-watcher.py' "$runtimeConfig"
             grep -q '"desktop_enabled": *true' "$runtimeConfig"
             grep -q '"ntfy_enabled": *true' "$runtimeConfig"

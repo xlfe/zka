@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -42,6 +43,12 @@ type paneReadinessResponse struct {
 	BackendReady bool `json:"backend_ready"`
 	BackendDead  bool `json:"backend_dead,omitempty"`
 	ClientReady  bool `json:"client_ready"`
+}
+
+type remoteAgentForwardingStatus struct {
+	Enabled         bool `json:"enabled"`
+	ForwardedSocket bool `json:"forwarded_socket"`
+	RelayVersion    int  `json:"relay_version"`
 }
 
 type RemoteManager struct {
@@ -567,7 +574,7 @@ func (w *remoteControlWriter) send(message remoteEnvelope) error {
 
 func runRemoteControl(ctx context.Context, paths Paths, stdin io.Reader, stdout io.Writer) error {
 	writer := &remoteControlWriter{enc: json.NewEncoder(stdout)}
-	if err := writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "hello", Capabilities: []string{"workspace-snapshots", "events", "two-phase-move", "revocation", "workspace-lifecycle"}}); err != nil {
+	if err := writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "hello", Capabilities: []string{"workspace-snapshots", "events", "two-phase-move", "revocation", "workspace-lifecycle", "ssh-agent-relay-v1"}}); err != nil {
 		return err
 	}
 	api := NewAPI(paths)
@@ -659,6 +666,21 @@ func streamRemoteEvents(ctx context.Context, api API, writer *remoteControlWrite
 func dispatchRemoteControl(ctx context.Context, api API, op string, raw json.RawMessage) (json.RawMessage, error) {
 	var value any
 	switch op {
+	case "agent_forwarding":
+		cfg, err := LoadConfig()
+		if err != nil {
+			return nil, err
+		}
+		forwarded := false
+		if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
+			if conn, dialErr := dialAgentSocket(socket); dialErr == nil {
+				forwarded = true
+				_ = conn.Close()
+			}
+		}
+		value = remoteAgentForwardingStatus{
+			Enabled: cfg.SSH.ForwardAgent, ForwardedSocket: forwarded, RelayVersion: agentRelayVersion,
+		}
 	case "list":
 		workspaces, err := authoritativeWorkspaces(ctx, api)
 		value = workspaces
@@ -801,6 +823,45 @@ func dispatchRemoteControl(ctx context.Context, api API, op string, raw json.Raw
 		}
 		workspace, err := api.DetachAttachment(ctx, req.Workspace, req.Attachment)
 		value = workspace
+		if err != nil {
+			return nil, err
+		}
+	case "workspace_agent_claim":
+		var req workspaceAgentRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		if err := requireAuthoritative(ctx, api, req.Workspace); err != nil {
+			return nil, err
+		}
+		status, err := api.ClaimWorkspaceAgent(ctx, req.Workspace, req.Attachment)
+		value = status
+		if err != nil {
+			return nil, err
+		}
+	case "workspace_agent_release":
+		var req workspaceAgentRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		if err := requireAuthoritative(ctx, api, req.Workspace); err != nil {
+			return nil, err
+		}
+		status, err := api.ReleaseWorkspaceAgent(ctx, req.Workspace)
+		value = status
+		if err != nil {
+			return nil, err
+		}
+	case "workspace_agent_status":
+		var req workspaceAgentRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		if err := requireAuthoritative(ctx, api, req.Workspace); err != nil {
+			return nil, err
+		}
+		status, err := api.WorkspaceAgentStatus(ctx, req.Workspace)
+		value = status
 		if err != nil {
 			return nil, err
 		}

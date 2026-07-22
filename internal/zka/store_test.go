@@ -70,7 +70,7 @@ func TestStoreResetsV2StateAndGeneratedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.SchemaVersion != 3 || len(state.Workspaces) != 0 {
+	if state.SchemaVersion != stateSchemaVersion || len(state.Workspaces) != 0 {
 		t.Fatalf("state = %#v", state)
 	}
 	if _, err := os.Stat(generated); !os.IsNotExist(err) {
@@ -88,6 +88,24 @@ func TestStoreRejectsFutureSchema(t *testing.T) {
 	}
 	if _, err := NewStore(paths).Load(); err == nil {
 		t.Fatal("future schema was accepted")
+	}
+}
+
+func TestStoreMigratesV3PanesAsLegacyAgentRelays(t *testing.T) {
+	paths := testPaths(t.TempDir())
+	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data := `{"schema_version":3,"workspaces":{"workspace":{"id":"workspace","panes":{"pane":{"id":"pane","backend_created":true}},"attachments":{}}}}`
+	if err := os.WriteFile(paths.StateFile, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := NewStore(paths).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.SchemaVersion != stateSchemaVersion || state.Workspaces["workspace"].Panes["pane"].AgentRelayVersion != 0 {
+		t.Fatalf("migrated state = %#v", state)
 	}
 }
 

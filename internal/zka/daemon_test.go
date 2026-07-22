@@ -4,9 +4,192 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestWorkspaceAgentClaimUsesStableRelayAndFailsClosedOnDetach(t *testing.T) {
+	root := t.TempDir()
+	originSocket := filepath.Join(root, "upstream", "origin.sock")
+	forwardedSocket := filepath.Join(root, "upstream", "forwarded.sock")
+	listenTestAgent(t, originSocket, "origin")
+	listenTestAgent(t, forwardedSocket, "remote")
+	configPath := filepath.Join(root, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"ssh":{"forward_agent":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", configPath)
+	t.Setenv("SSH_AUTH_SOCK", originSocket)
+	paths := testPaths(root)
+	agentDir, err := os.MkdirTemp("", "zka-agent-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths.AgentDir = agentDir
+	t.Cleanup(func() { _ = os.RemoveAll(paths.AgentDir) })
+	d, err := NewDaemon(paths, quietRunner(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	if _, err := d.applyEvent(context.Background(), Event{
+		WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "process_started", Source: "test", PID: 42,
+		AgentRelayVersion: agentRelayVersion,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	attachment, err := d.registerAttachment(workspace.ID, Attachment{
+		ID: "remote", Node: Host{ID: "destination", Name: "destination.example"},
+		Transport: Transport{Kind: "ssh", Host: "origin.example"}, Endpoint: "ssh:destination:remote",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.updateAttachment(attachmentUpdateRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID, Status: AttachmentReady,
+		Views: map[string]RuntimeView{pane.ID: {PaneID: pane.ID, WindowID: 1, Ready: true}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.setAttachmentPaneReady(attachmentPaneReadyRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID, Pane: pane.ID, Ready: true, AgentSocket: forwardedSocket,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.store.Save(d.state); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := os.ReadFile(paths.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(persisted), forwardedSocket) {
+		t.Fatal("ephemeral forwarded agent path was persisted")
+	}
+	status, err := d.claimWorkspaceAgent(workspaceAgentRequest{Workspace: workspace.ID, Attachment: attachment.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != "forwarded" || !status.Available || status.ClaimedAttachmentID != attachment.ID {
+		t.Fatalf("claimed status = %#v", status)
+	}
+	if got := relayRoundTrip(t, d.agentRelays.path(workspace.ID)); got != "remote" {
+		t.Fatalf("forwarded relay = %q", got)
+	}
+	if _, err := d.detachAttachment(workspace.ID, attachment.ID); err != nil {
+		t.Fatal(err)
+	}
+	status, err = d.workspaceAgentStatus(workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != "disconnected" || status.Available || status.ClaimedAttachmentID != attachment.ID {
+		t.Fatalf("detached status = %#v", status)
+	}
+	status, err = d.releaseWorkspaceAgent(workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != "origin" || !status.Available {
+		t.Fatalf("released status = %#v", status)
+	}
+}
+
+func TestWorkspaceAgentClaimRejectsLegacyPane(t *testing.T) {
+	root := t.TempDir()
+	forwardedSocket := filepath.Join(root, "forwarded.sock")
+	listenTestAgent(t, forwardedSocket, "remote")
+	configPath := filepath.Join(root, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"ssh":{"forward_agent":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", configPath)
+	paths := testPaths(root)
+	agentDir, err := os.MkdirTemp("", "zka-agent-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths.AgentDir = agentDir
+	t.Cleanup(func() { _ = os.RemoveAll(paths.AgentDir) })
+	d, err := NewDaemon(paths, quietRunner(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	if _, err := d.applyEvent(context.Background(), Event{WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "process_started", Source: "test", PID: 42}); err != nil {
+		t.Fatal(err)
+	}
+	attachment, err := d.registerAttachment(workspace.ID, Attachment{
+		ID: "remote", Node: Host{ID: "destination"}, Transport: Transport{Kind: "ssh"}, Endpoint: "ssh:destination:remote",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.updateAttachment(attachmentUpdateRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID, Status: AttachmentReady,
+		Views: map[string]RuntimeView{pane.ID: {PaneID: pane.ID, WindowID: 1, Ready: true}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.setAttachmentPaneReady(attachmentPaneReadyRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID, Pane: pane.ID, Ready: true, AgentSocket: forwardedSocket,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = d.claimWorkspaceAgent(workspaceAgentRequest{Workspace: workspace.ID, Attachment: attachment.ID})
+	if err == nil || !strings.Contains(err.Error(), pane.ID) || !strings.Contains(err.Error(), "legacy") {
+		t.Fatalf("legacy claim error = %v", err)
+	}
+}
+
+func TestWorkspaceAgentRelayRebindsAtSamePathAfterDaemonRestart(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"ssh":{"forward_agent":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", configPath)
+	paths := testPaths(root)
+	agentDir, err := os.MkdirTemp("", "zka-agent-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths.AgentDir = agentDir
+	t.Cleanup(func() { _ = os.RemoveAll(paths.AgentDir) })
+
+	first, err := NewDaemon(paths, quietRunner(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, first, 1)
+	relayPath := first.agentRelays.path(workspace.ID)
+	if _, err := os.Stat(relayPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(relayPath); !os.IsNotExist(err) {
+		t.Fatalf("relay survived daemon close: %v", err)
+	}
+
+	second, err := NewDaemon(paths, quietRunner(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	if err := second.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(relayPath); err != nil {
+		t.Fatalf("relay was not rebound at %s: %v", relayPath, err)
+	}
+}
 
 func firstPane(workspace *Workspace) *Pane { return workspace.SortedPanes()[0] }
 

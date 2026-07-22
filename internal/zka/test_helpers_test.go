@@ -60,6 +60,7 @@ func testPaths(root string) Paths {
 		StateFile:     filepath.Join(state, "state.json"),
 		GeneratedDir:  filepath.Join(state, "generated"),
 		AttachmentDir: filepath.Join(runtime, "kitty"),
+		AgentDir:      filepath.Join(runtime, "agents"),
 		Socket:        filepath.Join(runtime, "zka.sock"),
 		WatcherSocket: filepath.Join(runtime, "watcher.sock"),
 	}

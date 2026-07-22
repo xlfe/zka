@@ -60,6 +60,29 @@ func TestSSHIdentityAgentPrecedesOtherOptions(t *testing.T) {
 	}
 }
 
+func TestSSHForwardAgentIsOptInAndPrecedesOtherOptions(t *testing.T) {
+	t.Setenv("ZKA_CONFIG", "")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SSH.ForwardAgent || strings.Contains(strings.Join(cfg.SSH.Options, " "), "ForwardAgent") {
+		t.Fatalf("forwarding enabled by default: %#v", cfg.SSH)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"ssh":{"forward_agent":true,"options":["-o","ForwardAgent=no","-o","BatchMode=yes"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", path)
+	cfg, err = LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.SSH.ForwardAgent || !strings.HasPrefix(strings.Join(cfg.SSH.Options, " "), "-o ForwardAgent=yes ") {
+		t.Fatalf("forwarding options = %#v", cfg.SSH)
+	}
+}
+
 func TestSSHAgentInfoExpandsUIDAndHintsOnlyForAuthentication(t *testing.T) {
 	var cfg Config
 	cfg.SSH.IdentityAgent = "/run/user/%i/ssh-agent.socket"

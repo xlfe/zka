@@ -23,7 +23,10 @@ func NewStore(paths Paths) *Store { return &Store{paths: paths} }
 func (s *Store) SetOnSave(callback func()) { s.onSave = callback }
 
 func (s *Store) Ensure() error {
-	for _, dir := range []string{s.paths.StateDir, s.paths.GeneratedDir, s.paths.AttachmentDir} {
+	for _, dir := range []string{s.paths.StateDir, s.paths.GeneratedDir, s.paths.AttachmentDir, s.paths.AgentDir} {
+		if dir == "" {
+			continue
+		}
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("create directory %s: %w", dir, err)
 		}
@@ -37,7 +40,8 @@ func (s *Store) Ensure() error {
 // Load intentionally treats the pre-v3 schemas as empty state. v3 changes
 // process ownership: Kitty view closure now removes its zmx backend. Migrating
 // the old records would make that ownership ambiguous, so only zka's generated
-// files are reset. Existing zmx processes are deliberately left untouched.
+// files are reset. v3 itself migrates to v4 with panes marked as legacy relay
+// clients. Existing zmx processes are deliberately left untouched.
 func (s *Store) Load() (StateData, error) {
 	if err := s.Ensure(); err != nil {
 		return StateData{}, err
@@ -67,7 +71,7 @@ func (s *Store) Load() (StateData, error) {
 		}
 		return newStateData(), nil
 	}
-	if header.SchemaVersion != stateSchemaVersion {
+	if header.SchemaVersion != 3 && header.SchemaVersion != stateSchemaVersion {
 		return StateData{}, fmt.Errorf("unsupported state schema %d (want %d)", header.SchemaVersion, stateSchemaVersion)
 	}
 	var state StateData
@@ -83,6 +87,10 @@ func (s *Store) Load() (StateData, error) {
 	for _, workspace := range state.Workspaces {
 		normalizeWorkspace(workspace)
 	}
+	// v3 panes predate the stable agent relay. Leaving their zero relay
+	// version intact lets the CLI identify the exact backends that must be
+	// recreated before a forwarded agent can be claimed safely.
+	state.SchemaVersion = stateSchemaVersion
 	return state, nil
 }
 

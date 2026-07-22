@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	stateSchemaVersion = 3
-	protocolVersion    = 4
+	stateSchemaVersion = 4
+	protocolVersion    = 5
 	remoteProtocolName = "zka.workspace"
 	remoteProtocolMax  = 1 << 20
 )
@@ -96,28 +96,29 @@ type NotificationRecord struct {
 // Pane is the durable identity of one Kitty terminal pane and its hidden zmx
 // PTY. Foreground programs are never stored as restore commands.
 type Pane struct {
-	ID             string                        `json:"id"`
-	AllocationKey  string                        `json:"allocation_key,omitempty"`
-	Position       int                           `json:"position"`
-	Backend        BackendRef                    `json:"backend"`
-	CWD            string                        `json:"cwd,omitempty"`
-	Title          string                        `json:"title,omitempty"`
-	Visible        bool                          `json:"visible"`
-	Agent          string                        `json:"agent,omitempty"`
-	State          AgentState                    `json:"state"`
-	Evidence       Evidence                      `json:"evidence"`
-	LastTurnID     string                        `json:"last_turn_id,omitempty"`
-	Process        ProcessStatus                 `json:"process"`
-	Notifications  map[string]NotificationRecord `json:"notifications,omitempty"`
-	BackendCreated bool                          `json:"backend_created"`
-	BackendReady   bool                          `json:"backend_ready"`
-	BackendStart   bool                          `json:"backend_starting,omitempty"`
-	BackendDead    bool                          `json:"backend_dead,omitempty"`
-	BackendError   string                        `json:"backend_error,omitempty"`
-	RemovalPending bool                          `json:"removal_pending,omitempty"`
-	RemovalError   string                        `json:"removal_error,omitempty"`
-	CreatedAt      time.Time                     `json:"created_at"`
-	UpdatedAt      time.Time                     `json:"updated_at"`
+	ID                string                        `json:"id"`
+	AllocationKey     string                        `json:"allocation_key,omitempty"`
+	Position          int                           `json:"position"`
+	Backend           BackendRef                    `json:"backend"`
+	CWD               string                        `json:"cwd,omitempty"`
+	Title             string                        `json:"title,omitempty"`
+	Visible           bool                          `json:"visible"`
+	Agent             string                        `json:"agent,omitempty"`
+	State             AgentState                    `json:"state"`
+	Evidence          Evidence                      `json:"evidence"`
+	LastTurnID        string                        `json:"last_turn_id,omitempty"`
+	Process           ProcessStatus                 `json:"process"`
+	Notifications     map[string]NotificationRecord `json:"notifications,omitempty"`
+	BackendCreated    bool                          `json:"backend_created"`
+	AgentRelayVersion int                           `json:"agent_relay_version,omitempty"`
+	BackendReady      bool                          `json:"backend_ready"`
+	BackendStart      bool                          `json:"backend_starting,omitempty"`
+	BackendDead       bool                          `json:"backend_dead,omitempty"`
+	BackendError      string                        `json:"backend_error,omitempty"`
+	RemovalPending    bool                          `json:"removal_pending,omitempty"`
+	RemovalError      string                        `json:"removal_error,omitempty"`
+	CreatedAt         time.Time                     `json:"created_at"`
+	UpdatedAt         time.Time                     `json:"updated_at"`
 }
 
 func (p *Pane) Clone() *Pane {
@@ -207,6 +208,7 @@ type Workspace struct {
 	Manifest            Manifest               `json:"manifest"`
 	Attachments         map[string]*Attachment `json:"attachments"`
 	PrimaryAttachmentID string                 `json:"primary_attachment_id,omitempty"`
+	AgentAttachmentID   string                 `json:"agent_attachment_id,omitempty"`
 	PendingRevocations  []string               `json:"pending_revocations,omitempty"`
 	Attention           AgentState             `json:"attention"`
 	DeletionPending     bool                   `json:"deletion_pending,omitempty"`
@@ -286,15 +288,16 @@ func newStateData() StateData {
 }
 
 type Event struct {
-	WorkspaceID string         `json:"workspace_id"`
-	PaneID      string         `json:"pane_id"`
-	Kind        string         `json:"kind"`
-	Source      string         `json:"source"`
-	TurnID      string         `json:"turn_id,omitempty"`
-	Detail      string         `json:"detail,omitempty"`
-	PID         int            `json:"pid,omitempty"`
-	ExitCode    *int           `json:"exit_code,omitempty"`
-	Fields      map[string]any `json:"fields,omitempty"`
+	WorkspaceID       string         `json:"workspace_id"`
+	PaneID            string         `json:"pane_id"`
+	Kind              string         `json:"kind"`
+	Source            string         `json:"source"`
+	TurnID            string         `json:"turn_id,omitempty"`
+	Detail            string         `json:"detail,omitempty"`
+	PID               int            `json:"pid,omitempty"`
+	AgentRelayVersion int            `json:"agent_relay_version,omitempty"`
+	ExitCode          *int           `json:"exit_code,omitempty"`
+	Fields            map[string]any `json:"fields,omitempty"`
 }
 
 type WatcherEvent struct {

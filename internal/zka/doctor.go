@@ -67,6 +67,14 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 	}
 	checks = append(checks, doctorCheck{Name: "codex-hooks", OK: hooksOK, Detail: hooksDetail})
 	if *origin != "" {
+		forwardingConfigDetail := "disabled; enable services.zka.ssh.forwardAgent"
+		if cfg.SSH.ForwardAgent {
+			forwardingConfigDetail = "enabled"
+		}
+		checks = append(checks, doctorCheck{
+			Name: "ssh-agent-forwarding-config", OK: cfg.SSH.ForwardAgent,
+			Detail: forwardingConfigDetail,
+		})
 		daemonAgent, agentErr := api.SSHAgent(ctx)
 		if agentErr != nil {
 			checks = append(checks, doctorCheck{Name: "zkad-ssh-agent", OK: false, Detail: agentErr.Error() + " (restart zkad after upgrading)"})
@@ -80,6 +88,24 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		remoteErr := api.RemoteCall(ctx, *origin, "list", nil, &workspaces)
 		detail := fmt.Sprintf("%s (%d workspaces)", *origin, len(workspaces))
 		checks = append(checks, doctorCheck{Name: "remote-control", OK: remoteErr == nil, Detail: doctorDetail(remoteErr, detail)})
+		var forwarding remoteAgentForwardingStatus
+		forwardingErr := api.RemoteCall(ctx, *origin, "agent_forwarding", nil, &forwarding)
+		remoteConfigOK := forwardingErr == nil && forwarding.Enabled && forwarding.RelayVersion == agentRelayVersion
+		remoteConfigDetail := fmt.Sprintf("relay version %d", forwarding.RelayVersion)
+		if forwardingErr != nil {
+			remoteConfigDetail = forwardingErr.Error()
+		} else if !forwarding.Enabled {
+			remoteConfigDetail = "disabled on origin"
+		}
+		checks = append(checks, doctorCheck{Name: "remote-agent-relay", OK: remoteConfigOK, Detail: remoteConfigDetail})
+		forwardedOK := forwardingErr == nil && forwarding.ForwardedSocket
+		forwardedDetail := "forwarded agent socket is available"
+		if forwardingErr != nil {
+			forwardedDetail = forwardingErr.Error()
+		} else if !forwarding.ForwardedSocket {
+			forwardedDetail = "control SSH did not receive a dialable forwarded agent"
+		}
+		checks = append(checks, doctorCheck{Name: "remote-forwarded-agent", OK: forwardedOK, Detail: forwardedDetail})
 	}
 	return writeDoctorResult(checks, *jsonOut, stdout)
 }

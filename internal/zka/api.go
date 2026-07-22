@@ -125,6 +125,24 @@ func (a API) SetAttachmentPaneReady(ctx context.Context, req attachmentPaneReady
 	return &out, err
 }
 
+func (a API) ClaimWorkspaceAgent(ctx context.Context, workspace, attachment string) (workspaceAgentStatus, error) {
+	var out workspaceAgentStatus
+	err := a.client.Call(ctx, "workspace_agent_claim", workspaceAgentRequest{Workspace: workspace, Attachment: attachment}, &out)
+	return out, err
+}
+
+func (a API) ReleaseWorkspaceAgent(ctx context.Context, workspace string) (workspaceAgentStatus, error) {
+	var out workspaceAgentStatus
+	err := a.client.Call(ctx, "workspace_agent_release", workspaceAgentRequest{Workspace: workspace}, &out)
+	return out, err
+}
+
+func (a API) WorkspaceAgentStatus(ctx context.Context, workspace string) (workspaceAgentStatus, error) {
+	var out workspaceAgentStatus
+	err := a.client.Call(ctx, "workspace_agent_status", workspaceAgentRequest{Workspace: workspace}, &out)
+	return out, err
+}
+
 func (a API) UpdateManifest(ctx context.Context, req manifestUpdateRequest) (*Workspace, error) {
 	var out Workspace
 	err := a.client.Call(ctx, "update_manifest", req, &out)

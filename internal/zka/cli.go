@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const Version = "0.5.0"
+const Version = "0.6.0"
 
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
@@ -92,7 +92,7 @@ Commands:
   launch      Choose or create a workspace in the graphical launcher
   attention   Show, watch, focus, or defer panes that need you
   kitty       Create a managed Kitty workspace
-  workspace   List, inspect, attach, move, detach, rename, kill, focus, or acknowledge workspaces
+	workspace   Manage workspace views, lifecycle, focus, and SSH agent ownership
   doctor      Check local or remote integration
   daemon      Run zkad (normally via systemd --user)
 
@@ -310,6 +310,8 @@ func runWorkspace(args []string, paths Paths, stdout, stderr io.Writer) (int, er
 		return runWorkspaceFocus(args[1:], paths, stdout, stderr)
 	case "seen":
 		return runWorkspaceSeen(args[1:], paths, stdout, stderr)
+	case "agent":
+		return runWorkspaceAgent(args[1:], paths, stdout, stderr)
 	default:
 		printWorkspaceUsage(stderr)
 		return 2, fmt.Errorf("unknown workspace command %q", args[0])
@@ -327,7 +329,126 @@ func printWorkspaceUsage(w io.Writer) {
   rename [SSH_ALIAS:]REF NAME
   kill [SSH_ALIAS:]REF
   focus REF [--pane PANE]
-  seen REF [--pane PANE]`)
+  seen REF [--pane PANE]
+  agent claim [SSH_ALIAS:]REF
+  agent release [SSH_ALIAS:]REF
+  agent status [--json] [SSH_ALIAS:]REF`)
+}
+
+func runWorkspaceAgent(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	if len(args) == 0 {
+		return 2, fmt.Errorf("workspace agent requires claim, release, or status")
+	}
+	switch args[0] {
+	case "claim":
+		fs := newFlagSet("workspace agent claim", stderr)
+		if err := fs.Parse(args[1:]); err != nil {
+			return 2, err
+		}
+		if fs.NArg() != 1 {
+			return 2, fmt.Errorf("workspace agent claim requires one workspace reference")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		api := NewAPI(paths)
+		host, _ := splitWorkspaceRef(fs.Arg(0))
+		workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
+		if err != nil {
+			return 1, err
+		}
+		if host == "" {
+			host = workspace.RemoteHost
+		}
+		if host == "" {
+			return 1, fmt.Errorf("workspace %q is authoritative here and already uses the origin agent", workspace.Name)
+		}
+		localWorkspace, err := api.Workspace(ctx, workspace.ID)
+		if err != nil {
+			return 1, err
+		}
+		node, err := api.Node(ctx)
+		if err != nil {
+			return 1, err
+		}
+		attachment := preferredLocalAttachment(localWorkspace, node.ID)
+		if attachment == nil || attachment.Transport.Kind != "ssh" || !attachmentUsable(attachment) {
+			return 1, fmt.Errorf("no ready local SSH attachment for workspace %q; run workspace attach first", workspace.Name)
+		}
+		var status workspaceAgentStatus
+		err = api.RemoteCall(ctx, host, "workspace_agent_claim", workspaceAgentRequest{
+			Workspace: workspace.ID, Attachment: attachment.ID,
+		}, &status)
+		if err != nil {
+			return 1, err
+		}
+		writeWorkspaceAgentStatus(stdout, status)
+		return 0, nil
+	case "release", "status":
+		name := "workspace agent " + args[0]
+		fs := newFlagSet(name, stderr)
+		jsonOut := false
+		if args[0] == "status" {
+			fs.BoolVar(&jsonOut, "json", false, "emit JSON")
+		}
+		if err := parseInterspersed(fs, args[1:]); err != nil {
+			return 2, err
+		}
+		if fs.NArg() != 1 {
+			return 2, fmt.Errorf("%s requires one workspace reference", name)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		api := NewAPI(paths)
+		host, _ := splitWorkspaceRef(fs.Arg(0))
+		workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
+		if err != nil {
+			return 1, err
+		}
+		if host == "" {
+			host = workspace.RemoteHost
+		}
+		var status workspaceAgentStatus
+		op := "workspace_agent_status"
+		if args[0] == "release" {
+			op = "workspace_agent_release"
+		}
+		if host == "" {
+			if op == "workspace_agent_release" {
+				status, err = api.ReleaseWorkspaceAgent(ctx, workspace.ID)
+			} else {
+				status, err = api.WorkspaceAgentStatus(ctx, workspace.ID)
+			}
+		} else {
+			err = api.RemoteCall(ctx, host, op, workspaceAgentRequest{Workspace: workspace.ID}, &status)
+		}
+		if err != nil {
+			return 1, err
+		}
+		if jsonOut {
+			return 0, writeJSON(stdout, status)
+		}
+		writeWorkspaceAgentStatus(stdout, status)
+		return 0, nil
+	default:
+		return 2, fmt.Errorf("unknown workspace agent command %q", args[0])
+	}
+}
+
+func writeWorkspaceAgentStatus(w io.Writer, status workspaceAgentStatus) {
+	fmt.Fprintf(w, "agent=%s owner=%s available=%t", status.State, status.Owner, status.Available)
+	if status.ClaimedAttachmentID != "" {
+		fmt.Fprintf(w, " attachment=%s", status.ClaimedAttachmentID)
+	}
+	if status.ClaimedNodeID != "" {
+		fmt.Fprintf(w, " node=%s", status.ClaimedNodeID)
+	}
+	if status.RelaySocket != "" {
+		fmt.Fprintf(w, " relay=%s", status.RelaySocket)
+	}
+	if len(status.LegacyPaneIDs) != 0 {
+		fmt.Fprintf(w, " legacy_panes=%s", strings.Join(status.LegacyPaneIDs, ","))
+	}
+	fmt.Fprintln(w)
 }
 
 func runWorkspaceList(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
@@ -965,6 +1086,28 @@ func writeJSON(w io.Writer, value any) error {
 	return enc.Encode(value)
 }
 
+func paneCommandEnvironment(cfg Config, paths Paths, workspaceID, paneID string, creating bool) []string {
+	environment := append([]string(nil), os.Environ()...)
+	environment = replaceEnvironmentValue(environment, "ZKA_WORKSPACE_ID", workspaceID)
+	environment = replaceEnvironmentValue(environment, "ZKA_PANE_ID", paneID)
+	if creating && cfg.SSH.ForwardAgent {
+		environment = replaceEnvironmentValue(environment, "SSH_AUTH_SOCK", agentRelaySocketPath(paths.AgentDir, workspaceID))
+		environment = replaceEnvironmentValue(environment, "ZKA_AGENT_RELAY_VERSION", strconv.Itoa(agentRelayVersion))
+	}
+	return environment
+}
+
+func replaceEnvironmentValue(environment []string, name, value string) []string {
+	prefix := name + "="
+	result := environment[:0]
+	for _, entry := range environment {
+		if !strings.HasPrefix(entry, prefix) {
+			result = append(result, entry)
+		}
+	}
+	return append(result, prefix+value)
+}
+
 func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	fs := newFlagSet("pane", stderr)
 	workspaceRef := fs.String("workspace", "", "workspace id")
@@ -1024,7 +1167,7 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 	if prepared.Create && prepared.Pane.CWD != "" {
 		cmd.Dir = prepared.Pane.CWD
 	}
-	cmd.Env = append(os.Environ(), "ZKA_WORKSPACE_ID="+prepared.Workspace.ID, "ZKA_PANE_ID="+prepared.Pane.ID)
+	cmd.Env = paneCommandEnvironment(cfg, paths, prepared.Workspace.ID, prepared.Pane.ID, prepared.Create)
 	if err := cmd.Start(); err != nil {
 		return runLocalDeadPane(api, kitty, endpoint, windowID, prepared.Workspace, prepared.Pane, err, stdin, stdout)
 	}
@@ -1224,7 +1367,11 @@ func runPaneHost(args []string, paths Paths, stdin io.Reader, stdout, stderr io.
 		return 2, fmt.Errorf("pane-host requires --workspace, --pane, and a command after --")
 	}
 	api := NewAPI(paths)
-	workspace, err := api.Event(context.Background(), Event{WorkspaceID: *workspaceID, PaneID: *paneID, Kind: "process_started", Source: "pane-host", PID: os.Getpid()})
+	relayVersion, _ := strconv.Atoi(os.Getenv("ZKA_AGENT_RELAY_VERSION"))
+	workspace, err := api.Event(context.Background(), Event{
+		WorkspaceID: *workspaceID, PaneID: *paneID, Kind: "process_started", Source: "pane-host",
+		PID: os.Getpid(), AgentRelayVersion: relayVersion,
+	})
 	if err != nil {
 		return 1, err
 	}
@@ -1286,6 +1433,10 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 				fmt.Errorf("remote zmx session %q is missing", pane.Backend.Ref), stdin, stdout)
 		}
 	}
+	forwardedAgentSocket := ""
+	if cfg.SSH.ForwardAgent {
+		forwardedAgentSocket = os.Getenv("SSH_AUTH_SOCK")
+	}
 	zmxArgs := []string{"attach", pane.Backend.Ref}
 	if prepared.Create {
 		zmxArgs = append(zmxArgs, "zka", "pane-host", "--workspace", workspace.ID, "--pane", pane.ID, "--")
@@ -1293,7 +1444,7 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 	}
 	cmd := exec.Command(cfg.ZMX.Command, zmxArgs...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
-	cmd.Env = append(os.Environ(), "ZKA_WORKSPACE_ID="+workspace.ID, "ZKA_PANE_ID="+pane.ID)
+	cmd.Env = paneCommandEnvironment(cfg, paths, workspace.ID, pane.ID, prepared.Create)
 	if prepared.Create && pane.CWD != "" {
 		cmd.Dir = pane.CWD
 	}
@@ -1320,7 +1471,10 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 	if exited {
 		return finishRemotePaneAttach(api, cfg, workspace, pane, *attachmentID, runErr, stdin, stdout)
 	}
-	heartbeat := attachmentPaneReadyRequest{Workspace: workspace.ID, Attachment: *attachmentID, Pane: pane.ID, Ready: true}
+	heartbeat := attachmentPaneReadyRequest{
+		Workspace: workspace.ID, Attachment: *attachmentID, Pane: pane.ID, Ready: true,
+		AgentSocket: forwardedAgentSocket,
+	}
 	heartbeatCtx, heartbeatCancel := context.WithTimeout(ctx, 2*time.Second)
 	_, heartbeatErr := api.SetAttachmentPaneReady(heartbeatCtx, heartbeat)
 	heartbeatCancel()

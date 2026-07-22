@@ -17,7 +17,7 @@ func TestDefaultPathsUseXDGDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if paths.StateDir != filepath.Join(root, "state-home", "zka") || paths.Socket != filepath.Join(root, "runtime-home", "zka", "zka.sock") {
+	if paths.StateDir != filepath.Join(root, "state-home", "zka") || paths.Socket != filepath.Join(root, "runtime-home", "zka", "zka.sock") || paths.AgentDir != filepath.Join(root, "runtime-home", "zka", "agents") {
 		t.Fatalf("paths = %#v", paths)
 	}
 }
