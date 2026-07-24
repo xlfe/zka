@@ -9,12 +9,22 @@ let
   cfg = config.services.zka;
   toml = pkgs.formats.toml { };
   json = pkgs.formats.json { };
-  hookCommand = "${cfg.package}/libexec/zka/hooks/zka hook codex";
-  hook = {
+  codexHookCommand = "${cfg.package}/libexec/zka/hooks/zka hook codex";
+  codexHook = {
     hooks = [
       {
         type = "command";
-        command = hookCommand;
+        command = codexHookCommand;
+        timeout = 2;
+      }
+    ];
+  };
+  claudeHookCommand = "${cfg.package}/libexec/zka/hooks/zka hook claude";
+  claudeHook = {
+    hooks = [
+      {
+        type = "command";
+        command = claudeHookCommand;
         timeout = 2;
       }
     ];
@@ -24,20 +34,59 @@ let
     hooks = {
       managed_dir = "${cfg.package}/libexec/zka/hooks";
       SessionStart = [
-        (hook // { matcher = "startup|resume|clear|compact"; })
+        (codexHook // { matcher = "startup|resume|clear|compact"; })
       ];
-      UserPromptSubmit = [ hook ];
+      UserPromptSubmit = [ codexHook ];
       PermissionRequest = [
-        (hook // { matcher = ".*"; })
+        (codexHook // { matcher = ".*"; })
       ];
       PostToolUse = [
-        (hook // { matcher = ".*"; })
+        (codexHook // { matcher = ".*"; })
       ];
-      Stop = [ hook ];
+      Stop = [ codexHook ];
     };
   };
   requirements = lib.recursiveUpdate cfg.codex.extraRequirements zkaRequirements;
   requirementsFile = toml.generate "zka-codex-requirements.toml" requirements;
+  claudeManagedSettings = {
+    hooks = {
+      SessionStart = [
+        (claudeHook // { matcher = "startup|resume|clear|compact"; })
+      ];
+      UserPromptSubmit = [ claudeHook ];
+      PreToolUse = [
+        (claudeHook // { matcher = "AskUserQuestion|ExitPlanMode"; })
+      ];
+      PermissionRequest = [
+        (claudeHook // { matcher = "*"; })
+      ];
+      PostToolUse = [
+        (claudeHook // { matcher = "*"; })
+      ];
+      PostToolUseFailure = [
+        (claudeHook // { matcher = "*"; })
+      ];
+      Elicitation = [
+        (claudeHook // { matcher = "*"; })
+      ];
+      ElicitationResult = [
+        (claudeHook // { matcher = "*"; })
+      ];
+      Notification = [
+        (claudeHook // {
+          matcher = "permission_prompt|idle_prompt|elicitation_dialog|elicitation_complete|elicitation_response";
+        })
+      ];
+      Stop = [ claudeHook ];
+      StopFailure = [
+        (claudeHook // { matcher = "*"; })
+      ];
+      SessionEnd = [
+        (claudeHook // { matcher = "*"; })
+      ];
+    };
+  };
+  claudeManagedSettingsFile = json.generate "zka-claude-managed-settings.json" claudeManagedSettings;
   reservedRequirementPaths = [
     [ "features" "hooks" ]
     [ "hooks" "managed_dir" ]
@@ -73,6 +122,10 @@ let
       ntfy_enabled = cfg.notifications.ntfyEnabled;
       ntfy_include_evidence = cfg.notifications.ntfyIncludeEvidence;
       ntfy_command = cfg.notifications.ntfyCommand;
+    };
+    integrations = {
+      codex_managed_hooks = cfg.codex.enableManagedHooks;
+      claude_managed_hooks = cfg.claude.enableManagedHooks;
     };
   };
   servicePath = [
@@ -213,6 +266,12 @@ in
         description = "Additional values rendered into /etc/codex/requirements.toml.";
       };
     };
+
+    claude.enableManagedHooks = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Install zka lifecycle hooks in the system Claude Code managed-settings drop-in directory.";
+    };
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
@@ -245,6 +304,10 @@ in
 
     (lib.mkIf cfg.codex.enableManagedHooks {
       environment.etc."codex/requirements.toml".source = requirementsFile;
+    })
+
+    (lib.mkIf cfg.claude.enableManagedHooks {
+      environment.etc."claude-code/managed-settings.d/50-zka.json".source = claudeManagedSettingsFile;
     })
   ]);
 }

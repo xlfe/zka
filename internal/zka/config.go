@@ -39,6 +39,10 @@ type Config struct {
 		NtfyIncludeEvidence bool   `json:"ntfy_include_evidence"`
 		NtfyCommand         string `json:"ntfy_command"`
 	} `json:"notifications"`
+	Integrations struct {
+		CodexManagedHooks  bool `json:"codex_managed_hooks"`
+		ClaudeManagedHooks bool `json:"claude_managed_hooks"`
+	} `json:"integrations"`
 }
 
 func defaultConfig() Config {
@@ -59,6 +63,8 @@ func defaultConfig() Config {
 	cfg.Notifications.NtfyEnabled = true
 	cfg.Notifications.NtfyIncludeEvidence = false
 	cfg.Notifications.NtfyCommand = "ntfy-send"
+	cfg.Integrations.CodexManagedHooks = true
+	cfg.Integrations.ClaudeManagedHooks = true
 	return cfg
 }
 

@@ -3,6 +3,8 @@ package zka
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -57,5 +59,21 @@ func TestSSHPublicKeyFingerprints(t *testing.T) {
 	const want = "SHA256:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ"
 	if len(fingerprints) != 1 || fingerprints[0] != want {
 		t.Fatalf("fingerprints = %#v", fingerprints)
+	}
+}
+
+func TestManagedHookDoctorCheck(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(path, []byte(`{"command":"zka hook claude"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if check := managedHookDoctorCheck("claude-hooks", path, "hook claude", true); !check.OK || check.Detail != path {
+		t.Fatalf("installed check = %#v", check)
+	}
+	if check := managedHookDoctorCheck("claude-hooks", path, "hook codex", true); check.OK || !bytes.Contains([]byte(check.Detail), []byte("not found")) {
+		t.Fatalf("missing command check = %#v", check)
+	}
+	if check := managedHookDoctorCheck("claude-hooks", "/missing", "hook claude", false); !check.OK || !bytes.Contains([]byte(check.Detail), []byte("disabled")) {
+		t.Fatalf("disabled check = %#v", check)
 	}
 }

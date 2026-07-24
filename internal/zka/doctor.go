@@ -45,7 +45,13 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 	commands := []struct{ name, command string }{
 		{"kitty", cfg.Kitty.Command}, {"kitten", cfg.Kitty.KittenCommand},
 		{"zmx", cfg.ZMX.Command}, {"ssh", cfg.SSH.Command},
-		{"codex", "codex"}, {"ntfy-send", cfg.Notifications.NtfyCommand},
+		{"ntfy-send", cfg.Notifications.NtfyCommand},
+	}
+	if cfg.Integrations.CodexManagedHooks {
+		commands = append(commands, struct{ name, command string }{"codex", "codex"})
+	}
+	if cfg.Integrations.ClaudeManagedHooks {
+		commands = append(commands, struct{ name, command string }{"claude", "claude"})
 	}
 	for _, item := range commands {
 		path, lookupErr := exec.LookPath(item.command)
@@ -56,16 +62,10 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		watcherErr = fmt.Errorf("not found")
 	}
 	checks = append(checks, doctorCheck{Name: "kitty-watcher", OK: watcherErr == nil, Detail: doctorDetail(watcherErr, cfg.Kitty.Watcher)})
-	requirements := "/etc/codex/requirements.toml"
-	b, requirementsErr := os.ReadFile(requirements)
-	hooksOK := requirementsErr == nil && strings.Contains(string(b), "hook codex")
-	hooksDetail := requirements
-	if requirementsErr != nil {
-		hooksDetail = requirementsErr.Error()
-	} else if !hooksOK {
-		hooksDetail = "managed zka hook not found in " + requirements
-	}
-	checks = append(checks, doctorCheck{Name: "codex-hooks", OK: hooksOK, Detail: hooksDetail})
+	checks = append(checks,
+		managedHookDoctorCheck("codex-hooks", "/etc/codex/requirements.toml", "hook codex", cfg.Integrations.CodexManagedHooks),
+		managedHookDoctorCheck("claude-hooks", "/etc/claude-code/managed-settings.d/50-zka.json", "hook claude", cfg.Integrations.ClaudeManagedHooks),
+	)
 	if *origin != "" {
 		forwardingConfigDetail := "disabled; enable services.zka.ssh.forwardAgent"
 		if cfg.SSH.ForwardAgent {
@@ -108,6 +108,20 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		checks = append(checks, doctorCheck{Name: "remote-forwarded-agent", OK: forwardedOK, Detail: forwardedDetail})
 	}
 	return writeDoctorResult(checks, *jsonOut, stdout)
+}
+
+func managedHookDoctorCheck(name, path, command string, enabled bool) doctorCheck {
+	if !enabled {
+		return doctorCheck{Name: name, OK: true, Detail: "disabled in zka configuration"}
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return doctorCheck{Name: name, Detail: err.Error()}
+	}
+	if !strings.Contains(string(b), command) {
+		return doctorCheck{Name: name, Detail: "managed zka hook not found in " + path}
+	}
+	return doctorCheck{Name: name, OK: true, Detail: path}
 }
 
 type sshAgentInspector func(context.Context, string) ([]string, error)

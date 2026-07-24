@@ -1531,8 +1531,11 @@ func (d *Daemon) applyEvent(_ context.Context, event Event) (*Workspace, error) 
 	}
 	before := pane.State
 	pane.Evidence = Evidence{Source: event.Source, Event: event.Kind, Detail: event.Detail, TurnID: event.TurnID, Timestamp: now}
-	if event.Source == "codex-hook" {
+	switch event.Source {
+	case "codex-hook":
 		pane.Agent = "codex"
+	case "claude-hook":
+		pane.Agent = "claude"
 	}
 	if event.TurnID != "" {
 		pane.LastTurnID = event.TurnID
@@ -1546,6 +1549,10 @@ func (d *Daemon) applyEvent(_ context.Context, event Event) (*Workspace, error) 
 		pane.State = StateBlocked
 	case "stop":
 		pane.State = StateDone
+	case "agent_error":
+		pane.State = StateError
+	case "session_end":
+		pane.Agent, pane.State, pane.LastTurnID = "", StateUnknown, ""
 	case "process_started":
 		pane.Process = ProcessStatus{Running: true, PID: event.PID, Started: now}
 		pane.BackendCreated, pane.BackendReady, pane.BackendStart = true, true, false

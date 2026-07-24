@@ -73,15 +73,36 @@
               }
             ];
           };
+          disabledHooks = nixpkgs.lib.nixosSystem {
+            modules = [
+              self.nixosModules.default
+              {
+                nixpkgs.hostPlatform = system;
+                system.stateVersion = "26.05";
+                services.zka = {
+                  enable = true;
+                  codex.enableManagedHooks = false;
+                  claude.enableManagedHooks = false;
+                };
+              }
+            ];
+          };
           service = evaluated.config.systemd.user.services.zkad;
           requirements = evaluated.config.environment.etc."codex/requirements.toml".source;
+          claudeSettings = evaluated.config.environment.etc."claude-code/managed-settings.d/50-zka.json".source;
+          disabledRuntimeConfig = disabledHooks.config.systemd.user.services.zkad.environment.ZKA_CONFIG;
+          disabledCodexPresent = builtins.hasAttr "codex/requirements.toml" disabledHooks.config.environment.etc;
+          disabledClaudePresent = builtins.hasAttr "claude-code/managed-settings.d/50-zka.json" disabledHooks.config.environment.etc;
         in
         {
           package = self.packages.${system}.zka;
           module = pkgs.runCommand "zka-module-check" {
             execStart = service.serviceConfig.ExecStart;
             runtimeConfig = service.environment.ZKA_CONFIG;
-            inherit requirements;
+            inherit requirements claudeSettings;
+            inherit disabledRuntimeConfig;
+            disabledCodexPresent = toString disabledCodexPresent;
+            disabledClaudePresent = toString disabledClaudePresent;
           } ''
             test -n "$execStart"
             grep -q '"fish"' "$runtimeConfig"
@@ -94,8 +115,17 @@
             grep -q '"ntfy_enabled": *true' "$runtimeConfig"
             grep -q '"ntfy_include_evidence": *false' "$runtimeConfig"
             grep -q '"blocked"' "$runtimeConfig"
+            grep -q '"codex_managed_hooks": *true' "$runtimeConfig"
+            grep -q '"claude_managed_hooks": *true' "$runtimeConfig"
             grep -q 'hook codex' "$requirements"
             grep -q 'managed_dir' "$requirements"
+            grep -q 'hook claude' "$claudeSettings"
+            grep -q 'AskUserQuestion|ExitPlanMode' "$claudeSettings"
+            grep -q 'StopFailure' "$claudeSettings"
+            grep -q '"codex_managed_hooks": *false' "$disabledRuntimeConfig"
+            grep -q '"claude_managed_hooks": *false' "$disabledRuntimeConfig"
+            test "$disabledCodexPresent" = ""
+            test "$disabledClaudePresent" = ""
             test -x ${self.packages.${system}.zka}/bin/zka-launch
             touch "$out"
           '';

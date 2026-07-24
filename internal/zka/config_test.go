@@ -15,7 +15,9 @@ func TestAttentionConfigDefaultsAndExplicitNotificationDisable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(cfg.Attention.States, []AgentState{StateBlocked, StateError, StateDone}) || !cfg.Notifications.DesktopEnabled || !cfg.Notifications.NtfyEnabled || cfg.Notifications.NtfyIncludeEvidence {
+	if !reflect.DeepEqual(cfg.Attention.States, []AgentState{StateBlocked, StateError, StateDone}) ||
+		!cfg.Notifications.DesktopEnabled || !cfg.Notifications.NtfyEnabled || cfg.Notifications.NtfyIncludeEvidence ||
+		!cfg.Integrations.CodexManagedHooks || !cfg.Integrations.ClaudeManagedHooks {
 		t.Fatalf("defaults = %#v", cfg)
 	}
 	path := filepath.Join(t.TempDir(), "config.json")
@@ -29,6 +31,21 @@ func TestAttentionConfigDefaultsAndExplicitNotificationDisable(t *testing.T) {
 	}
 	if cfg.Notifications.DesktopEnabled || cfg.Notifications.NtfyEnabled || !cfg.Notifications.NtfyIncludeEvidence {
 		t.Fatalf("explicit channel disable was ignored: %#v", cfg.Notifications)
+	}
+}
+
+func TestManagedHookIntegrationsCanBeDisabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"integrations":{"codex_managed_hooks":false,"claude_managed_hooks":false}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", path)
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Integrations.CodexManagedHooks || cfg.Integrations.ClaudeManagedHooks {
+		t.Fatalf("managed hooks remained enabled: %#v", cfg.Integrations)
 	}
 }
 

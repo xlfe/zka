@@ -8,8 +8,8 @@ directories, and focus—into one durable unit. Each pane runs in its own hidden
 [`zmx`](https://github.com/neurosnap/zmx) session, so the shell, editor, server,
 or coding agent inside it keeps running when the view goes away.
 
-When Codex needs input or finishes work, zka collects the exact panes that need
-you and takes you straight back to them.
+When Codex or Claude Code needs input or finishes work, zka collects the exact
+panes that need you and takes you straight back to them.
 
 <p align="center">
   <img src="docs/images/workspace-launcher.png" width="49%" alt="zka workspace launcher showing an attached workspace">
@@ -22,8 +22,8 @@ you and takes you straight back to them.
 
 > [!NOTE]
 > zka 0.6.0 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
-> builds on Kitty, zmx, OpenSSH, systemd user services, and Codex hooks instead
-> of replacing them.
+> builds on Kitty, zmx, OpenSSH, systemd user services, and coding-agent hooks
+> instead of replacing them.
 
 [Quick start](#quick-start) · [Why zka](#why-zka) ·
 [Compare](#how-zka-compares) · [How it works](#how-it-works) ·
@@ -45,7 +45,7 @@ zka keeps the terminal workflow and adds the missing workspace layer:
 | **Kitty-native UI** | Keep ordinary Kitty OS windows, tabs, splits, layouts, titles, scrollback, and key bindings. |
 | **Whole-workspace restore** | Recreate the logical topology, working directories, and focus around the same live zmx sessions. |
 | **Remote attach and move** | Open an origin workspace from another machine over normal OpenSSH, as a mirror or a primary handoff. |
-| **Agent attention** | See Codex panes that are blocked, failed, or done in one live queue; jump directly to the exact pane. |
+| **Agent attention** | See Codex and Claude Code panes that are blocked, failed, or done in one live queue; jump directly to the exact pane. |
 | **Composable infrastructure** | Keep network reachability, authentication, terminal rendering, and PTY ownership in tools that already do them well. |
 
 zka is not a new terminal emulator or an outer multiplexer. It does not replay a
@@ -70,7 +70,8 @@ abstraction boundaries:
 - **zka composes the workspace.** Kitty continues to own the visible windows,
   tabs, splits, rendering, and input; zmx owns one persistent PTY per pane; zka
   adds durable workspace identity, topology restore, remote attachments, and a
-  Codex attention layer. It is deliberately NixOS-, Wayland-, and Kitty-native.
+  Codex and Claude Code attention layer. It is deliberately NixOS-, Wayland-,
+  and Kitty-native.
 
 Choose herdr when you want one portable, self-contained, agent-aware terminal
 multiplexer. Choose zka when Kitty itself is the workspace you want to preserve,
@@ -92,7 +93,7 @@ resuming an agent through its own session mechanism.
 | [Superset](https://github.com/superset-sh/superset) | macOS desktop code editor | Persistent terminal sessions per workspace survive app restarts | Primarily local desktop workspaces | Worktree-isolated parallel agents, monitoring, diff review, editor, and PR workflow |
 | [Claude Squad](https://github.com/smtg-ai/claude-squad) | Terminal session manager | tmux provides process persistence | Runs wherever its tmux host runs | Multi-agent profiles, one worktree per task, previews, diff review, and checkout workflow |
 | [Vibe Kanban](https://github.com/BloopAI/vibe-kanban) | Kanban-style local web/desktop app | Manages agent execution inside task workspaces rather than acting as a general PTY multiplexer | Self-hosted/remote deployment model | Planning, worktree execution, browser preview, inline diff review, and PR flow; project is sunsetting |
-| **zka** | Native Kitty windows, tabs, and splits plus a small launcher/inbox | One zmx-owned live PTY per pane; topology is restored around the same processes | OpenSSH mirror attachments and transactional primary moves between configured machines | Arbitrary terminal programs, Codex lifecycle attention, no built-in task planner, diff review, or worktree isolation |
+| **zka** | Native Kitty windows, tabs, and splits plus a small launcher/inbox | One zmx-owned live PTY per pane; topology is restored around the same processes | OpenSSH mirror attachments and transactional primary moves between configured machines | Arbitrary terminal programs, Codex and Claude Code lifecycle attention, no built-in task planner, diff review, or worktree isolation |
 
 Comparison checked against each project's public documentation in July 2026.
 These tools overlap, but they optimize for different jobs: general multiplexing,
@@ -141,9 +142,10 @@ Apply the configuration:
 sudo nixos-rebuild switch --flake .#my-host
 ```
 
-The module installs zka, Kitty, OpenSSH, the Kitty watcher, the Codex hooks, and
-the `zkad` systemd user service. `zmx.package` supplies the persistent PTY
-backend.
+The module installs zka, Kitty, OpenSSH, the Kitty watcher, managed Codex and
+Claude Code hooks, and the `zkad` systemd user service. `zmx.package` supplies
+the persistent PTY backend. Install the Codex and Claude Code CLIs separately on
+machines where you use them.
 
 ### 2. Open the launcher
 
@@ -170,14 +172,15 @@ zka workspace attach example-project
 ```
 
 That is the core zka loop. `attach` restores the workspace around the original
-live processes; it does not rerun `codex`, `nvim`, a dev server, or the shell.
+live processes; it does not rerun `codex`, `claude`, `nvim`, a dev server, or
+the shell.
 
 ## The daily workflow
 
 1. Run `zka launch` and create or switch to a workspace.
 2. Add Kitty tabs and splits as usual; each becomes a managed pane.
-3. Start any terminal program. Codex gets agent-aware status through managed
-   lifecycle hooks.
+3. Start any terminal program. Codex and Claude Code get agent-aware status
+   through managed lifecycle hooks.
 4. Detach when you want the view gone but the work to continue.
 5. Open `zka attention show` when you want only the panes that need a decision.
 6. Attach the same workspace locally, or from another configured host over SSH.
@@ -185,14 +188,14 @@ live processes; it does not rerun `codex`, `nvim`, a dev server, or the shell.
 The launcher groups known workspaces into **Attached** and **Detached**. Selecting
 an attached workspace switches to its existing Sway window; selecting a detached
 one reconstructs its Kitty view. Each row shows workspace-level agent state,
-detected agent processes, and pane/tab/window counts.
+hook-reported agent types, and pane/tab/window counts.
 
 ## How it works
 
 ```text
 workspace "example-project" on devbox.example
 ├── saved Kitty topology: OS windows → tabs → splits
-├── pane A → zmx session → live Codex process
+├── pane A → zmx session → live Codex or Claude Code process
 ├── pane B → zmx session → live editor
 └── pane C → zmx session → live shell
 
@@ -330,10 +333,23 @@ explicitly while preserving the rest of the workspace.
 
 ## Attention and notifications
 
-Each pane records explainable Codex lifecycle evidence and one of `unknown`,
-`idle`, `working`, `blocked`, `done`, or `error`. The workspace exposes the
-highest-priority aggregate. Managed hooks associate Codex events with the hidden
-pane through `ZKA_WORKSPACE_ID` and `ZKA_PANE_ID`.
+Each pane records explainable Codex or Claude Code lifecycle evidence and one of
+`unknown`, `idle`, `working`, `blocked`, `done`, or `error`. The workspace
+exposes the highest-priority aggregate. Managed hooks associate agent events
+with the hidden pane through `ZKA_WORKSPACE_ID` and `ZKA_PANE_ID`.
+
+Claude support is hook-only: zka does not read screen contents, scrollback, or
+transcripts. Claude Code does not emit `Stop` after a user interrupt, and a
+dismissed permission dialog may not emit a closing event. An idle notification
+can repair those states; otherwise the next prompt or session transition clears
+them. Background subagent activity cannot overwrite the parent pane, while
+subagent permission requests still surface as blocked.
+
+Claude permission prompts, `AskUserQuestion`, plan approval, and MCP elicitation
+dialogs map to `blocked`; successful or failed tool completion resumes
+`working`; `Stop` maps to `done`; and `StopFailure` maps to `error` without
+marking the zmx backend dead. `SessionEnd` clears the Claude label and returns
+the pane to `unknown`.
 
 `zka attention` is a live projection of what needs you now, not a notification
 history. Resolved items disappear automatically; finished work disappears while
@@ -409,7 +425,7 @@ pauses or resumes notifications, and Escape closes the popup.
 ## Configuration
 
 The NixOS module owns the runtime configuration shared by the CLI, launcher, and
-daemon:
+daemon. Managed hooks for both supported agents default to enabled:
 
 ```nix
 services.zka = {
@@ -417,6 +433,8 @@ services.zka = {
 
   shell.command = [ "fish" ];
   zmx.package = zmx.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  codex.enableManagedHooks = true;
+  claude.enableManagedHooks = true;
 
   attention.states = [ "blocked" "error" "done" ];
   kitty.extraArgs = [ "--class" "managed-kitty" ];
@@ -444,7 +462,14 @@ services.zka = {
 When managed Codex hooks are enabled, the module owns
 `/etc/codex/requirements.toml`. Add other system requirements under
 `services.zka.codex.extraRequirements`; zka does not disable user or project
-hooks.
+hooks. Disable the managed entries with
+`services.zka.codex.enableManagedHooks = false`.
+
+Managed Claude hooks are written as the independent
+`/etc/claude-code/managed-settings.d/50-zka.json` drop-in, so other managed
+settings files remain untouched. The hooks run system-wide but immediately
+return without side effects outside a zka pane. Disable them with
+`services.zka.claude.enableManagedHooks = false`.
 
 `ntfy-send` authentication remains in the helper's own configuration. zka never
 reads or transports its token.
@@ -617,6 +642,10 @@ journalctl --user-unit zkad
 `zka workspace inspect WORKSPACE` includes attachment health, pane/backend state,
 agent evidence, and retained notification failures.
 
+`zka doctor` checks the enabled Codex and Claude Code executables and their
+managed hook files. An integration disabled in the NixOS module is reported as
+disabled instead of failed.
+
 ## Boundaries
 
 "Exact restore" means logical Kitty topology plus the live terminal state still
@@ -627,7 +656,8 @@ safely; shared unmanaged Kitty processes remain outside the model.
 
 zka manages durable terminal workspaces, not prompts, branches, worktrees, diffs,
 or agent task planning. Any terminal program can run in its panes, while the
-built-in attention integration currently targets Codex lifecycle hooks.
+built-in attention integration currently targets Codex and Claude Code
+lifecycle hooks.
 
 Keep short-lived utility terminals on plain Kitty unless their processes should
 persist. Existing `new_window_with_cwd` and `new_tab_with_cwd` mappings continue
@@ -638,8 +668,8 @@ routing the new pane through zka.
 
 Version 0.6.0 implements the complete workspace-centric path: local lifecycle,
 topology restoration, remote mirrors and two-phase moves, reconnect-safe SSH
-agent forwarding, Codex attention, Waybar streaming, desktop/ntfy notifications,
-and durable cleanup after partial failures.
+agent forwarding, Codex and Claude Code attention, Waybar streaming,
+desktop/ntfy notifications, and durable cleanup after partial failures.
 
 State schemas v1 and v2 are reset on the first v0.3-or-newer start because v3
 changed process ownership. The reset removes old zka state and generated Kitty
