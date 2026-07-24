@@ -122,6 +122,27 @@ func TestBackendReconcileKeepsPartialWorkspaceAndMarksDeadPane(t *testing.T) {
 	if !dead.BackendDead || dead.BackendReady || dead.Process.Running || dead.State != StateError || dead.Evidence.Event != "backend_missing" {
 		t.Fatalf("missing pane was not tombstoned: %#v", dead)
 	}
+
+	runner.setSession(panes[1].Backend.Ref, true)
+	result, err = d.reconcileBackends(context.Background(), workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Recovered) != 1 || result.Recovered[0] != panes[1].ID {
+		t.Fatalf("reconcile recovery = %#v", result)
+	}
+	got, err = d.getWorkspace(workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := got.Panes[panes[1].ID]
+	if recovered.BackendDead || !recovered.BackendReady || !recovered.Process.Running ||
+		recovered.State != StateUnknown || recovered.Evidence.Event != "backend_recovered" {
+		t.Fatalf("live pane was not recovered: %#v", recovered)
+	}
+	if snapshot := d.attentionSnapshot(); snapshot.Counts.Total != 0 {
+		t.Fatalf("recovered pane remained in attention: %#v", snapshot)
+	}
 }
 
 func TestBackendReconcileDeletesWorkspaceWhenAllBackendsAreDead(t *testing.T) {

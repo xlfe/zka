@@ -388,8 +388,9 @@ type backendReconcileRequest struct {
 }
 
 type backendReconcileResponse struct {
-	Marked  []string `json:"marked,omitempty"`
-	Deleted []string `json:"deleted,omitempty"`
+	Marked    []string `json:"marked,omitempty"`
+	Recovered []string `json:"recovered,omitempty"`
+	Deleted   []string `json:"deleted,omitempty"`
 }
 
 type attachmentRequest struct {
@@ -1540,6 +1541,7 @@ func (d *Daemon) applyEvent(_ context.Context, event Event) (*Workspace, error) 
 	if event.TurnID != "" {
 		pane.LastTurnID = event.TurnID
 	}
+	pane.AttentionSeen = ""
 	switch event.Kind {
 	case "session_start":
 		pane.State = StateIdle
@@ -1618,11 +1620,19 @@ func (d *Daemon) markSeen(workspaceRef, paneRef string) (*Workspace, error) {
 	}
 	changed := false
 	for _, pane := range panes {
-		if pane.State == StateDone {
+		switch pane.State {
+		case StateDone:
 			pane.State = StateIdle
+			pane.AttentionSeen = ""
 			pane.Evidence = Evidence{Source: "zka", Event: "seen", Timestamp: time.Now().UTC()}
 			pane.UpdatedAt = pane.Evidence.Timestamp
 			changed = true
+		case StateBlocked, StateError:
+			identity := attentionEventIdentity(pane)
+			if pane.AttentionSeen != identity {
+				pane.AttentionSeen = identity
+				changed = true
+			}
 		}
 	}
 	workspace.RecomputeAttention()

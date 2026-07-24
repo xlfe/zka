@@ -98,6 +98,10 @@ func TestLaunchIsAStandaloneTopLevelCommand(t *testing.T) {
 	if !strings.Contains(stdout.String(), "launch      Choose or create a workspace") {
 		t.Fatalf("top-level usage does not advertise the launcher: %q", stdout.String())
 	}
+	if strings.Contains(stdout.String(), "\t") ||
+		!strings.Contains(stdout.String(), "\n  workspace   Manage workspace views") {
+		t.Fatalf("top-level usage has inconsistent command indentation: %q", stdout.String())
+	}
 }
 
 func TestLauncherProxyReturnsHelperExitStatus(t *testing.T) {

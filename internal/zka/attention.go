@@ -75,6 +75,9 @@ func buildAttentionSnapshot(state StateData, enabled []AgentState) AttentionSnap
 			if pane == nil || !allowed[pane.State] {
 				continue
 			}
+			if pane.AttentionSeen == attentionEventIdentity(pane) {
+				continue
+			}
 			attached, _ := attentionPaneViewOnNode(state.Node.ID, workspace, pane.ID)
 			_, focused := attentionPaneView(workspace, pane.ID)
 			if pane.State == StateDone && focused {
@@ -187,6 +190,17 @@ func attentionItemID(workspace *Workspace, pane *Pane) string {
 		origin = "local"
 	}
 	return fmt.Sprintf("%s:%s:%s", origin, workspace.ID, pane.ID)
+}
+
+func attentionEventIdentity(pane *Pane) string {
+	if pane == nil {
+		return ""
+	}
+	transitioned := pane.Evidence.Timestamp
+	if transitioned.IsZero() {
+		transitioned = pane.UpdatedAt
+	}
+	return string(pane.State) + ":" + transitioned.Format(time.RFC3339Nano)
 }
 
 func nextAttentionItem(snapshot AttentionSnapshot) (AttentionItem, bool) {

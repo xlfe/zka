@@ -258,6 +258,52 @@ func TestProcessFailureBecomesPaneAndWorkspaceError(t *testing.T) {
 	}
 }
 
+func TestMarkSeenAcknowledgesErrorWithoutErasingDiagnosticState(t *testing.T) {
+	root := t.TempDir()
+	d, err := newTestDaemon(t, root, quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	if _, err := d.applyEvent(context.Background(), Event{
+		WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "agent_error", Source: "codex-hook",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	seen, err := d.markSeen(workspace.ID, pane.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := seen.Panes[pane.ID]
+	if got.State != StateError || got.Evidence.Event != "agent_error" || got.AttentionSeen != attentionEventIdentity(got) {
+		t.Fatalf("seen error lost diagnostic state: %#v", got)
+	}
+	if snapshot := d.attentionSnapshot(); snapshot.Counts.Total != 0 {
+		t.Fatalf("seen error remained in attention: %#v", snapshot)
+	}
+
+	d.Close()
+	restarted, err := NewDaemon(testPaths(root), quietRunner(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	if snapshot := restarted.attentionSnapshot(); snapshot.Counts.Total != 0 {
+		t.Fatalf("seen error returned after restart: %#v", snapshot)
+	}
+
+	if _, err := restarted.applyEvent(context.Background(), Event{
+		WorkspaceID: workspace.ID, PaneID: pane.ID, Kind: "agent_error", Source: "codex-hook",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := restarted.attentionSnapshot(); snapshot.Counts.Error != 1 {
+		t.Fatalf("new error did not return to attention: %#v", snapshot)
+	}
+}
+
 func TestPreparePaneAllocatesAndNeverRestartsMissingBackend(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {

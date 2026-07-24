@@ -107,6 +107,7 @@ type Pane struct {
 	State             AgentState                    `json:"state"`
 	Evidence          Evidence                      `json:"evidence"`
 	LastTurnID        string                        `json:"last_turn_id,omitempty"`
+	AttentionSeen     string                        `json:"attention_seen,omitempty"`
 	Process           ProcessStatus                 `json:"process"`
 	Notifications     map[string]NotificationRecord `json:"notifications,omitempty"`
 	BackendCreated    bool                          `json:"backend_created"`

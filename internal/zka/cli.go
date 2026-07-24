@@ -92,7 +92,7 @@ Commands:
   launch      Choose or create a workspace in the graphical launcher
   attention   Show, watch, focus, or defer panes that need you
   kitty       Create a managed Kitty workspace
-	workspace   Manage workspace views, lifecycle, focus, and SSH agent ownership
+  workspace   Manage workspace views, lifecycle, focus, and SSH agent ownership
   doctor      Check local or remote integration
   daemon      Run zkad (normally via systemd --user)
 

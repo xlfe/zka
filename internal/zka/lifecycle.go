@@ -517,6 +517,30 @@ func (d *Daemon) reconcileBackends(ctx context.Context, workspaceRef string) (ba
 			established = true
 			if active[pane.Backend.Ref] {
 				live = true
+				if pane.BackendDead && pane.Evidence.Event == "backend_missing" {
+					if !workspaceChanged {
+						changedBefore[workspace.ID] = workspace.Clone()
+					}
+					pane.BackendCreated = true
+					pane.BackendReady = true
+					pane.BackendStart = false
+					pane.BackendDead = false
+					pane.BackendError = ""
+					pane.Process.Running = true
+					pane.Process.ExitCode = nil
+					pane.Process.Exited = time.Time{}
+					pane.State = StateUnknown
+					pane.AttentionSeen = ""
+					pane.Evidence = Evidence{
+						Source:    "zkad",
+						Event:     "backend_recovered",
+						Detail:    fmt.Sprintf("zmx session %q is available", pane.Backend.Ref),
+						Timestamp: now,
+					}
+					pane.UpdatedAt = now
+					response.Recovered = append(response.Recovered, pane.ID)
+					workspaceChanged = true
+				}
 				continue
 			}
 			if !pane.BackendDead || pane.BackendReady || pane.Process.Running || pane.State != StateError || pane.Evidence.Event != "backend_missing" {
@@ -531,6 +555,7 @@ func (d *Daemon) reconcileBackends(ctx context.Context, workspaceRef string) (ba
 				pane.Process.PID = 0
 				pane.Process.Exited = now
 				pane.State = StateError
+				pane.AttentionSeen = ""
 				pane.Evidence = Evidence{Source: "zkad", Event: "backend_missing", Detail: pane.BackendError, Timestamp: now}
 				pane.UpdatedAt = now
 				response.Marked = append(response.Marked, pane.ID)

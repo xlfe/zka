@@ -78,6 +78,28 @@ func TestBuildAttentionSnapshotOnlyMarksViewsOnThisNodeAttached(t *testing.T) {
 	}
 }
 
+func TestBuildAttentionSnapshotSuppressesOnlyTheAcknowledgedEvent(t *testing.T) {
+	base := time.Date(2026, 7, 17, 9, 0, 0, 0, time.UTC)
+	pane := &Pane{
+		ID: "pane", State: StateError,
+		Evidence: Evidence{Event: "agent_error", Timestamp: base},
+	}
+	pane.AttentionSeen = attentionEventIdentity(pane)
+	state := newStateData()
+	state.Workspaces["workspace"] = &Workspace{
+		ID: "workspace", Panes: map[string]*Pane{pane.ID: pane},
+	}
+
+	if snapshot := buildAttentionSnapshot(state, []AgentState{StateError}); snapshot.Counts.Total != 0 {
+		t.Fatalf("acknowledged event remained actionable: %#v", snapshot)
+	}
+
+	pane.Evidence = Evidence{Event: "agent_error", Timestamp: base.Add(time.Minute)}
+	if snapshot := buildAttentionSnapshot(state, []AgentState{StateError}); snapshot.Counts.Total != 1 {
+		t.Fatalf("new error was hidden by stale acknowledgement: %#v", snapshot)
+	}
+}
+
 func TestAttentionPausePersistsAcrossDaemonRestart(t *testing.T) {
 	root := t.TempDir()
 	d, err := newTestDaemon(t, root, quietRunner())
