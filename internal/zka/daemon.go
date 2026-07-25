@@ -994,24 +994,36 @@ func (d *Daemon) updateAttachment(req attachmentUpdateRequest) (*Workspace, erro
 	if req.ExpectedRevision != 0 && req.ExpectedRevision != workspace.Revision {
 		return nil, fmt.Errorf("workspace revision changed: have %d, expected %d", workspace.Revision, req.ExpectedRevision)
 	}
+	candidate := attachment.Clone()
 	if req.Status != "" {
-		attachment.Status = req.Status
+		candidate.Status = req.Status
 	}
 	if req.Views != nil {
-		attachment.Views = cloneViews(req.Views)
+		candidate.Views = cloneViews(req.Views)
 	}
-	attachment.LastError = req.Error
-	attachment.UpdatedAt = time.Now().UTC()
-	workspace.UpdatedAt = attachment.UpdatedAt
-	if attachment.Status == AttachmentReady {
-		if err := validateAttachmentReady(workspace, attachment); err != nil {
-			attachment.Status = AttachmentUnhealthy
-			attachment.LastError = err.Error()
-			_ = d.store.Save(d.state)
+	candidate.LastError = req.Error
+	if candidate.Status == AttachmentReady {
+		if err := validateAttachmentReady(workspace, candidate); err != nil {
+			candidate.Status = AttachmentUnhealthy
+			candidate.LastError = err.Error()
+			if !attachmentRuntimeEqual(attachment, candidate) {
+				now := time.Now().UTC()
+				applyAttachmentRuntime(attachment, candidate)
+				attachment.UpdatedAt = now
+				workspace.UpdatedAt = now
+				_ = d.store.Save(d.state)
+			}
 			return nil, err
 		}
-		attachment.AppliedRevision = workspace.Revision
+		candidate.AppliedRevision = workspace.Revision
 	}
+	if attachmentRuntimeEqual(attachment, candidate) {
+		return workspace.Clone(), nil
+	}
+	now := time.Now().UTC()
+	applyAttachmentRuntime(attachment, candidate)
+	attachment.UpdatedAt = now
+	workspace.UpdatedAt = now
 	if err := d.store.Save(d.state); err != nil {
 		return nil, err
 	}
@@ -1234,6 +1246,40 @@ func cloneViews(views map[string]RuntimeView) map[string]RuntimeView {
 	return copy
 }
 
+func runtimeViewsEqual(left, right map[string]RuntimeView) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for paneID, leftView := range left {
+		rightView, ok := right[paneID]
+		if !ok {
+			return false
+		}
+		// LastSeen records when the same runtime view was observed. A fallback
+		// capture refreshing it is not a workspace state change.
+		leftView.LastSeen = time.Time{}
+		rightView.LastSeen = time.Time{}
+		if leftView != rightView {
+			return false
+		}
+	}
+	return true
+}
+
+func attachmentRuntimeEqual(left, right *Attachment) bool {
+	return left.Status == right.Status &&
+		left.AppliedRevision == right.AppliedRevision &&
+		left.LastError == right.LastError &&
+		runtimeViewsEqual(left.Views, right.Views)
+}
+
+func applyAttachmentRuntime(destination, source *Attachment) {
+	destination.Status = source.Status
+	destination.AppliedRevision = source.AppliedRevision
+	destination.LastError = source.LastError
+	destination.Views = cloneViews(source.Views)
+}
+
 func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1260,18 +1306,31 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 		_ = d.store.Save(d.state)
 		return nil, err
 	}
-	attachment.Views = cloneViews(req.Views)
-	attachment.UpdatedAt = time.Now().UTC()
-	workspace.UpdatedAt = attachment.UpdatedAt
-	if err := validateViewsReady(attachment, topologyPaneIDs(req.Manifest.Topology)); err != nil {
-		attachment.Status = AttachmentUnhealthy
-		attachment.LastError = err.Error()
-		_ = d.store.Save(d.state)
+	candidate := attachment.Clone()
+	candidate.Views = cloneViews(req.Views)
+	if err := validateViewsReady(candidate, topologyPaneIDs(req.Manifest.Topology)); err != nil {
+		candidate.Status = AttachmentUnhealthy
+		candidate.LastError = err.Error()
+		if !attachmentRuntimeEqual(attachment, candidate) {
+			now := time.Now().UTC()
+			applyAttachmentRuntime(attachment, candidate)
+			attachment.UpdatedAt = now
+			workspace.UpdatedAt = now
+			_ = d.store.Save(d.state)
+		}
 		return nil, err
 	}
 	if workspace.RemoteHost != "" || attachment.Role != AttachmentPrimary || workspace.PrimaryAttachmentID != attachment.ID {
-		attachment.Status = AttachmentReady
-		attachment.AppliedRevision = workspace.Revision
+		candidate.Status = AttachmentReady
+		candidate.LastError = ""
+		candidate.AppliedRevision = workspace.Revision
+		if attachmentRuntimeEqual(attachment, candidate) {
+			return workspace.Clone(), nil
+		}
+		now := time.Now().UTC()
+		applyAttachmentRuntime(attachment, candidate)
+		attachment.UpdatedAt = now
+		workspace.UpdatedAt = now
 		if err := d.store.Save(d.state); err != nil {
 			return nil, err
 		}
@@ -1279,18 +1338,36 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	}
 	acceptCapturedCWD := attachment.Transport.Kind != "ssh"
 	if !acceptCapturedCWD {
+		req.Manifest.Topology = cloneNodes(req.Manifest.Topology)
 		preserveOriginPaneCWD(workspace, req.Manifest.Topology)
 	}
-	applyManifestPaneMetadata(workspace, req.Manifest.Topology, acceptCapturedCWD)
-	if req.Manifest.Session != workspace.Manifest.Session || !nodesEqual(req.Manifest.Topology, workspace.Manifest.Topology) {
+	topologyChanged := req.Manifest.Session != workspace.Manifest.Session || !nodesEqual(req.Manifest.Topology, workspace.Manifest.Topology)
+	manifestChanged := topologyChanged || req.Manifest.KittyVersion != workspace.Manifest.KittyVersion
+	nextRevision := workspace.Revision
+	if topologyChanged {
+		nextRevision++
+	}
+	candidate.Status = AttachmentReady
+	candidate.LastError = ""
+	candidate.AppliedRevision = nextRevision
+	attachmentChanged := !attachmentRuntimeEqual(attachment, candidate)
+	if !manifestChanged && !attachmentChanged {
+		return workspace.Clone(), nil
+	}
+	now := time.Now().UTC()
+	if topologyChanged {
+		applyManifestPaneMetadata(workspace, req.Manifest.Topology, acceptCapturedCWD)
 		workspace.Revision++
 	}
-	req.Manifest.CapturedAt = time.Now().UTC()
-	workspace.Manifest = req.Manifest
-	workspace.UpdatedAt = req.Manifest.CapturedAt
-	attachment.Status = AttachmentReady
-	attachment.LastError = ""
-	attachment.AppliedRevision = workspace.Revision
+	if manifestChanged {
+		req.Manifest.CapturedAt = now
+		workspace.Manifest = req.Manifest
+	}
+	if attachmentChanged {
+		applyAttachmentRuntime(attachment, candidate)
+		attachment.UpdatedAt = now
+	}
+	workspace.UpdatedAt = now
 	if err := d.store.Save(d.state); err != nil {
 		return nil, err
 	}
@@ -1335,6 +1412,20 @@ func preserveOriginPaneCWD(workspace *Workspace, nodes []Node) {
 		}
 		preserveOriginPaneCWD(workspace, node.Children)
 	}
+}
+
+func cloneNodes(nodes []Node) []Node {
+	if nodes == nil {
+		return nil
+	}
+	cloned := make([]Node, len(nodes))
+	for index, node := range nodes {
+		cloned[index] = node
+		cloned[index].EnabledLayouts = append([]string(nil), node.EnabledLayouts...)
+		cloned[index].LayoutState = append(json.RawMessage(nil), node.LayoutState...)
+		cloned[index].Children = cloneNodes(node.Children)
+	}
+	return cloned
 }
 
 func nodesEqual(a, b []Node) bool {

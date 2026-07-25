@@ -192,7 +192,7 @@ func TestNotificationChannelsCanBeDisabledIndependently(t *testing.T) {
 		d.mu.Lock()
 		actual := d.state.Workspaces[workspace.ID]
 		actual.Attachments["local"] = &Attachment{
-			ID: "local", Endpoint: "unix:/kitty", Status: AttachmentReady,
+			ID: "local", Node: d.state.Node, Endpoint: "unix:/kitty", Status: AttachmentReady,
 			Views: readyView(pane.ID, 7),
 		}
 		if err := d.store.Save(d.state); err != nil {
@@ -240,7 +240,7 @@ func TestRemoteMirrorUsesKittyNotificationButNeverDuplicatesNtfy(t *testing.T) {
 	actual.Panes[pane.ID].State = StateBlocked
 	actual.Panes[pane.ID].LastTurnID = "remote-turn"
 	actual.Attachments["local"] = &Attachment{
-		ID: "local", Endpoint: "unix:/kitty", Status: AttachmentReady,
+		ID: "local", Node: d.state.Node, Endpoint: "unix:/kitty", Status: AttachmentReady,
 		Views: readyView(pane.ID, 7),
 	}
 	actual.Attachments["local"].Views[pane.ID] = RuntimeView{PaneID: pane.ID, WindowID: 7, Ready: true, Focused: false}

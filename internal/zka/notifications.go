@@ -51,14 +51,14 @@ func (d *Daemon) afterTransition(ctx context.Context, before AgentState, workspa
 			return
 		}
 	}
-	d.updateKittyState(ctx, workspace)
+	d.updateKittyState(ctx, workspace, paneID)
 	_, focused := attentionPaneView(workspace, paneID)
 	if !d.attentionStateEnabled(pane.State) || (pane.State == StateDone && focused) {
 		d.closeDesktopNotifications(ctx, workspace, paneID)
 		return
 	}
 	if d.config.Notifications.DesktopEnabled {
-		if attachment, view := firstUnfocusedView(workspace, paneID); attachment != nil {
+		if attachment, view := d.firstUnfocusedView(workspace, paneID); attachment != nil {
 			d.sendDesktop(ctx, attachment, view, workspace, pane)
 		}
 	}
@@ -70,18 +70,22 @@ func (d *Daemon) afterTransition(ctx context.Context, before AgentState, workspa
 }
 
 func (d *Daemon) afterRemoteTransition(ctx context.Context, workspace *Workspace, paneID string) {
+	d.updateKittyState(ctx, workspace, paneID)
+	d.afterRemoteTransitionNotification(ctx, workspace, paneID)
+}
+
+func (d *Daemon) afterRemoteTransitionNotification(ctx context.Context, workspace *Workspace, paneID string) {
 	pane := workspace.Panes[paneID]
 	if pane == nil {
 		return
 	}
-	d.updateKittyState(ctx, workspace)
 	_, focused := attentionPaneView(workspace, paneID)
 	if !d.attentionStateEnabled(pane.State) || (pane.State == StateDone && focused) {
 		d.closeDesktopNotifications(ctx, workspace, paneID)
 		return
 	}
 	if d.config.Notifications.DesktopEnabled {
-		if attachment, view := firstUnfocusedView(workspace, paneID); attachment != nil {
+		if attachment, view := d.firstUnfocusedView(workspace, paneID); attachment != nil {
 			d.sendDesktop(ctx, attachment, view, workspace, pane)
 		}
 	}
@@ -110,7 +114,7 @@ func (d *Daemon) resumeAttentionNotifications(ctx context.Context) {
 			continue
 		}
 		if d.config.Notifications.DesktopEnabled {
-			if attachment, view := firstUnfocusedView(workspace, pane.ID); attachment != nil {
+			if attachment, view := d.firstUnfocusedView(workspace, pane.ID); attachment != nil {
 				d.sendDesktop(ctx, attachment, view, workspace, pane)
 			}
 		}
@@ -136,9 +140,28 @@ func paneAttached(workspace *Workspace, paneID string) bool {
 	return false
 }
 
-func firstUnfocusedView(workspace *Workspace, paneID string) (*Attachment, RuntimeView) {
+func isLocalUnixAttachment(attachment *Attachment, nodeID string) bool {
+	return attachment != nil &&
+		attachment.Node.ID == nodeID &&
+		strings.HasPrefix(attachment.Endpoint, "unix:")
+}
+
+func isReadyLocalKittyAttachment(attachment *Attachment, nodeID string) bool {
+	return isLocalUnixAttachment(attachment, nodeID) &&
+		attachment.Status == AttachmentReady &&
+		!attachment.Revoked
+}
+
+func (d *Daemon) localNodeID() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.state.Node.ID
+}
+
+func (d *Daemon) firstUnfocusedView(workspace *Workspace, paneID string) (*Attachment, RuntimeView) {
+	localNodeID := d.localNodeID()
 	for _, attachment := range workspace.SortedAttachments() {
-		if !strings.HasPrefix(attachment.Endpoint, "unix:") || attachment.Status == AttachmentDetached {
+		if !isReadyLocalKittyAttachment(attachment, localNodeID) {
 			continue
 		}
 		if view, ok := attachment.Views[paneID]; ok && view.Ready && !view.Focused {
@@ -148,16 +171,29 @@ func firstUnfocusedView(workspace *Workspace, paneID string) (*Attachment, Runti
 	return nil, RuntimeView{}
 }
 
-func (d *Daemon) updateKittyState(ctx context.Context, workspace *Workspace) {
+func (d *Daemon) updateKittyState(ctx context.Context, workspace *Workspace, paneIDs ...string) {
+	localNodeID := d.localNodeID()
+	var selected map[string]bool
+	if len(paneIDs) != 0 {
+		selected = make(map[string]bool, len(paneIDs))
+		for _, paneID := range paneIDs {
+			selected[paneID] = true
+		}
+	}
 	for _, attachment := range workspace.SortedAttachments() {
-		if !strings.HasPrefix(attachment.Endpoint, "unix:") || attachment.Status == AttachmentDetached {
+		if !isReadyLocalKittyAttachment(attachment, localNodeID) {
 			continue
 		}
+		updated := false
 		for paneID, view := range attachment.Views {
+			if selected != nil && !selected[paneID] {
+				continue
+			}
 			pane := workspace.Panes[paneID]
 			if pane == nil || !view.Ready {
 				continue
 			}
+			updated = true
 			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			err := d.kitty.SetPaneState(callCtx, attachment.Endpoint, view, workspace, pane)
 			cancel()
@@ -165,7 +201,9 @@ func (d *Daemon) updateKittyState(ctx context.Context, workspace *Workspace) {
 				d.logger.Printf("update kitty state workspace=%s pane=%s: %v", workspace.ID, paneID, err)
 			}
 		}
-		d.updateKittyTabTitles(ctx, attachment.Endpoint, workspace)
+		if updated {
+			d.updateKittyTabTitles(ctx, attachment.Endpoint, workspace)
+		}
 	}
 }
 
@@ -264,8 +302,11 @@ func (d *Daemon) sendDesktop(ctx context.Context, attachment *Attachment, view R
 }
 
 func (d *Daemon) closeDesktopNotifications(ctx context.Context, workspace *Workspace, paneRef string) {
+	localNodeID := d.localNodeID()
 	for _, attachment := range workspace.Attachments {
-		if !strings.HasPrefix(attachment.Endpoint, "unix:") {
+		if !isLocalUnixAttachment(attachment, localNodeID) ||
+			attachment.Status == AttachmentDetached ||
+			attachment.Revoked {
 			continue
 		}
 		for paneID := range workspace.Panes {

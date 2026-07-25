@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -651,12 +652,15 @@ func streamRemoteEvents(ctx context.Context, api API, writer *remoteControlWrite
 				if writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "event", Op: "snapshot", Payload: payload}) != nil {
 					return
 				}
+				for _, workspace := range workspaces {
+					seen[workspace.ID] = remoteWorkspaceFingerprint(workspace)
+				}
 				first = false
 			}
 			current := map[string]bool{}
 			for _, workspace := range workspaces {
 				current[workspace.ID] = true
-				fingerprint := fmt.Sprintf("%d:%s:%s", workspace.Revision, workspace.UpdatedAt.Format(time.RFC3339Nano), workspace.Attention)
+				fingerprint := remoteWorkspaceFingerprint(workspace)
 				if seen[workspace.ID] == fingerprint {
 					continue
 				}
@@ -683,6 +687,10 @@ func streamRemoteEvents(ctx context.Context, api API, writer *remoteControlWrite
 		case <-ticker.C:
 		}
 	}
+}
+
+func remoteWorkspaceFingerprint(workspace *Workspace) string {
+	return fmt.Sprintf("%d:%s:%s", workspace.Revision, workspace.UpdatedAt.Format(time.RFC3339Nano), workspace.Attention)
 }
 
 func dispatchRemoteControl(ctx context.Context, api API, op string, raw json.RawMessage) (json.RawMessage, error) {
@@ -997,7 +1005,8 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 	clone := remote.Clone()
 	clone.RemoteHost = host
 	normalizeWorkspace(clone)
-	var changedPanes []string
+	var changedKittyPanes []string
+	var transitionedPanes []string
 	var pendingDetaches []string
 	var revokedEndpoints []string
 	var deletingEndpoints []string
@@ -1018,12 +1027,15 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 					}
 				}
 				if previous.State != pane.State {
-					changedPanes = append(changedPanes, paneID)
+					transitionedPanes = append(transitionedPanes, paneID)
+					changedKittyPanes = append(changedKittyPanes, paneID)
+				} else if previous.Title != pane.Title {
+					changedKittyPanes = append(changedKittyPanes, paneID)
 				}
 			}
 		}
 		for id, localAttachment := range existing.Attachments {
-			if !strings.HasPrefix(localAttachment.Endpoint, "unix:") {
+			if !isLocalUnixAttachment(localAttachment, d.state.Node.ID) {
 				continue
 			}
 			if authoritative := clone.Attachments[id]; authoritative != nil {
@@ -1074,12 +1086,17 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 	result := clone.Clone()
 	d.mu.Unlock()
 	if existing != nil {
-		if len(changedPanes) == 0 {
-			d.startWorker(func(ctx context.Context) { d.updateKittyState(ctx, result) })
-		}
-		for _, paneID := range changedPanes {
-			paneID := paneID
-			d.startWorker(func(ctx context.Context) { d.afterRemoteTransition(ctx, result, paneID) })
+		sort.Strings(changedKittyPanes)
+		sort.Strings(transitionedPanes)
+		if len(changedKittyPanes) != 0 || len(transitionedPanes) != 0 {
+			d.startWorker(func(ctx context.Context) {
+				if len(changedKittyPanes) != 0 {
+					d.updateKittyState(ctx, result, changedKittyPanes...)
+				}
+				for _, paneID := range transitionedPanes {
+					d.afterRemoteTransitionNotification(ctx, result, paneID)
+				}
+			})
 		}
 		for _, attachmentID := range pendingDetaches {
 			attachmentID := attachmentID

@@ -169,7 +169,9 @@ func (d *Daemon) endpointAttachment(endpoint string) (*Workspace, *Attachment) {
 			continue
 		}
 		for _, attachment := range workspace.Attachments {
-			if attachment.Endpoint == endpoint && attachment.Status != AttachmentDetached {
+			if attachment.Node.ID == d.state.Node.ID &&
+				attachment.Endpoint == endpoint &&
+				attachment.Status != AttachmentDetached {
 				return workspace.Clone(), attachment.Clone()
 			}
 		}
