@@ -101,6 +101,14 @@ func (a API) ReconcileBackends(ctx context.Context, workspace string) (backendRe
 	return out, err
 }
 
+func (a API) ReconcileTopology(ctx context.Context, workspace, attachment string) (*Workspace, error) {
+	var out Workspace
+	client := a.client
+	client.Timeout = 45 * time.Second
+	err := client.Call(ctx, "reconcile_topology", topologyReconcileRequest{Workspace: workspace, Attachment: attachment}, &out)
+	return &out, err
+}
+
 func (a API) RegisterAttachment(ctx context.Context, workspace string, attachment Attachment) (*Attachment, error) {
 	var out Attachment
 	err := a.client.Call(ctx, "register_attachment", attachmentRequest{Workspace: workspace, Attachment: attachment}, &out)

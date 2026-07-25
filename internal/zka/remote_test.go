@@ -203,7 +203,8 @@ func TestRemoteCachePreservesLocalRuntimeMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	local := cached.Attachments["local"]
-	if local.Endpoint != "unix:/kitty" || local.Views["pane"].WindowID != 9 || local.Role != AttachmentPrimary || local.AppliedRevision != 5 {
+	if local.Endpoint != "unix:/kitty" || local.Views["pane"].WindowID != 9 || local.Role != AttachmentPrimary ||
+		local.AppliedRevision != 0 || local.AppliedTopologyGeneration != 0 {
 		t.Fatalf("local attachment = %#v", local)
 	}
 }

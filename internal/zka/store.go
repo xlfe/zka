@@ -40,8 +40,8 @@ func (s *Store) Ensure() error {
 // Load intentionally treats the pre-v3 schemas as empty state. v3 changes
 // process ownership: Kitty view closure now removes its zmx backend. Migrating
 // the old records would make that ownership ambiguous, so only zka's generated
-// files are reset. v3 itself migrates to v4 with panes marked as legacy relay
-// clients. Existing zmx processes are deliberately left untouched.
+// files are reset. v3/v4 migrate to v5. Existing zmx processes are deliberately
+// left untouched, and v4 receives a one-time rollback backup before migration.
 func (s *Store) Load() (StateData, error) {
 	if err := s.Ensure(); err != nil {
 		return StateData{}, err
@@ -71,8 +71,13 @@ func (s *Store) Load() (StateData, error) {
 		}
 		return newStateData(), nil
 	}
-	if header.SchemaVersion != 3 && header.SchemaVersion != stateSchemaVersion {
+	if header.SchemaVersion != 3 && header.SchemaVersion != 4 && header.SchemaVersion != stateSchemaVersion {
 		return StateData{}, fmt.Errorf("unsupported state schema %d (want %d)", header.SchemaVersion, stateSchemaVersion)
+	}
+	if header.SchemaVersion == 4 {
+		if err := s.writeMigrationBackup(b, 4); err != nil {
+			return StateData{}, err
+		}
 	}
 	var state StateData
 	if err := json.Unmarshal(b, &state); err != nil {
@@ -86,12 +91,72 @@ func (s *Store) Load() (StateData, error) {
 	}
 	for _, workspace := range state.Workspaces {
 		normalizeWorkspace(workspace)
+		if header.SchemaVersion != stateSchemaVersion {
+			applyManifestLaunchOptions(workspace, workspace.Manifest.Session)
+			// Pre-v5 layout_state contains attachment-local Kitty IDs and
+			// cannot be made replica-safe without the original runtime tree.
+			clearTopologyLayoutState(workspace.Manifest.Topology)
+			clearTopologyLayoutState(workspace.Topology.Roots)
+		}
+		topologyRecovered, recoverErr := recoverMissingTopologyPanes(workspace)
+		if recoverErr != nil {
+			return StateData{}, fmt.Errorf("migrate workspace %s topology: %w", workspace.ID, recoverErr)
+		}
+		if header.SchemaVersion != stateSchemaVersion || topologyRecovered {
+			for _, attachment := range workspace.Attachments {
+				attachment.AppliedTopologyGeneration = 0
+				attachment.AppliedTopologyDigest = ""
+				attachment.ObservedTopology = nil
+				attachment.ReconcileTargetGeneration = workspace.Topology.Generation
+				attachment.ReconcileStatus = "pending"
+			}
+		}
 	}
 	// v3 panes predate the stable agent relay. Leaving their zero relay
 	// version intact lets the CLI identify the exact backends that must be
 	// recreated before a forwarded agent can be claimed safely.
 	state.SchemaVersion = stateSchemaVersion
 	return state, nil
+}
+
+func (s *Store) writeMigrationBackup(data []byte, version int) error {
+	path := fmt.Sprintf("%s.v%d.backup", s.paths.StateFile, version)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("create state migration backup: %w", err)
+	}
+	ok := false
+	defer func() {
+		_ = file.Close()
+		if !ok {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf("write state migration backup: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync state migration backup: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close state migration backup: %w", err)
+	}
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	ok = true
+	return nil
+}
+
+func clearTopologyLayoutState(nodes []Node) {
+	for index := range nodes {
+		nodes[index].LayoutState = nil
+		clearTopologyLayoutState(nodes[index].Children)
+	}
 }
 
 func normalizeWorkspace(workspace *Workspace) {
@@ -112,6 +177,15 @@ func normalizeWorkspace(workspace *Workspace) {
 		}
 		if attachment.ClientHeartbeats == nil {
 			attachment.ClientHeartbeats = map[string]time.Time{}
+		}
+	}
+	if len(workspace.Topology.Roots) != 0 {
+		workspace.Topology.Roots = canonicalTopology(workspace.Topology.Roots)
+		if workspace.Topology.Digest == "" {
+			workspace.Topology.Digest = topologyDigest(workspace.Topology.Roots)
+		}
+		if workspace.Topology.Generation == 0 {
+			workspace.Topology.Generation = 1
 		}
 	}
 	workspace.RecomputeAttention()

@@ -78,7 +78,7 @@ func (c Client) Call(ctx context.Context, op string, payload, out any) error {
 		return fmt.Errorf("read response: %w", err)
 	}
 	if res.Version != protocolVersion {
-		return fmt.Errorf("unsupported daemon protocol %d", res.Version)
+		return fmt.Errorf("unsupported daemon protocol %d (client requires %d; upgrade and restart zka on this machine)", res.Version, protocolVersion)
 	}
 	if !res.OK {
 		return errors.New(res.Error)

@@ -48,7 +48,7 @@ func (d *Daemon) watcherReadLoop(ctx context.Context) {
 
 func (d *Daemon) topologyLoop(ctx context.Context) {
 	check := time.NewTicker(50 * time.Millisecond)
-	fallback := time.NewTicker(2 * time.Second)
+	fallback := time.NewTicker(30 * time.Second)
 	defer check.Stop()
 	defer fallback.Stop()
 	pending := map[string]debounceEntry{}
@@ -58,6 +58,9 @@ func (d *Daemon) topologyLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case event := <-d.events:
+			if d.topologyCaptureSuppressed(event.Endpoint) {
+				continue
+			}
 			if event.Kind == "quit" {
 				if event.Confirmed && !event.Aborted {
 					delete(pending, event.Endpoint)
@@ -115,7 +118,11 @@ func (d *Daemon) topologyLoop(ctx context.Context) {
 		case <-fallback.C:
 			for _, endpoint := range d.attachmentEndpoints() {
 				if _, queued := pending[endpoint]; !queued {
-					d.scheduleCapture(endpoint)
+					if d.endpointNeedsTopologyReconcile(endpoint) {
+						d.scheduleTopologyReconcile(endpoint)
+					} else {
+						d.scheduleCapture(endpoint)
+					}
 				}
 			}
 		}
@@ -123,15 +130,28 @@ func (d *Daemon) topologyLoop(ctx context.Context) {
 }
 
 func (d *Daemon) scheduleCapture(endpoint string) {
+	if d.topologyCaptureSuppressed(endpoint) {
+		return
+	}
 	d.captureMu.Lock()
 	if d.capturing[endpoint] {
+		d.captureAgain[endpoint] = true
 		d.captureMu.Unlock()
 		return
 	}
 	d.capturing[endpoint] = true
 	d.captureMu.Unlock()
 	d.startWorker(func(ctx context.Context) {
-		defer func() { d.captureMu.Lock(); delete(d.capturing, endpoint); d.captureMu.Unlock() }()
+		defer func() {
+			d.captureMu.Lock()
+			again := d.captureAgain[endpoint]
+			delete(d.captureAgain, endpoint)
+			delete(d.capturing, endpoint)
+			d.captureMu.Unlock()
+			if again && ctx.Err() == nil {
+				d.scheduleCapture(endpoint)
+			}
+		}()
 		d.captureEndpoint(ctx, endpoint)
 	})
 }
@@ -182,6 +202,14 @@ func (d *Daemon) endpointAttachment(endpoint string) (*Workspace, *Attachment) {
 func (d *Daemon) captureEndpoint(ctx context.Context, endpoint string) {
 	workspace, attachment := d.endpointAttachment(endpoint)
 	if workspace == nil || attachment == nil {
+		return
+	}
+	if len(workspace.Topology.Roots) != 0 &&
+		(attachment.AppliedTopologyGeneration != workspace.Topology.Generation ||
+			attachment.AppliedTopologyDigest != workspace.Topology.Digest ||
+			attachment.ReconcileStatus == "pending" ||
+			attachment.ReconcileStatus == "error") {
+		d.scheduleTopologyReconcile(endpoint)
 		return
 	}
 	if attachment.Revoked {
@@ -273,38 +301,26 @@ func (d *Daemon) captureEndpoint(ctx context.Context, endpoint string) {
 		}
 		return
 	}
-	if workspace.RemoteHost != "" && attachment.Role == AttachmentPrimary && workspace.PrimaryAttachmentID == attachment.ID {
+	if workspace.RemoteHost != "" {
 		remoteCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		_, err = d.remotes.Call(remoteCtx, workspace.RemoteHost, "update_manifest", manifestUpdateRequest{
 			Workspace: workspace.ID, Attachment: attachment.ID,
-			ExpectedRevision: workspace.Revision, Manifest: manifest, Views: views,
+			ExpectedRevision: workspace.Revision, BaseTopologyGeneration: workspace.Topology.Generation,
+			Manifest: manifest, Views: views,
 		})
 		cancel()
-	} else if attachment.Role == AttachmentPrimary && workspace.PrimaryAttachmentID == attachment.ID {
+	} else {
 		_, err = d.updateManifest(manifestUpdateRequest{
 			Workspace: workspace.ID, Attachment: attachment.ID,
-			ExpectedRevision: workspace.Revision, Manifest: manifest, Views: views,
+			ExpectedRevision: workspace.Revision, BaseTopologyGeneration: workspace.Topology.Generation,
+			Manifest: manifest, Views: views,
 		})
-	} else {
-		_, err = d.updateAttachment(attachmentUpdateRequest{
-			Workspace: workspace.ID, Attachment: attachment.ID,
-			ExpectedRevision: workspace.Revision, Status: AttachmentReady, Views: views,
-		})
-		if workspace.RemoteHost != "" {
-			remoteCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			if err == nil {
-				_, err = d.remotes.Call(remoteCtx, workspace.RemoteHost, "update_attachment", attachmentUpdateRequest{
-					Workspace: workspace.ID, Attachment: attachment.ID,
-					ExpectedRevision: workspace.Revision, Status: AttachmentReady, Views: views,
-				})
-			} else {
-				_, _ = d.remotes.Call(remoteCtx, workspace.RemoteHost, "update_attachment", attachmentUpdateRequest{
-					Workspace: workspace.ID, Attachment: attachment.ID,
-					ExpectedRevision: workspace.Revision, Status: AttachmentUnhealthy, Views: views, Error: err.Error(),
-				})
-			}
-			cancel()
-		}
+	}
+	if err != nil && (strings.Contains(err.Error(), "topology generation changed") ||
+		strings.Contains(err.Error(), "topology pane set") ||
+		strings.Contains(err.Error(), "differs from origin generation")) {
+		d.scheduleTopologyReconcile(endpoint)
+		return
 	}
 	if err != nil && !strings.Contains(err.Error(), "revision changed") {
 		d.markAttachmentUnhealthy(workspace.ID, attachment.ID, err)

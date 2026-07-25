@@ -177,7 +177,10 @@ func (d *Daemon) beginPaneClosure(req closePanesRequest) (*Workspace, bool, erro
 	if attachment.Transport.Kind == "ssh" {
 		preserveOriginPaneCWD(workspace, req.Manifest.Topology)
 	}
-	applyManifestPaneMetadata(workspace, req.Manifest.Topology, attachment.Transport.Kind != "ssh")
+	stableTopology, err := stabilizeTopologyIDs(workspace.ID, workspace.Topology.Roots, req.Manifest.Topology)
+	if err != nil {
+		return nil, false, err
+	}
 	for paneID := range requested {
 		pane := workspace.Panes[paneID]
 		pane.Visible = false
@@ -185,17 +188,54 @@ func (d *Daemon) beginPaneClosure(req closePanesRequest) (*Workspace, bool, erro
 		pane.RemovalError = ""
 		pane.UpdatedAt = now
 	}
+	topologyChanged, err := installDesiredTopology(workspace, stableTopology)
+	if err != nil {
+		d.state.Workspaces[workspace.ID] = before
+		return nil, false, err
+	}
+	if !topologyChanged {
+		d.state.Workspaces[workspace.ID] = before
+		return nil, false, fmt.Errorf("pane closure did not change canonical topology")
+	}
+	applyCapturedPaneMetadata(workspace, workspace.Topology.Roots, attachment.Transport.Kind != "ssh")
 	req.Manifest.CapturedAt = now
+	req.Manifest.Topology = cloneNodes(workspace.Topology.Roots)
+	applyManifestLaunchOptions(workspace, req.Manifest.Session)
+	req.Manifest.Session, err = renderDesiredTopologySession(workspace, Transport{Kind: "local"}, "")
+	if err != nil {
+		d.state.Workspaces[workspace.ID] = before
+		return nil, false, err
+	}
 	workspace.Manifest = req.Manifest
 	workspace.Revision++
 	workspace.UpdatedAt = now
 	attachment.Views = cloneViews(req.Views)
 	attachment.AppliedRevision = workspace.Revision
+	attachment.AppliedTopologyGeneration = workspace.Topology.Generation
+	attachment.AppliedTopologyDigest = workspace.Topology.Digest
+	attachment.ObservedTopology = topologyIdentity(workspace.Topology.Roots)
+	attachment.ReconcileTargetGeneration = workspace.Topology.Generation
+	attachment.ReconcileStatus = "ready"
 	attachment.LastError = ""
 	attachment.UpdatedAt = now
+	annotateRuntimeViews(attachment.ObservedTopology, attachment.Views)
+	for id, other := range workspace.Attachments {
+		if id == attachment.ID || other.Status == AttachmentDetached || other.Revoked {
+			continue
+		}
+		other.ReconcileTargetGeneration = workspace.Topology.Generation
+		other.ReconcileStatus = "pending"
+	}
 	if err := d.store.Save(d.state); err != nil {
 		d.state.Workspaces[workspace.ID] = before
 		return nil, false, err
+	}
+	for id, other := range workspace.Attachments {
+		if id == attachment.ID || !isLocalUnixAttachment(other, d.state.Node.ID) ||
+			other.Status == AttachmentDetached || other.Revoked {
+			continue
+		}
+		d.scheduleTopologyReconcile(other.Endpoint)
 	}
 	return workspace.Clone(), true, nil
 }
@@ -490,6 +530,7 @@ func (d *Daemon) reconcileBackends(ctx context.Context, workspaceRef string) (ba
 
 	response := backendReconcileResponse{}
 	var deleteIDs []string
+	var topologyEndpoints []string
 	changed := false
 	changedBefore := map[string]*Workspace{}
 	now := time.Now().UTC()
@@ -499,10 +540,55 @@ func (d *Daemon) reconcileBackends(ctx context.Context, workspaceRef string) (ba
 		}
 		pending, live, established, removalPending := false, false, false, false
 		workspaceChanged := false
-		for _, pane := range workspace.Panes {
+		for paneID, pane := range workspace.Panes {
 			if pane.RemovalPending {
 				removalPending = true
 				continue
+			}
+			if pane.TopologyPending {
+				startedAt := pane.TopologyPendingAt
+				if startedAt.IsZero() {
+					startedAt = pane.UpdatedAt
+				}
+				if active[pane.Backend.Ref] {
+					if !workspaceChanged {
+						changedBefore[workspace.ID] = workspace.Clone()
+					}
+					if _, topologyErr := appendRecoveredPane(workspace, pane); topologyErr != nil {
+						d.mu.Unlock()
+						return backendReconcileResponse{}, topologyErr
+					}
+					pane.Visible = true
+					pane.UpdatedAt = now
+					workspace.Revision++
+					for _, attachment := range workspace.Attachments {
+						if attachment.Status == AttachmentDetached || attachment.Revoked {
+							continue
+						}
+						attachment.ReconcileTargetGeneration = workspace.Topology.Generation
+						attachment.ReconcileStatus = "pending"
+						if isLocalUnixAttachment(attachment, d.state.Node.ID) {
+							topologyEndpoints = append(topologyEndpoints, attachment.Endpoint)
+						}
+					}
+					response.Recovered = append(response.Recovered, pane.ID)
+					workspaceChanged = true
+				} else if !startedAt.IsZero() && now.Sub(startedAt) >= backendStartupGrace {
+					if !workspaceChanged {
+						changedBefore[workspace.ID] = workspace.Clone()
+					}
+					delete(workspace.Panes, paneID)
+					for _, attachment := range workspace.Attachments {
+						delete(attachment.Views, paneID)
+						delete(attachment.ClientHeartbeats, paneID)
+					}
+					workspace.Revision++
+					workspaceChanged = true
+					continue
+				} else {
+					pending = true
+					continue
+				}
 			}
 			if !pane.BackendCreated && !pane.BackendDead {
 				startedAt := pane.UpdatedAt
@@ -581,6 +667,9 @@ func (d *Daemon) reconcileBackends(ctx context.Context, workspaceRef string) (ba
 		}
 	}
 	d.mu.Unlock()
+	for _, endpoint := range sortedEndpointSet(topologyEndpoints) {
+		d.scheduleTopologyReconcile(endpoint)
+	}
 
 	for _, workspaceID := range deleteIDs {
 		if _, err := d.killWorkspace(ctx, workspaceID); err != nil {

@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	stateSchemaVersion = 4
-	protocolVersion    = 5
+	stateSchemaVersion = 5
+	protocolVersion    = 6
 	remoteProtocolName = "zka.workspace"
 	remoteProtocolMax  = 1 << 20
 )
@@ -51,6 +51,15 @@ const (
 	AttachmentReady     AttachmentStatus = "ready"
 	AttachmentUnhealthy AttachmentStatus = "unhealthy"
 	AttachmentDetached  AttachmentStatus = "detached"
+)
+
+type TopologyReconcileStatus string
+
+const (
+	TopologyReconcilePending  TopologyReconcileStatus = "pending"
+	TopologyReconcileApplying TopologyReconcileStatus = "applying"
+	TopologyReconcileReady    TopologyReconcileStatus = "ready"
+	TopologyReconcileError    TopologyReconcileStatus = "error"
 )
 
 type Transport struct {
@@ -102,6 +111,7 @@ type Pane struct {
 	Backend           BackendRef                    `json:"backend"`
 	CWD               string                        `json:"cwd,omitempty"`
 	Title             string                        `json:"title,omitempty"`
+	LaunchOptions     []string                      `json:"launch_options,omitempty"`
 	Visible           bool                          `json:"visible"`
 	Agent             string                        `json:"agent,omitempty"`
 	State             AgentState                    `json:"state"`
@@ -118,6 +128,8 @@ type Pane struct {
 	BackendError      string                        `json:"backend_error,omitempty"`
 	RemovalPending    bool                          `json:"removal_pending,omitempty"`
 	RemovalError      string                        `json:"removal_error,omitempty"`
+	TopologyPending   bool                          `json:"topology_pending,omitempty"`
+	TopologyPendingAt time.Time                     `json:"topology_pending_at,omitempty"`
 	CreatedAt         time.Time                     `json:"created_at"`
 	UpdatedAt         time.Time                     `json:"updated_at"`
 }
@@ -132,6 +144,7 @@ func (p *Pane) Clone() *Pane {
 // Node is a logical Kitty topology node. It intentionally has no Kitty
 // runtime IDs; those belong to Attachment.Views.
 type Node struct {
+	ID             string          `json:"id,omitempty"`
 	Kind           string          `json:"kind"` // os-window, tab, or pane
 	PaneID         string          `json:"pane_id,omitempty"`
 	Title          string          `json:"title,omitempty"`
@@ -147,6 +160,14 @@ type Node struct {
 	Children       []Node          `json:"children,omitempty"`
 }
 
+// DesiredTopology is the origin-owned logical Kitty tree. Runtime Kitty IDs,
+// focus, and viewport state are deliberately excluded from its identity.
+type DesiredTopology struct {
+	Generation uint64 `json:"generation"`
+	Digest     string `json:"digest"`
+	Roots      []Node `json:"roots"`
+}
+
 type Manifest struct {
 	KittyVersion string    `json:"kitty_version,omitempty"`
 	CapturedAt   time.Time `json:"captured_at,omitempty"`
@@ -155,31 +176,38 @@ type Manifest struct {
 }
 
 type RuntimeView struct {
-	PaneID     string    `json:"pane_id"`
-	WindowID   int64     `json:"window_id"`
-	TabID      int64     `json:"tab_id,omitempty"`
-	OSWindowID int64     `json:"os_window_id,omitempty"`
-	Focused    bool      `json:"focused"`
-	Ready      bool      `json:"ready"`
-	LastSeen   time.Time `json:"last_seen"`
+	PaneID         string    `json:"pane_id"`
+	WindowID       int64     `json:"window_id"`
+	TabID          int64     `json:"tab_id,omitempty"`
+	OSWindowID     int64     `json:"os_window_id,omitempty"`
+	TabNodeID      string    `json:"tab_node_id,omitempty"`
+	OSWindowNodeID string    `json:"os_window_node_id,omitempty"`
+	Focused        bool      `json:"focused"`
+	Ready          bool      `json:"ready"`
+	LastSeen       time.Time `json:"last_seen"`
 }
 
 type Attachment struct {
-	ID               string                 `json:"id"`
-	Node             Host                   `json:"node"`
-	Transport        Transport              `json:"transport"`
-	Role             AttachmentRole         `json:"role"`
-	Status           AttachmentStatus       `json:"status"`
-	Endpoint         string                 `json:"endpoint,omitempty"`
-	PID              int                    `json:"pid,omitempty"`
-	AppliedRevision  uint64                 `json:"applied_revision"`
-	Views            map[string]RuntimeView `json:"views,omitempty"`
-	ClientHeartbeats map[string]time.Time   `json:"client_heartbeats,omitempty"`
-	LastError        string                 `json:"last_error,omitempty"`
-	CreatedAt        time.Time              `json:"created_at"`
-	UpdatedAt        time.Time              `json:"updated_at"`
-	Revoked          bool                   `json:"revoked,omitempty"`
-	RevocationClosed bool                   `json:"revocation_closed,omitempty"`
+	ID                        string                  `json:"id"`
+	Node                      Host                    `json:"node"`
+	Transport                 Transport               `json:"transport"`
+	Role                      AttachmentRole          `json:"role"`
+	Status                    AttachmentStatus        `json:"status"`
+	Endpoint                  string                  `json:"endpoint,omitempty"`
+	PID                       int                     `json:"pid,omitempty"`
+	AppliedRevision           uint64                  `json:"applied_revision"`
+	AppliedTopologyGeneration uint64                  `json:"applied_topology_generation,omitempty"`
+	AppliedTopologyDigest     string                  `json:"applied_topology_digest,omitempty"`
+	ObservedTopology          []Node                  `json:"observed_topology,omitempty"`
+	ReconcileTargetGeneration uint64                  `json:"reconcile_target_generation,omitempty"`
+	ReconcileStatus           TopologyReconcileStatus `json:"reconcile_status,omitempty"`
+	Views                     map[string]RuntimeView  `json:"views,omitempty"`
+	ClientHeartbeats          map[string]time.Time    `json:"client_heartbeats,omitempty"`
+	LastError                 string                  `json:"last_error,omitempty"`
+	CreatedAt                 time.Time               `json:"created_at"`
+	UpdatedAt                 time.Time               `json:"updated_at"`
+	Revoked                   bool                    `json:"revoked,omitempty"`
+	RevocationClosed          bool                    `json:"revocation_closed,omitempty"`
 }
 
 func (a *Attachment) Clone() *Attachment {
@@ -206,12 +234,14 @@ type Workspace struct {
 	Revision            uint64                 `json:"revision"`
 	Shell               []string               `json:"shell"`
 	Panes               map[string]*Pane       `json:"panes"`
+	Topology            DesiredTopology        `json:"topology"`
 	Manifest            Manifest               `json:"manifest"`
 	Attachments         map[string]*Attachment `json:"attachments"`
 	PrimaryAttachmentID string                 `json:"primary_attachment_id,omitempty"`
 	AgentAttachmentID   string                 `json:"agent_attachment_id,omitempty"`
 	PendingRevocations  []string               `json:"pending_revocations,omitempty"`
 	Attention           AgentState             `json:"attention"`
+	RestoreFocusPaneID  string                 `json:"restore_focus_pane_id,omitempty"`
 	DeletionPending     bool                   `json:"deletion_pending,omitempty"`
 	DeletionError       string                 `json:"deletion_error,omitempty"`
 	CreatedAt           time.Time              `json:"created_at"`

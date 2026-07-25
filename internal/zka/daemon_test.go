@@ -373,7 +373,11 @@ func TestTwoPhaseMoveCommitsOnlyReadyDestination(t *testing.T) {
 	if _, err := d.commitMove(moveCommitRequest{Workspace: workspace.ID, Destination: destination.ID, ExpectedRevision: before}); err == nil {
 		t.Fatal("unready destination committed")
 	}
-	workspace, err = d.updateAttachment(attachmentUpdateRequest{Workspace: workspace.ID, Attachment: destination.ID, ExpectedRevision: before, Status: AttachmentReady, Views: readyView(pane.ID, 2)})
+	workspace, err = d.updateAttachment(attachmentUpdateRequest{
+		Workspace: workspace.ID, Attachment: destination.ID, ExpectedRevision: before,
+		TopologyGeneration: workspace.Topology.Generation, TopologyDigest: workspace.Topology.Digest,
+		ObservedTopology: workspace.Topology.Roots, Status: AttachmentReady, Views: readyView(pane.ID, 2),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

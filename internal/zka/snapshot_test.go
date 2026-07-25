@@ -2,6 +2,7 @@ package zka
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -168,6 +169,48 @@ func TestCaptureManifestRequiresEveryDedicatedKittyWindowTagged(t *testing.T) {
 	}
 	if _, _, err := CaptureManifest(context.Background(), KittyClient{Runner: runner}, "unix:/kitty", workspace); err == nil || !strings.Contains(err.Error(), "untagged") {
 		t.Fatalf("untagged error = %v", err)
+	}
+}
+
+func TestRenderAttachmentSessionUsesDesiredTopologyAndStableContainerIDs(t *testing.T) {
+	workspace := templateWorkspace()
+	pane := firstPane(workspace)
+	for paneID := range workspace.Panes {
+		if paneID != pane.ID {
+			delete(workspace.Panes, paneID)
+		}
+	}
+	workspace.Manifest.Session = "new_tab stale\nlaunch --var zka_workspace=workspace --var zka_pane=" + pane.ID + "\n"
+	workspace.Topology = DesiredTopology{
+		Generation: 4,
+		Roots: []Node{{
+			ID: "os-node", Kind: "os-window",
+			Children: []Node{{
+				ID: "tab-node", Kind: "tab", Title: "Canonical", Layout: "splits",
+				LayoutState: json.RawMessage(`{"all_windows":{"active_group_history":[],"active_group_idx":0,"window_groups":[{"id":1,"window_ids":[1]}]},"class":"Splits","pairs":{"one":1}}`),
+				Children:    []Node{{ID: pane.ID, Kind: "pane", PaneID: pane.ID}},
+			}},
+		}},
+	}
+	workspace.Topology.Digest = topologyDigest(workspace.Topology.Roots)
+	session, err := RenderAttachmentSession(workspace, Transport{Kind: "ssh", Host: "origin.example"}, "attachment")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"new_tab Canonical",
+		"layout splits",
+		"zka_os_window=os-node",
+		"zka_tab=tab-node",
+		"zka remote-pane --origin origin.example",
+		`kitty-unserialize-data={\"id\":1}`,
+	} {
+		if !strings.Contains(session, required) {
+			t.Fatalf("rendered session does not contain %q:\n%s", required, session)
+		}
+	}
+	if strings.Contains(session, "new_tab stale") {
+		t.Fatalf("legacy manifest remained a topology source:\n%s", session)
 	}
 }
 

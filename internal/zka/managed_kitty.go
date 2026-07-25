@@ -39,7 +39,7 @@ func templatePaneSpecs(template SessionTemplate, defaultCWD string) ([]PaneSpec,
 		if title == "" {
 			title = plainLaunchOption(options, "--window-title")
 		}
-		result = append(result, PaneSpec{CWD: cwd, Title: title})
+		result = append(result, PaneSpec{CWD: cwd, Title: title, LaunchOptions: append([]string(nil), options...)})
 	}
 	return result, nil
 }
@@ -206,25 +206,15 @@ func waitForAttachmentReady(ctx context.Context, api API, kitty KittyClient, wor
 		}
 		cancel()
 		if err == nil {
-			if attachment.Role == AttachmentPrimary && workspace.PrimaryAttachmentID == attachment.ID {
-				updated, updateErr := api.UpdateManifest(ctx, manifestUpdateRequest{
-					Workspace: workspace.ID, Attachment: attachment.ID,
-					ExpectedRevision: workspace.Revision, Manifest: manifest, Views: views,
-				})
-				if updateErr == nil {
-					return updated, nil
-				}
-				lastErr, validationErr = updateErr, updateErr
-			} else {
-				updated, updateErr := api.UpdateAttachment(ctx, attachmentUpdateRequest{
-					Workspace: workspace.ID, Attachment: attachment.ID,
-					ExpectedRevision: workspace.Revision, Status: AttachmentReady, Views: views,
-				})
-				if updateErr == nil {
-					return updated, nil
-				}
-				lastErr, validationErr = updateErr, updateErr
+			updated, updateErr := api.UpdateManifest(ctx, manifestUpdateRequest{
+				Workspace: workspace.ID, Attachment: attachment.ID,
+				ExpectedRevision: workspace.Revision, BaseTopologyGeneration: workspace.Topology.Generation,
+				Manifest: manifest, Views: views,
+			})
+			if updateErr == nil {
+				return updated, nil
 			}
+			lastErr, validationErr = updateErr, updateErr
 		} else {
 			lastErr = err
 		}

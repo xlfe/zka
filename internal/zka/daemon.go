@@ -22,6 +22,7 @@ type Daemon struct {
 	lifeMu      sync.Mutex
 	attentionMu sync.Mutex
 	captureMu   sync.Mutex
+	topologyMu  sync.Mutex
 	cleanupMu   sync.Mutex
 	wg          sync.WaitGroup
 
@@ -34,22 +35,26 @@ type Daemon struct {
 	logger   *log.Logger
 	sshAgent sshAgentInfo
 
-	ctx           context.Context
-	cancel        context.CancelFunc
-	listener      net.Listener
-	watcher       *net.UnixConn
-	conns         map[net.Conn]struct{}
-	started       bool
-	closed        bool
-	workerErr     error
-	events        chan WatcherEvent
-	capturing     map[string]bool
-	cleaning      map[string]bool
-	cleanups      map[string]*sync.Mutex
-	deleted       map[string]string
-	remotes       *RemoteManager
-	agentRelays   *agentRelayManager
-	attentionSubs map[chan struct{}]struct{}
+	ctx            context.Context
+	cancel         context.CancelFunc
+	listener       net.Listener
+	watcher        *net.UnixConn
+	conns          map[net.Conn]struct{}
+	started        bool
+	closed         bool
+	workerErr      error
+	events         chan WatcherEvent
+	capturing      map[string]bool
+	captureAgain   map[string]bool
+	reconciling    map[string]bool
+	reconcileAgain map[string]bool
+	suppressUntil  map[string]time.Time
+	cleaning       map[string]bool
+	cleanups       map[string]*sync.Mutex
+	deleted        map[string]string
+	remotes        *RemoteManager
+	agentRelays    *agentRelayManager
+	attentionSubs  map[chan struct{}]struct{}
 }
 
 func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, error) {
@@ -116,17 +121,21 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 			Runner:  runner,
 			Command: cfg.Kitty.KittenCommand,
 		},
-		logger:        logger,
-		sshAgent:      newSSHAgentInfo(cfg, os.Getenv("SSH_AUTH_SOCK")),
-		ctx:           ctx,
-		cancel:        cancel,
-		events:        make(chan WatcherEvent, 128),
-		capturing:     map[string]bool{},
-		cleaning:      map[string]bool{},
-		cleanups:      map[string]*sync.Mutex{},
-		deleted:       map[string]string{},
-		conns:         map[net.Conn]struct{}{},
-		attentionSubs: map[chan struct{}]struct{}{},
+		logger:         logger,
+		sshAgent:       newSSHAgentInfo(cfg, os.Getenv("SSH_AUTH_SOCK")),
+		ctx:            ctx,
+		cancel:         cancel,
+		events:         make(chan WatcherEvent, 128),
+		capturing:      map[string]bool{},
+		captureAgain:   map[string]bool{},
+		reconciling:    map[string]bool{},
+		reconcileAgain: map[string]bool{},
+		suppressUntil:  map[string]time.Time{},
+		cleaning:       map[string]bool{},
+		cleanups:       map[string]*sync.Mutex{},
+		deleted:        map[string]string{},
+		conns:          map[net.Conn]struct{}{},
+		attentionSubs:  map[chan struct{}]struct{}{},
 	}
 	store.SetOnSave(d.signalAttention)
 	d.remotes = NewRemoteManager(d)
@@ -184,6 +193,7 @@ func (d *Daemon) Start() error {
 	d.startWorkerLocked(func(ctx context.Context) { d.backendReconcileLoop(ctx) })
 	d.lifeMu.Unlock()
 	d.resumeLifecycleCleanup()
+	d.resumeTopologyReconciliation()
 	return nil
 }
 
@@ -313,7 +323,7 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 	if req.Version != protocolVersion {
-		d.writeResponse(conn, nil, fmt.Errorf("unsupported protocol %d", req.Version))
+		d.writeResponse(conn, nil, fmt.Errorf("unsupported protocol %d (daemon requires %d; upgrade and restart all zka peers)", req.Version, protocolVersion))
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
@@ -346,8 +356,9 @@ func (d *Daemon) writeResponse(w io.Writer, data any, callErr error) {
 }
 
 type PaneSpec struct {
-	CWD   string `json:"cwd,omitempty"`
-	Title string `json:"title,omitempty"`
+	CWD           string   `json:"cwd,omitempty"`
+	Title         string   `json:"title,omitempty"`
+	LaunchOptions []string `json:"launch_options,omitempty"`
 }
 
 type createWorkspaceRequest struct {
@@ -403,13 +414,21 @@ type attachmentRefRequest struct {
 	Attachment string `json:"attachment"`
 }
 
+type topologyReconcileRequest struct {
+	Workspace  string `json:"workspace"`
+	Attachment string `json:"attachment,omitempty"`
+}
+
 type attachmentUpdateRequest struct {
-	Workspace        string                 `json:"workspace"`
-	Attachment       string                 `json:"attachment"`
-	ExpectedRevision uint64                 `json:"expected_revision,omitempty"`
-	Status           AttachmentStatus       `json:"status,omitempty"`
-	Views            map[string]RuntimeView `json:"views,omitempty"`
-	Error            string                 `json:"error,omitempty"`
+	Workspace          string                 `json:"workspace"`
+	Attachment         string                 `json:"attachment"`
+	ExpectedRevision   uint64                 `json:"expected_revision,omitempty"`
+	TopologyGeneration uint64                 `json:"topology_generation,omitempty"`
+	TopologyDigest     string                 `json:"topology_digest,omitempty"`
+	ObservedTopology   []Node                 `json:"observed_topology,omitempty"`
+	Status             AttachmentStatus       `json:"status,omitempty"`
+	Views              map[string]RuntimeView `json:"views,omitempty"`
+	Error              string                 `json:"error,omitempty"`
 }
 
 type attachmentPaneReadyRequest struct {
@@ -437,11 +456,13 @@ type workspaceAgentStatus struct {
 }
 
 type manifestUpdateRequest struct {
-	Workspace        string                 `json:"workspace"`
-	Attachment       string                 `json:"attachment"`
-	ExpectedRevision uint64                 `json:"expected_revision,omitempty"`
-	Manifest         Manifest               `json:"manifest"`
-	Views            map[string]RuntimeView `json:"views"`
+	Workspace                string                 `json:"workspace"`
+	Attachment               string                 `json:"attachment"`
+	ExpectedRevision         uint64                 `json:"expected_revision,omitempty"`
+	BaseTopologyGeneration   uint64                 `json:"base_topology_generation,omitempty"`
+	VerifyTopologyGeneration uint64                 `json:"verify_topology_generation,omitempty"`
+	Manifest                 Manifest               `json:"manifest"`
+	Views                    map[string]RuntimeView `json:"views"`
 }
 
 type renameWorkspaceRequest struct {
@@ -544,6 +565,12 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 			return nil, err
 		}
 		return d.reconcileBackends(ctx, req.Workspace)
+	case "reconcile_topology":
+		var req topologyReconcileRequest
+		if err := decodePayload(raw, &req); err != nil {
+			return nil, err
+		}
+		return d.reconcileTopology(ctx, req)
 	case "register_attachment":
 		var req attachmentRequest
 		if err := decodePayload(raw, &req); err != nil {
@@ -714,6 +741,7 @@ func newPane(workspaceID string, position int, spec PaneSpec, now time.Time) (*P
 	return &Pane{
 		ID: id, Position: position, Backend: BackendRef{Kind: "zmx", Ref: backendName(workspaceID, id)},
 		CWD: spec.CWD, Title: title, State: StateUnknown,
+		LaunchOptions: append([]string(nil), spec.LaunchOptions...),
 		Visible:       true,
 		Evidence:      Evidence{Source: "zka", Event: "pane_created", Timestamp: now},
 		Notifications: map[string]NotificationRecord{}, CreatedAt: now, UpdatedAt: now,
@@ -869,6 +897,8 @@ func allocatePaneLocked(workspace *Workspace, key, cwd string) (*Pane, bool, err
 		return nil, false, err
 	}
 	pane.AllocationKey = key
+	pane.TopologyPending = true
+	pane.TopologyPendingAt = time.Now().UTC()
 	workspace.Panes[pane.ID] = pane
 	workspace.Revision++
 	workspace.UpdatedAt = time.Now().UTC()
@@ -922,6 +952,11 @@ func (d *Daemon) registerAttachment(workspaceRef string, attachment Attachment) 
 		existing.RevocationClosed = false
 		existing.Status = AttachmentPreparing
 		existing.LastError = ""
+		existing.AppliedTopologyGeneration = 0
+		existing.AppliedTopologyDigest = ""
+		existing.ObservedTopology = nil
+		existing.ReconcileTargetGeneration = workspace.Topology.Generation
+		existing.ReconcileStatus = "pending"
 		existing.ClientHeartbeats = map[string]time.Time{}
 		existing.UpdatedAt = now
 		if existing.Views == nil {
@@ -941,6 +976,8 @@ func (d *Daemon) registerAttachment(workspaceRef string, attachment Attachment) 
 		return existing.Clone(), nil
 	}
 	attachment.Status = AttachmentPreparing
+	attachment.ReconcileTargetGeneration = workspace.Topology.Generation
+	attachment.ReconcileStatus = "pending"
 	attachment.Views = map[string]RuntimeView{}
 	attachment.ClientHeartbeats = map[string]time.Time{}
 	attachment.CreatedAt = now
@@ -991,7 +1028,7 @@ func (d *Daemon) updateAttachment(req attachmentUpdateRequest) (*Workspace, erro
 	if attachment.Status == AttachmentDetached || attachment.Revoked {
 		return nil, fmt.Errorf("attachment %s is detached or revoked", attachment.ID)
 	}
-	if req.ExpectedRevision != 0 && req.ExpectedRevision != workspace.Revision {
+	if req.TopologyGeneration == 0 && req.ExpectedRevision != 0 && req.ExpectedRevision != workspace.Revision {
 		return nil, fmt.Errorf("workspace revision changed: have %d, expected %d", workspace.Revision, req.ExpectedRevision)
 	}
 	candidate := attachment.Clone()
@@ -1003,8 +1040,63 @@ func (d *Daemon) updateAttachment(req attachmentUpdateRequest) (*Workspace, erro
 	}
 	candidate.LastError = req.Error
 	if candidate.Status == AttachmentReady {
+		if workspace.Topology.Generation == 0 && req.TopologyGeneration == 0 {
+			if err := validateViewsReady(candidate, activeTopologyPaneIDs(workspace)); err != nil {
+				candidate.Status = AttachmentUnhealthy
+				candidate.LastError = err.Error()
+				return nil, err
+			}
+			candidate.AppliedRevision = workspace.Revision
+			if attachmentRuntimeEqual(attachment, candidate) {
+				return workspace.Clone(), nil
+			}
+			now := time.Now().UTC()
+			applyAttachmentRuntime(attachment, candidate)
+			attachment.UpdatedAt = now
+			workspace.UpdatedAt = now
+			if err := d.store.Save(d.state); err != nil {
+				return nil, err
+			}
+			return workspace.Clone(), nil
+		}
+		if req.TopologyGeneration != 0 {
+			candidate.AppliedTopologyGeneration = req.TopologyGeneration
+			candidate.AppliedTopologyDigest = req.TopologyDigest
+			candidate.ObservedTopology = topologyIdentity(req.ObservedTopology)
+		}
+		if candidate.AppliedTopologyGeneration != workspace.Topology.Generation ||
+			candidate.AppliedTopologyDigest != workspace.Topology.Digest {
+			candidate.Status = AttachmentUnhealthy
+			candidate.ReconcileStatus = "pending"
+			candidate.ReconcileTargetGeneration = workspace.Topology.Generation
+			candidate.LastError = fmt.Sprintf("attachment topology is stale: have generation %d, want %d",
+				candidate.AppliedTopologyGeneration, workspace.Topology.Generation)
+		} else if len(candidate.ObservedTopology) == 0 ||
+			!topologyMatchesDesired(workspace, candidate.ObservedTopology) {
+			candidate.Status = AttachmentUnhealthy
+			candidate.ReconcileStatus = "pending"
+			candidate.ReconcileTargetGeneration = workspace.Topology.Generation
+			candidate.LastError = "attachment topology digest was not verified from a complete capture"
+		}
+		if candidate.Status == AttachmentReady {
+			annotateRuntimeViews(candidate.ObservedTopology, candidate.Views)
+			candidate.ReconcileStatus = "ready"
+			candidate.ReconcileTargetGeneration = workspace.Topology.Generation
+		}
+		if candidate.Status != AttachmentReady {
+			err := fmt.Errorf("%s", candidate.LastError)
+			if !attachmentRuntimeEqual(attachment, candidate) {
+				now := time.Now().UTC()
+				applyAttachmentRuntime(attachment, candidate)
+				attachment.UpdatedAt = now
+				workspace.UpdatedAt = now
+				_ = d.store.Save(d.state)
+			}
+			return nil, err
+		}
 		if err := validateAttachmentReady(workspace, candidate); err != nil {
 			candidate.Status = AttachmentUnhealthy
+			candidate.ReconcileStatus = "error"
 			candidate.LastError = err.Error()
 			if !attachmentRuntimeEqual(attachment, candidate) {
 				now := time.Now().UTC()
@@ -1225,7 +1317,16 @@ func (d *Daemon) workspaceAgentStatus(workspaceRef string) (workspaceAgentStatus
 }
 
 func validateAttachmentReady(workspace *Workspace, attachment *Attachment) error {
-	return validateViewsReady(attachment, manifestPaneIDs(workspace))
+	if err := validateViewsReady(attachment, desiredPaneIDs(workspace)); err != nil {
+		return err
+	}
+	if workspace.Topology.Generation != 0 {
+		if attachment.AppliedTopologyGeneration != workspace.Topology.Generation ||
+			attachment.AppliedTopologyDigest != workspace.Topology.Digest {
+			return fmt.Errorf("attachment %s has not verified topology generation %d", attachment.ID, workspace.Topology.Generation)
+		}
+	}
+	return nil
 }
 
 func validateViewsReady(attachment *Attachment, paneIDs map[string]bool) error {
@@ -1233,6 +1334,11 @@ func validateViewsReady(attachment *Attachment, paneIDs map[string]bool) error {
 		view, ok := attachment.Views[paneID]
 		if !ok || !view.Ready || view.WindowID <= 0 {
 			return fmt.Errorf("attachment %s is missing ready pane %s", attachment.ID, paneID)
+		}
+	}
+	for paneID := range attachment.Views {
+		if !paneIDs[paneID] {
+			return fmt.Errorf("attachment %s contains unexpected pane %s", attachment.ID, paneID)
 		}
 	}
 	return nil
@@ -1269,13 +1375,23 @@ func runtimeViewsEqual(left, right map[string]RuntimeView) bool {
 func attachmentRuntimeEqual(left, right *Attachment) bool {
 	return left.Status == right.Status &&
 		left.AppliedRevision == right.AppliedRevision &&
+		left.AppliedTopologyGeneration == right.AppliedTopologyGeneration &&
+		left.AppliedTopologyDigest == right.AppliedTopologyDigest &&
+		left.ReconcileTargetGeneration == right.ReconcileTargetGeneration &&
+		left.ReconcileStatus == right.ReconcileStatus &&
 		left.LastError == right.LastError &&
+		nodesEqual(left.ObservedTopology, right.ObservedTopology) &&
 		runtimeViewsEqual(left.Views, right.Views)
 }
 
 func applyAttachmentRuntime(destination, source *Attachment) {
 	destination.Status = source.Status
 	destination.AppliedRevision = source.AppliedRevision
+	destination.AppliedTopologyGeneration = source.AppliedTopologyGeneration
+	destination.AppliedTopologyDigest = source.AppliedTopologyDigest
+	destination.ObservedTopology = cloneNodes(source.ObservedTopology)
+	destination.ReconcileTargetGeneration = source.ReconcileTargetGeneration
+	destination.ReconcileStatus = source.ReconcileStatus
 	destination.LastError = source.LastError
 	destination.Views = cloneViews(source.Views)
 }
@@ -1297,7 +1413,11 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	if attachment.Status == AttachmentDetached || attachment.Revoked {
 		return nil, fmt.Errorf("attachment %s is detached or revoked", attachment.ID)
 	}
-	if req.ExpectedRevision != 0 && req.ExpectedRevision != workspace.Revision {
+	if req.VerifyTopologyGeneration != 0 && req.VerifyTopologyGeneration != workspace.Topology.Generation {
+		return nil, fmt.Errorf("topology generation changed: have %d, reconciling %d",
+			workspace.Topology.Generation, req.VerifyTopologyGeneration)
+	}
+	if req.BaseTopologyGeneration == 0 && req.ExpectedRevision != 0 && req.ExpectedRevision != workspace.Revision {
 		return nil, fmt.Errorf("workspace revision changed: have %d, expected %d", workspace.Revision, req.ExpectedRevision)
 	}
 	if err := validateManifest(workspace, req.Manifest); err != nil {
@@ -1306,10 +1426,59 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 		_ = d.store.Save(d.state)
 		return nil, err
 	}
+	staleTopologyBase := req.BaseTopologyGeneration != 0 &&
+		req.BaseTopologyGeneration != workspace.Topology.Generation
+	previousTopology := workspace.Topology.Roots
+	if staleTopologyBase {
+		if attachment.AppliedTopologyGeneration != req.BaseTopologyGeneration ||
+			len(attachment.ObservedTopology) == 0 {
+			return nil, fmt.Errorf("attachment %s has no verified baseline for topology generation %d",
+				attachment.ID, req.BaseTopologyGeneration)
+		}
+		previousTopology = attachment.ObservedTopology
+	}
+	stableTopology, err := stabilizeTopologyIDs(workspace.ID, previousTopology, req.Manifest.Topology)
+	if err != nil {
+		return nil, err
+	}
+	capturedPanes := topologyPaneIDs(stableTopology)
+	if staleTopologyBase {
+		for paneID := range topologyPaneIDs(attachment.ObservedTopology) {
+			pane := workspace.Panes[paneID]
+			if pane != nil && !pane.RemovalPending && !capturedPanes[paneID] {
+				err := fmt.Errorf("stale capture omitted previously observed pane %s", paneID)
+				attachment.Status = AttachmentUnhealthy
+				attachment.ReconcileStatus = TopologyReconcileError
+				attachment.LastError = err.Error()
+				attachment.UpdatedAt = time.Now().UTC()
+				workspace.UpdatedAt = attachment.UpdatedAt
+				_ = d.store.Save(d.state)
+				return nil, err
+			}
+		}
+	} else {
+		expectedPanes := activeTopologyPaneIDs(workspace)
+		for paneID := range capturedPanes {
+			if pane := workspace.Panes[paneID]; pane != nil && pane.TopologyPending {
+				expectedPanes[paneID] = true
+			}
+		}
+		if !samePaneSet(capturedPanes, expectedPanes) {
+			err := fmt.Errorf("captured topology pane set does not equal active workspace pane set")
+			attachment.Status = AttachmentUnhealthy
+			attachment.ReconcileStatus = TopologyReconcileError
+			attachment.LastError = err.Error()
+			attachment.UpdatedAt = time.Now().UTC()
+			workspace.UpdatedAt = attachment.UpdatedAt
+			_ = d.store.Save(d.state)
+			return nil, err
+		}
+	}
 	candidate := attachment.Clone()
 	candidate.Views = cloneViews(req.Views)
-	if err := validateViewsReady(candidate, topologyPaneIDs(req.Manifest.Topology)); err != nil {
+	if err := validateViewsReady(candidate, capturedPanes); err != nil {
 		candidate.Status = AttachmentUnhealthy
+		candidate.ReconcileStatus = "error"
 		candidate.LastError = err.Error()
 		if !attachmentRuntimeEqual(attachment, candidate) {
 			now := time.Now().UTC()
@@ -1320,9 +1489,30 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 		}
 		return nil, err
 	}
-	if workspace.RemoteHost != "" || attachment.Role != AttachmentPrimary || workspace.PrimaryAttachmentID != attachment.ID {
+	annotateRuntimeViews(stableTopology, candidate.Views)
+	if workspace.RemoteHost != "" {
+		if !topologyMatchesDesired(workspace, stableTopology) {
+			err := fmt.Errorf("local attachment topology differs from origin generation %d", workspace.Topology.Generation)
+			candidate.Status = AttachmentUnhealthy
+			candidate.ReconcileStatus = "pending"
+			candidate.ReconcileTargetGeneration = workspace.Topology.Generation
+			candidate.LastError = err.Error()
+			if !attachmentRuntimeEqual(attachment, candidate) {
+				now := time.Now().UTC()
+				applyAttachmentRuntime(attachment, candidate)
+				attachment.UpdatedAt = now
+				workspace.UpdatedAt = now
+				_ = d.store.Save(d.state)
+			}
+			return nil, err
+		}
 		candidate.Status = AttachmentReady
 		candidate.LastError = ""
+		candidate.ObservedTopology = topologyIdentity(stableTopology)
+		candidate.AppliedTopologyGeneration = workspace.Topology.Generation
+		candidate.AppliedTopologyDigest = workspace.Topology.Digest
+		candidate.ReconcileTargetGeneration = workspace.Topology.Generation
+		candidate.ReconcileStatus = "ready"
 		candidate.AppliedRevision = workspace.Revision
 		if attachmentRuntimeEqual(attachment, candidate) {
 			return workspace.Clone(), nil
@@ -1338,26 +1528,68 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	}
 	acceptCapturedCWD := attachment.Transport.Kind != "ssh"
 	if !acceptCapturedCWD {
-		req.Manifest.Topology = cloneNodes(req.Manifest.Topology)
-		preserveOriginPaneCWD(workspace, req.Manifest.Topology)
+		stableTopology = cloneNodes(stableTopology)
+		preserveOriginPaneCWD(workspace, stableTopology)
 	}
-	topologyChanged := req.Manifest.Session != workspace.Manifest.Session || !nodesEqual(req.Manifest.Topology, workspace.Manifest.Topology)
-	manifestChanged := topologyChanged || req.Manifest.KittyVersion != workspace.Manifest.KittyVersion
+	observedTopology := cloneNodes(stableTopology)
+	if staleTopologyBase {
+		stableTopology, err = rebaseCapturedTopology(workspace, attachment.ObservedTopology, stableTopology)
+		if err != nil {
+			return nil, fmt.Errorf("rebase topology generation %d onto %d: %w",
+				req.BaseTopologyGeneration, workspace.Topology.Generation, err)
+		}
+	}
+	before := workspace.Clone()
+	topologyChanged, err := installDesiredTopology(workspace, stableTopology)
+	if err != nil {
+		return nil, err
+	}
+	beforeLaunchOptions := workspaceLaunchOptions(workspace)
+	applyManifestLaunchOptions(workspace, req.Manifest.Session)
+	launchOptionsChanged := beforeLaunchOptions != workspaceLaunchOptions(workspace)
+	metadataChanged := applyCapturedPaneMetadata(workspace, observedTopology, acceptCapturedCWD)
+	req.Manifest.Topology = cloneNodes(workspace.Topology.Roots)
+	req.Manifest.Session, err = renderDesiredTopologySession(workspace, Transport{Kind: "local"}, "")
+	if err != nil {
+		d.state.Workspaces[workspace.ID] = before
+		return nil, err
+	}
+	manifestChanged := topologyChanged || launchOptionsChanged || metadataChanged ||
+		req.Manifest.KittyVersion != workspace.Manifest.KittyVersion ||
+		!nodesEqual(req.Manifest.Topology, workspace.Manifest.Topology)
 	nextRevision := workspace.Revision
 	if topologyChanged {
 		nextRevision++
 	}
-	candidate.Status = AttachmentReady
+	sourceMatchesDesired := topologyMatchesDesired(workspace, observedTopology) &&
+		samePaneSet(capturedPanes, desiredPaneIDs(workspace))
 	candidate.LastError = ""
-	candidate.AppliedRevision = nextRevision
+	candidate.ObservedTopology = topologyIdentity(observedTopology)
+	candidate.ReconcileTargetGeneration = workspace.Topology.Generation
+	if sourceMatchesDesired {
+		candidate.Status = AttachmentReady
+		candidate.AppliedTopologyGeneration = workspace.Topology.Generation
+		candidate.AppliedTopologyDigest = workspace.Topology.Digest
+		candidate.ReconcileStatus = TopologyReconcileReady
+		candidate.AppliedRevision = nextRevision
+	} else {
+		candidate.Status = AttachmentPreparing
+		candidate.ReconcileStatus = TopologyReconcilePending
+	}
 	attachmentChanged := !attachmentRuntimeEqual(attachment, candidate)
 	if !manifestChanged && !attachmentChanged {
 		return workspace.Clone(), nil
 	}
 	now := time.Now().UTC()
 	if topologyChanged {
-		applyManifestPaneMetadata(workspace, req.Manifest.Topology, acceptCapturedCWD)
 		workspace.Revision++
+		for id, other := range workspace.Attachments {
+			if id == attachment.ID || other.Status == AttachmentDetached || other.Revoked {
+				continue
+			}
+			other.ReconcileTargetGeneration = workspace.Topology.Generation
+			other.ReconcileStatus = "pending"
+		}
 	}
 	if manifestChanged {
 		req.Manifest.CapturedAt = now
@@ -1369,24 +1601,47 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	}
 	workspace.UpdatedAt = now
 	if err := d.store.Save(d.state); err != nil {
+		d.state.Workspaces[workspace.ID] = before
 		return nil, err
+	}
+	if topologyChanged || !sourceMatchesDesired {
+		for id, other := range workspace.Attachments {
+			if (id == attachment.ID && sourceMatchesDesired) || !isLocalUnixAttachment(other, d.state.Node.ID) ||
+				other.Status == AttachmentDetached || other.Revoked {
+				continue
+			}
+			d.scheduleTopologyReconcile(other.Endpoint)
+		}
 	}
 	return workspace.Clone(), nil
 }
 
-func applyManifestPaneMetadata(workspace *Workspace, nodes []Node, acceptCWD bool) {
+func applyCapturedPaneMetadata(workspace *Workspace, nodes []Node, acceptCWD bool) bool {
 	seen := map[string]bool{}
+	changed := false
 	var visit func([]Node)
 	visit = func(children []Node) {
 		for _, node := range children {
 			if node.Kind == "pane" {
 				if pane := workspace.Panes[node.PaneID]; pane != nil {
-					pane.Visible = true
-					if node.Title != "" {
-						pane.Title = stripStateMarker(node.Title)
+					paneChanged := false
+					if !pane.Visible {
+						pane.Visible = true
+						changed = true
+						paneChanged = true
 					}
-					if acceptCWD && node.CWD != "" {
+					if title := stripStateMarker(node.Title); title != "" && pane.Title != title {
+						pane.Title = title
+						changed = true
+						paneChanged = true
+					}
+					if acceptCWD && node.CWD != "" && pane.CWD != node.CWD {
 						pane.CWD = node.CWD
+						changed = true
+						paneChanged = true
+					}
+					if paneChanged {
+						pane.UpdatedAt = time.Now().UTC()
 					}
 					seen[pane.ID] = true
 				}
@@ -1396,10 +1651,30 @@ func applyManifestPaneMetadata(workspace *Workspace, nodes []Node, acceptCWD boo
 	}
 	visit(nodes)
 	for id, pane := range workspace.Panes {
-		if !seen[id] {
-			pane.Visible = false
+		if !seen[id] && !pane.TopologyPending && !pane.RemovalPending {
+			if pane.Visible {
+				pane.Visible = false
+				changed = true
+			}
 		}
 	}
+	if acceptCWD {
+		var copyCWD func([]Node)
+		copyCWD = func(children []Node) {
+			for index := range children {
+				node := &children[index]
+				if node.Kind == "pane" {
+					if pane := workspace.Panes[node.PaneID]; pane != nil {
+						node.CWD = pane.CWD
+						node.Title = pane.Title
+					}
+				}
+				copyCWD(node.Children)
+			}
+		}
+		copyCWD(workspace.Topology.Roots)
+	}
+	return changed
 }
 
 func preserveOriginPaneCWD(workspace *Workspace, nodes []Node) {
@@ -1467,15 +1742,7 @@ func validateManifest(workspace *Workspace, manifest Manifest) error {
 }
 
 func manifestPaneIDs(workspace *Workspace) map[string]bool {
-	result := topologyPaneIDs(workspace.Manifest.Topology)
-	if len(result) == 0 {
-		for id, pane := range workspace.Panes {
-			if pane.Visible {
-				result[id] = true
-			}
-		}
-	}
-	return result
+	return desiredPaneIDs(workspace)
 }
 
 func topologyPaneIDs(topology []Node) map[string]bool {
@@ -1710,6 +1977,10 @@ func (d *Daemon) markSeen(workspaceRef, paneRef string) (*Workspace, error) {
 		}
 	}
 	changed := false
+	if paneRef != "" && workspace.RestoreFocusPaneID != paneRef {
+		workspace.RestoreFocusPaneID = paneRef
+		changed = true
+	}
 	for _, pane := range panes {
 		switch pane.State {
 		case StateDone:
@@ -1727,6 +1998,12 @@ func (d *Daemon) markSeen(workspaceRef, paneRef string) (*Workspace, error) {
 		}
 	}
 	workspace.RecomputeAttention()
+	if !changed {
+		copy := workspace.Clone()
+		d.mu.Unlock()
+		return copy, nil
+	}
+	workspace.UpdatedAt = time.Now().UTC()
 	copy := workspace.Clone()
 	err = d.store.Save(d.state)
 	d.mu.Unlock()

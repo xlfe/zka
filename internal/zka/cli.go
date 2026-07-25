@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const Version = "0.6.0"
+const Version = "0.7.0"
 
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
@@ -296,6 +296,8 @@ func runWorkspace(args []string, paths Paths, stdout, stderr io.Writer) (int, er
 		return runWorkspaceList(args[1:], paths, stdout, stderr)
 	case "inspect":
 		return runWorkspaceInspect(args[1:], paths, stdout, stderr)
+	case "reconcile":
+		return runWorkspaceReconcile(args[1:], paths, stdout, stderr)
 	case "attach":
 		return runWorkspaceAttach(args[1:], paths, false, stdout, stderr)
 	case "move":
@@ -323,6 +325,7 @@ func printWorkspaceUsage(w io.Writer) {
 
   list [--origin SSH_ALIAS] [--json]
   inspect [SSH_ALIAS:]REF [--json]
+  reconcile [SSH_ALIAS:]REF [--attachment ID]
   attach [SSH_ALIAS:]REF [--pane PANE]
   move [SSH_ALIAS:]REF [--pane PANE]
   detach REF
@@ -333,6 +336,38 @@ func printWorkspaceUsage(w io.Writer) {
   agent claim [SSH_ALIAS:]REF
   agent release [SSH_ALIAS:]REF
   agent status [--json] [SSH_ALIAS:]REF`)
+}
+
+func runWorkspaceReconcile(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("workspace reconcile", stderr)
+	attachmentID := fs.String("attachment", "", "local attachment id")
+	if err := parseInterspersed(fs, args); err != nil {
+		return 2, err
+	}
+	if fs.NArg() != 1 {
+		return 2, fmt.Errorf("workspace reconcile requires one workspace reference")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	api := NewAPI(paths)
+	workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
+	if err != nil {
+		return 1, err
+	}
+	workspace, err = api.ReconcileTopology(ctx, workspace.ID, *attachmentID)
+	if err != nil {
+		return 1, err
+	}
+	fmt.Fprintf(stdout, "%s\tgeneration=%d\tdigest=%s\n",
+		workspace.ID, workspace.Topology.Generation, shortDigest(workspace.Topology.Digest))
+	return 0, nil
+}
+
+func shortDigest(digest string) string {
+	if len(digest) > 12 {
+		return digest[:12]
+	}
+	return digest
 }
 
 func runWorkspaceAgent(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
@@ -566,7 +601,17 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	if existing != nil {
 		attachmentID = existing.ID
 	}
-	if attachmentUsable(existing) && existing.AppliedRevision == workspace.Revision {
+	if attachmentUsable(existing) && !attachmentTopologyCurrent(workspace, existing) {
+		reconciled, reconcileErr := api.ReconcileTopology(ctx, workspace.ID, existing.ID)
+		if reconcileErr == nil {
+			workspace = reconciled
+			existing = workspace.Attachments[existing.ID]
+		} else {
+			fmt.Fprintf(stderr, "zka: topology reconciliation failed for attachment %s: %v; rebuilding the view\n",
+				shortID(existing.ID), reconcileErr)
+		}
+	}
+	if attachmentUsable(existing) && attachmentTopologyCurrent(workspace, existing) {
 		if move && workspace.PrimaryAttachmentID != existing.ID {
 			if host != "" {
 				workspace, err = commitRemoteMove(ctx, api, host, workspace, existing)
@@ -603,7 +648,7 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 			}
 		}
 	}
-	if strings.TrimSpace(workspace.Manifest.Session) == "" {
+	if len(workspace.Topology.Roots) == 0 && strings.TrimSpace(workspace.Manifest.Session) == "" {
 		return 1, fmt.Errorf("workspace %s has no captured Kitty manifest", workspace.Name)
 	}
 	transport := Transport{Kind: "local"}
@@ -668,6 +713,18 @@ func attachmentUsable(attachment *Attachment) bool {
 	return attachment != nil && attachment.Status == AttachmentReady && strings.HasPrefix(attachment.Endpoint, "unix:") && !attachment.Revoked
 }
 
+func attachmentTopologyCurrent(workspace *Workspace, attachment *Attachment) bool {
+	if workspace == nil || attachment == nil {
+		return false
+	}
+	if workspace.Topology.Generation == 0 {
+		return attachment.AppliedRevision == workspace.Revision
+	}
+	return attachment.AppliedTopologyGeneration == workspace.Topology.Generation &&
+		attachment.AppliedTopologyDigest == workspace.Topology.Digest &&
+		topologyMatchesDesired(workspace, attachment.ObservedTopology)
+}
+
 func preferredLocalAttachment(workspace *Workspace, nodeID string) *Attachment {
 	primary := workspace.Attachments[workspace.PrimaryAttachmentID]
 	if primary != nil && primary.Node.ID == nodeID && attachmentUsable(primary) {
@@ -723,8 +780,11 @@ func readyRemoteAttachment(ctx context.Context, api API, host string, workspace 
 	}
 	var remote Workspace
 	err := api.RemoteCall(ctx, host, "update_attachment", attachmentUpdateRequest{
-		Workspace: workspace.ID, Attachment: attachment.ID, ExpectedRevision: workspace.Revision,
-		Status: AttachmentReady, Views: attachment.Views,
+		Workspace: workspace.ID, Attachment: attachment.ID,
+		TopologyGeneration: attachment.AppliedTopologyGeneration,
+		TopologyDigest:     attachment.AppliedTopologyDigest,
+		ObservedTopology:   attachment.ObservedTopology,
+		Status:             AttachmentReady, Views: attachment.Views,
 	}, &remote)
 	if err != nil {
 		return nil, err
@@ -1058,6 +1118,9 @@ func writeWorkspaceTable(w io.Writer, workspaces []*Workspace) {
 func writeWorkspaceDetail(w io.Writer, workspace *Workspace) {
 	fmt.Fprintf(w, "workspace=%s\nname=%s\norigin=%s\nrevision=%d\nattention=%s\nprimary_attachment=%s\n",
 		workspace.ID, workspace.Name, workspace.Origin.Name, workspace.Revision, workspace.Attention, workspace.PrimaryAttachmentID)
+	fmt.Fprintf(w, "topology_generation=%d\ntopology_digest=%s\ntopology_panes=%d\ntopology_pending=%d\n",
+		workspace.Topology.Generation, shortDigest(workspace.Topology.Digest),
+		len(desiredPaneIDs(workspace)), pendingTopologyPaneCount(workspace))
 	if workspace.DeletionPending {
 		fmt.Fprintf(w, "deletion_pending=true\ndeletion_error=%s\n", workspace.DeletionError)
 	}
@@ -1069,6 +1132,9 @@ func writeWorkspaceDetail(w io.Writer, workspace *Workspace) {
 		if pane.RemovalPending {
 			fmt.Fprintf(w, "pane_removal[%s]=pending error=%s\n", shortID(pane.ID), pane.RemovalError)
 		}
+		if pane.TopologyPending {
+			fmt.Fprintf(w, "pane_topology[%s]=pending since=%s\n", shortID(pane.ID), pane.TopologyPendingAt.Format(time.RFC3339))
+		}
 		for _, record := range pane.Notifications {
 			if record.LastError != "" {
 				fmt.Fprintf(w, "notification_error[%s]=%s\n", record.Channel, record.LastError)
@@ -1076,8 +1142,25 @@ func writeWorkspaceDetail(w io.Writer, workspace *Workspace) {
 		}
 	}
 	for _, attachment := range workspace.SortedAttachments() {
-		fmt.Fprintf(w, "attachment[%s]=%s node=%s transport=%s status=%s revision=%d\n", shortID(attachment.ID), attachment.Role, attachment.Node.Name, attachment.Transport.Kind, attachment.Status, attachment.AppliedRevision)
+		fmt.Fprintf(w, "attachment[%s]=%s node=%s transport=%s status=%s revision=%d topology=%d/%s reconcile=%s target=%d\n",
+			shortID(attachment.ID), attachment.Role, attachment.Node.Name, attachment.Transport.Kind,
+			attachment.Status, attachment.AppliedRevision, attachment.AppliedTopologyGeneration,
+			shortDigest(attachment.AppliedTopologyDigest), attachment.ReconcileStatus,
+			attachment.ReconcileTargetGeneration)
+		if attachment.LastError != "" {
+			fmt.Fprintf(w, "attachment_error[%s]=%s\n", shortID(attachment.ID), attachment.LastError)
+		}
 	}
+}
+
+func pendingTopologyPaneCount(workspace *Workspace) int {
+	count := 0
+	for _, pane := range workspace.Panes {
+		if pane.TopologyPending || pane.RemovalPending {
+			count++
+		}
+	}
+	return count
 }
 
 func writeJSON(w io.Writer, value any) error {

@@ -282,7 +282,9 @@ func TestMirrorPaneClosureKillsOnlyClosedBackend(t *testing.T) {
 	}
 	workspace, err = d.updateAttachment(attachmentUpdateRequest{
 		Workspace: workspace.ID, Attachment: mirror.ID, ExpectedRevision: workspace.Revision,
-		Status: AttachmentReady, Views: viewsForPanes(panes[0].ID, panes[1].ID),
+		TopologyGeneration: workspace.Topology.Generation, TopologyDigest: workspace.Topology.Digest,
+		ObservedTopology: workspace.Topology.Roots,
+		Status:           AttachmentReady, Views: viewsForPanes(panes[0].ID, panes[1].ID),
 	})
 	if err != nil {
 		t.Fatal(err)

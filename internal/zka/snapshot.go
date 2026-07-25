@@ -3,6 +3,7 @@ package zka
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -188,11 +189,19 @@ func GenerateManagedSession(template SessionTemplate, workspace *Workspace) (str
 }
 
 func writeCanonicalLaunch(out *bytes.Buffer, options []string, workspace *Workspace, pane *Pane, transport Transport, attachmentID string) {
+	writeCanonicalLaunchWithTopology(out, options, workspace, pane, transport, attachmentID, "", "", 0)
+}
+
+func writeCanonicalLaunchWithTopology(out *bytes.Buffer, options []string, workspace *Workspace, pane *Pane, transport Transport, attachmentID, osWindowNodeID, tabNodeID string, serializedWindowID int64) {
 	clean := stripManagedOptions(options)
 	if transport.Kind == "ssh" {
 		clean = dropLaunchOption(clean, "--cwd")
 	}
 	tokens := []string{"launch"}
+	if serializedWindowID > 0 {
+		serialized, _ := json.Marshal(map[string]int64{"id": serializedWindowID})
+		tokens = append(tokens, "kitty-unserialize-data="+string(serialized))
+	}
 	tokens = append(tokens, clean...)
 	if transport.Kind != "ssh" && !hasLaunchOption(clean, "--cwd") && pane.CWD != "" {
 		tokens = append(tokens, "--cwd", pane.CWD)
@@ -207,8 +216,14 @@ func writeCanonicalLaunch(out *bytes.Buffer, options []string, workspace *Worksp
 		"--var", "zka_ready=0",
 		"--env", "ZKA_WORKSPACE_ID="+workspace.ID,
 		"--env", "ZKA_PANE_ID="+pane.ID,
-		"--",
 	)
+	if osWindowNodeID != "" {
+		tokens = append(tokens, "--var", "zka_os_window="+osWindowNodeID)
+	}
+	if tabNodeID != "" {
+		tokens = append(tokens, "--var", "zka_tab="+tabNodeID)
+	}
+	tokens = append(tokens, "--")
 	if transport.Kind == "ssh" {
 		tokens = append(tokens, "zka", "remote-pane", "--origin", transport.Host,
 			"--workspace", workspace.ID, "--pane", pane.ID, "--attachment", attachmentID)
@@ -270,7 +285,8 @@ func stripManagedOptions(options []string) []string {
 }
 
 func isManagedPaneVariable(key string) bool {
-	return key == "zka_workspace" || key == "zka_pane" || key == "zka_state" || key == "zka_ready" || strings.HasPrefix(key, "ZKA_")
+	return key == "zka_workspace" || key == "zka_pane" || key == "zka_state" || key == "zka_ready" ||
+		key == "zka_os_window" || key == "zka_tab" || strings.HasPrefix(key, "ZKA_")
 }
 
 func hasLaunchOption(options []string, wanted string) bool {
@@ -359,6 +375,9 @@ func launchOptionValue(options []string, option, key string) string {
 }
 
 func RenderAttachmentSession(workspace *Workspace, transport Transport, attachmentID string) (string, error) {
+	if len(workspace.Topology.Roots) != 0 {
+		return renderDesiredTopologySession(workspace, transport, attachmentID)
+	}
 	if strings.TrimSpace(workspace.Manifest.Session) == "" {
 		return "", fmt.Errorf("workspace %s has no captured manifest", workspace.Name)
 	}
@@ -396,6 +415,95 @@ func RenderAttachmentSession(workspace *Workspace, transport Transport, attachme
 		writeCanonicalLaunch(&out, options, workspace, pane, transport, attachmentID)
 	}
 	return out.String(), nil
+}
+
+func renderDesiredTopologySession(workspace *Workspace, transport Transport, attachmentID string) (string, error) {
+	if err := validateTopology(workspace, workspace.Topology.Roots, activeTopologyPaneIDs(workspace)); err != nil {
+		return "", fmt.Errorf("invalid desired topology: %w", err)
+	}
+	var out bytes.Buffer
+	focusPane := workspace.RestoreFocusPaneID
+	if focusPane == "" {
+		for _, osNode := range workspace.Topology.Roots {
+			for _, tabNode := range osNode.Children {
+				if len(tabNode.Children) != 0 {
+					focusPane = tabNode.Children[0].PaneID
+					break
+				}
+			}
+			if focusPane != "" {
+				break
+			}
+		}
+	}
+	focusOSIndex, focusTabIndex := 0, 0
+	for osIndex, osNode := range workspace.Topology.Roots {
+		if osIndex > 0 {
+			writeRawDirective(&out, "new_os_window")
+		}
+		if osNode.State != "" {
+			writeSessionTokens(&out, []string{"os_window_state", osNode.State})
+		}
+		if osNode.Class != "" {
+			writeSessionTokens(&out, []string{"os_window_class", osNode.Class})
+		}
+		if osNode.Name != "" {
+			writeSessionTokens(&out, []string{"os_window_name", osNode.Name})
+		}
+		for tabIndex, tabNode := range osNode.Children {
+			writeSessionTokens(&out, []string{"new_tab", tabNode.Title})
+			if len(tabNode.EnabledLayouts) != 0 {
+				writeRawDirective(&out, "enabled_layouts "+strings.Join(tabNode.EnabledLayouts, ","))
+			}
+			if tabNode.Layout != "" {
+				writeSessionTokens(&out, []string{"layout", tabNode.Layout})
+			}
+			if len(tabNode.LayoutState) != 0 {
+				writeRawDirective(&out, "set_layout_state "+string(tabNode.LayoutState))
+			}
+			for paneIndex, paneNode := range tabNode.Children {
+				pane := workspace.Panes[paneNode.PaneID]
+				if pane == nil {
+					return "", fmt.Errorf("desired topology references unknown pane %s", paneNode.PaneID)
+				}
+				serializedWindowID := int64(0)
+				if len(tabNode.LayoutState) != 0 {
+					serializedWindowID = int64(paneIndex + 1)
+				}
+				writeCanonicalLaunchWithTopology(&out, pane.LaunchOptions, workspace, pane, transport, attachmentID, osNode.ID, tabNode.ID, serializedWindowID)
+				if pane.ID == focusPane {
+					writeRawDirective(&out, "focus")
+					focusOSIndex, focusTabIndex = osIndex, tabIndex
+				}
+			}
+		}
+	}
+	writeRawDirective(&out, fmt.Sprintf("focus_tab %d", focusTabIndex))
+	if len(workspace.Topology.Roots) > 1 {
+		writeRawDirective(&out, fmt.Sprintf("focus_os_window %d", focusOSIndex))
+	}
+	return out.String(), nil
+}
+
+func applyManifestLaunchOptions(workspace *Workspace, session string) {
+	for _, raw := range strings.Split(session, "\n") {
+		tokens, err := splitSessionWords(strings.TrimSpace(raw))
+		if err != nil || len(tokens) == 0 || tokens[0] != "launch" {
+			continue
+		}
+		options, _, err := parseLaunch(tokens[1:])
+		if err != nil {
+			continue
+		}
+		paneID := launchOptionValue(options, "--var", "zka_pane")
+		if pane := workspace.Panes[paneID]; pane != nil {
+			clean := stripManagedOptions(options)
+			for _, derived := range []string{"--cwd", "--title", "--window-title", "--tab-title"} {
+				clean = dropLaunchOption(clean, derived)
+			}
+			pane.LaunchOptions = clean
+		}
+	}
 }
 
 func CaptureManifest(ctx context.Context, kitty KittyClient, endpoint string, workspace *Workspace) (Manifest, map[string]RuntimeView, error) {

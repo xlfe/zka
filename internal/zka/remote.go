@@ -394,7 +394,7 @@ func (c *remoteClient) readLoop(ctx context.Context, input io.Reader) {
 			return
 		}
 		if message.Protocol != remoteProtocolName || message.Version != protocolVersion {
-			c.setTerminal(fmt.Errorf("remote %s uses incompatible protocol %q version %d", c.host, message.Protocol, message.Version))
+			c.setTerminal(fmt.Errorf("remote %s uses incompatible protocol %q version %d (local requires %d; upgrade zka on both machines)", c.host, message.Protocol, message.Version, protocolVersion))
 			c.mu.Lock()
 			if c.process != nil && c.process.Process != nil {
 				_ = c.process.Process.Kill()
@@ -597,7 +597,7 @@ func (w *remoteControlWriter) send(message remoteEnvelope) error {
 
 func runRemoteControl(ctx context.Context, paths Paths, stdin io.Reader, stdout io.Writer) error {
 	writer := &remoteControlWriter{enc: json.NewEncoder(stdout)}
-	if err := writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "hello", Capabilities: []string{"workspace-snapshots", "events", "two-phase-move", "revocation", "workspace-lifecycle", "ssh-agent-relay-v1"}}); err != nil {
+	if err := writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "hello", Capabilities: []string{"workspace-snapshots", "events", "two-phase-move", "revocation", "workspace-lifecycle", "ssh-agent-relay-v1", "topology-replica-v1"}}); err != nil {
 		return err
 	}
 	api := NewAPI(paths)
@@ -640,8 +640,20 @@ func runRemoteControl(ctx context.Context, paths Paths, stdin io.Reader, stdout 
 }
 
 func streamRemoteEvents(ctx context.Context, api API, writer *remoteControlWriter) {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	changes := make(chan struct{}, 1)
+	watchCtx, cancelWatch := context.WithCancel(ctx)
+	defer cancelWatch()
+	go func() {
+		_ = api.WatchAttention(watchCtx, func(AttentionSnapshot) error {
+			select {
+			case changes <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+	}()
 	seen := map[string]string{}
 	first := true
 	for {
@@ -684,6 +696,7 @@ func streamRemoteEvents(ctx context.Context, api API, writer *remoteControlWrite
 		select {
 		case <-ctx.Done():
 			return
+		case <-changes:
 		case <-ticker.C:
 		}
 	}
@@ -1010,12 +1023,15 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 	var pendingDetaches []string
 	var revokedEndpoints []string
 	var deletingEndpoints []string
+	var topologyEndpoints []string
 	existing := d.state.Workspaces[clone.ID]
 	if err := validateRemoteWorkspaceCollision(host, clone.ID, existing); err != nil {
 		d.mu.Unlock()
 		return nil, err
 	}
 	if existing != nil {
+		topologyChanged := existing.Topology.Generation != clone.Topology.Generation ||
+			existing.Topology.Digest != clone.Topology.Digest
 		for paneID, pane := range clone.Panes {
 			if previous := existing.Panes[paneID]; previous != nil {
 				if pane.Notifications == nil {
@@ -1058,8 +1074,12 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 				if local.Revoked && !local.RevocationClosed && local.Status != AttachmentDetached {
 					revokedEndpoints = append(revokedEndpoints, local.Endpoint)
 				}
-				if authoritative.AppliedRevision == clone.Revision {
-					local.AppliedRevision = clone.Revision
+				if topologyChanged || local.AppliedTopologyGeneration != clone.Topology.Generation ||
+					local.AppliedTopologyDigest != clone.Topology.Digest {
+					local.Status = AttachmentPreparing
+					local.ReconcileStatus = "pending"
+					local.ReconcileTargetGeneration = clone.Topology.Generation
+					topologyEndpoints = append(topologyEndpoints, local.Endpoint)
 				}
 				if local.Status == AttachmentDetached && authoritative.Status != AttachmentDetached {
 					pendingDetaches = append(pendingDetaches, id)
@@ -1116,6 +1136,9 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 				_ = d.kitty.CloseWorkspace(callCtx, endpoint, result.ID)
 				cancel()
 			})
+		}
+		for _, endpoint := range sortedEndpointSet(topologyEndpoints) {
+			d.scheduleTopologyReconcile(endpoint)
 		}
 	}
 	return result, nil

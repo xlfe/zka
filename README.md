@@ -21,7 +21,7 @@ panes that need you and takes you straight back to them.
 </p>
 
 > [!NOTE]
-> zka 0.6.0 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
+> zka 0.7.0 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
 > builds on Kitty, zmx, OpenSSH, systemd user services, and coding-agent hooks
 > instead of replacing them.
 
@@ -210,14 +210,21 @@ attachments
 | **Pane** | One stable zka pane ID backed by one zmx-owned PTY. |
 | **Origin** | The machine that owns the workspace state and zmx sessions. |
 | **Attachment** | A dedicated Kitty view of a workspace on one machine. |
-| **Primary** | The authoritative interactive attachment after a local start or successful move. |
-| **Mirror** | An additional attachment created without revoking the primary. |
+| **Primary** | The attachment that owns the interactive primary lease after a local start or successful move. |
+| **Mirror** | An additional fully interactive attachment created without revoking the primary. |
 
 Kitty remains the visible interface. zmx remains the only persistent PTY owner.
 OpenSSH provides authentication and transport. zka owns workspace identity,
 topology capture, restoration, remote coordination, lifecycle, and attention.
 There is no listening zka TCP service, PTY migration, or local zmx wrapped
 around an SSH connection.
+
+The origin owns one canonical, generation-numbered topology. Tabs, splits,
+ordering, layouts, and tab titles changed in any ready attachment are committed
+at the origin and reconciled into every other connected attachment. Focus,
+scroll position, viewport size, and compositor geometry remain local so using a
+mirror does not steal focus on another machine. Disconnected attachments catch
+up from their last verified generation when they reconnect.
 
 ### Lifecycle semantics
 
@@ -236,13 +243,14 @@ The difference between closing and detaching is intentional:
 
 Restoration recreates the logical OS-window/tab/split hierarchy, layout state,
 titles, working directories, and active focus. A watcher triggers topology
-capture, with a two-second reconciliation fallback.
+capture and origin-pushed reconciliation, with a 30-second liveness fallback.
 
 ## Workspace commands
 
 ```sh
 zka workspace list
 zka workspace inspect example-project
+zka workspace reconcile example-project
 zka workspace attach example-project
 zka workspace move example-project
 zka workspace focus example-project --pane PANE_ID
@@ -660,7 +668,14 @@ journalctl --user-unit zkad
 ```
 
 `zka workspace inspect WORKSPACE` includes attachment health, pane/backend state,
-agent evidence, and retained notification failures.
+canonical topology generation/digest, convergence state, agent evidence, and
+retained notification failures. `zka workspace reconcile WORKSPACE` forces a
+complete local recapture and repair without restarting the pane backends.
+
+The 0.7.0 state migration creates a private `.v4.backup` beside the state file,
+assigns stable logical container IDs, and places any live pane omitted from the
+old manifest in a `Recovered <pane-id>` tab. Protocol 6 is intentionally not
+mixed-version compatible; upgrade and restart zka on both SSH peers together.
 
 `zka doctor` checks the enabled Codex and Claude Code executables and their
 managed hook files. An integration disabled in the NixOS module is reported as
@@ -686,7 +701,7 @@ routing the new pane through zka.
 
 ## Project status
 
-Version 0.6.0 implements the complete workspace-centric path: local lifecycle,
+Version 0.7.0 implements the complete workspace-centric path: local lifecycle,
 topology restoration, remote mirrors and two-phase moves, reconnect-safe SSH
 agent forwarding, Codex and Claude Code attention, Waybar streaming,
 desktop/ntfy notifications, and durable cleanup after partial failures.
