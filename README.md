@@ -440,7 +440,6 @@ services.zka = {
   kitty.extraArgs = [ "--class" "managed-kitty" ];
 
   ssh.identityAgent = "/run/user/%i/ssh-agent.socket";
-  ssh.extraOptions = [ "-o" "IdentitiesOnly=yes" ];
   ssh.options = [
     "-o" "ServerAliveInterval=5"
     "-o" "ServerAliveCountMax=3"
@@ -494,6 +493,26 @@ services.zka.ssh.identityAgent = "/run/user/%i/ssh-agent.socket";
 OpenSSH expands `%i` to the numeric user ID. This socket is also the default
 agent inside new zka workspaces when managed forwarding is enabled.
 
+> [!CAUTION]
+> `IdentityAgent` selects the agent socket, but `IdentitiesOnly=yes` separately
+> limits authentication to keys named by `IdentityFile`. A GPG agent,
+> smartcard, or other agent-only key may therefore work with plain `ssh` while
+> zka fails with `Permission denied (publickey)` because the key was never
+> offered. Unless you deliberately need to restrict a multi-key agent, omit
+> `IdentitiesOnly=yes`; the explicit `ssh.identityAgent` already selects the
+> intended agent.
+
+If `IdentitiesOnly=yes` is required, name the corresponding public key file.
+OpenSSH can use that public key to select the matching private key held by the
+agent; the private key does not need to be exported:
+
+```nix
+services.zka.ssh.extraOptions = [
+  "-o" "IdentitiesOnly=yes"
+  "-o" "IdentityFile=/home/user/.ssh/gpg-card.pub"
+];
+```
+
 Inspect the user manager's current environment with:
 
 ```sh
@@ -534,10 +553,11 @@ services.zka.ssh.extraOptions = [
 ];
 ```
 
-Append these entries if `ssh.extraOptions` already contains options such as
-`IdentitiesOnly=yes`. The first connection becomes the master; later control and
-pane sessions reuse it without another key or hardware-token operation. `%C`
-keeps each destination's socket name short and unique.
+Append these entries to any existing `ssh.extraOptions` list. If that list also
+contains `IdentitiesOnly=yes`, configure a matching `IdentityFile` as described
+above. The first connection becomes the master; later control and pane sessions
+reuse it without another key or hardware-token operation. `%C` keeps each
+destination's socket name short and unique.
 
 A connection failure interrupts all multiplexed channels together. zka's
 control and pane reconnect paths then reattach them to the same zmx sessions.
