@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"testing"
@@ -76,5 +77,41 @@ func TestProcessExitCodeForSignal(t *testing.T) {
 	err = cmd.Run()
 	if got := processExitCode(err); got != 128+int(syscall.SIGTERM) {
 		t.Fatalf("signal exit code = %d", got)
+	}
+}
+
+// A pane's recorded directory can be deleted while the workspace is closed --
+// a scratch dir, a removed git worktree. exec fails outright when Dir does not
+// exist, so an unusable directory must be dropped rather than kill the pane.
+func TestPaneHostStartsWhenTheRecordedDirectoryIsGone(t *testing.T) {
+	root := t.TempDir()
+	d, err := newTestDaemon(t, root, quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	d.mu.Lock()
+	d.state.Workspaces[workspace.ID].Panes[pane.ID].CWD = filepath.Join(root, "deleted-worktree")
+	if err := d.store.Save(d.state); err != nil {
+		d.mu.Unlock()
+		t.Fatal(err)
+	}
+	d.mu.Unlock()
+	t.Setenv("ZKA_TEST_HELPER", "17")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := runPaneHost(
+		[]string{"--workspace", workspace.ID, "--pane", pane.ID, "--", exe, "-test.run=TestAgentHelperProcess"},
+		d.paths, os.Stdin, io.Discard, io.Discard,
+	)
+	if err != nil {
+		t.Fatalf("pane died because its recorded directory was gone: %v", err)
+	}
+	if code != 17 {
+		t.Fatalf("exit code = %d, want the shell to have run anyway", code)
 	}
 }

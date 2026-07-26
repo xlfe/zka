@@ -32,6 +32,7 @@ type Daemon struct {
 	state    StateData
 	config   Config
 	runner   CommandRunner
+	proc     processTree
 	kitty    KittyClient
 	logger   *log.Logger
 	sshAgent sshAgentInfo
@@ -123,6 +124,7 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 		state:  state,
 		config: cfg,
 		runner: runner,
+		proc:   procFS{},
 		kitty: KittyClient{
 			Runner:  runner,
 			Command: cfg.Kitty.KittenCommand,
@@ -390,6 +392,9 @@ type workspacePaneRequest struct {
 	// admission can be decided from evidence rather than from a timer.
 	Endpoint string `json:"endpoint,omitempty"`
 	WindowID int64  `json:"window_id,omitempty"`
+	// InheritFromPane names the pane the user was looking at when this one was
+	// opened, so the new pane can start in that shell's current directory.
+	InheritFromPane string `json:"inherit_from_pane,omitempty"`
 }
 
 type preparePaneResponse struct {
@@ -409,6 +414,10 @@ type allocatePaneRequest struct {
 	CWD       string `json:"cwd,omitempty"`
 	Endpoint  string `json:"endpoint,omitempty"`
 	WindowID  int64  `json:"window_id,omitempty"`
+	// InheritFromPane names the pane the user was looking at. For a remote
+	// workspace this is the only usable cwd signal: the requesting host's own
+	// directory is meaningless on the origin.
+	InheritFromPane string `json:"inherit_from_pane,omitempty"`
 }
 
 // admitPaneRequest asks the daemon to commit a freshly tagged pane into the
@@ -873,6 +882,11 @@ func resolvePaneLocked(workspace *Workspace, ref string) (*Pane, error) {
 }
 
 func (d *Daemon) preparePane(req workspacePaneRequest) (preparePaneResponse, error) {
+	// Resolved before the lock: inheritance reads /proc and stats directories,
+	// and no syscall may run under the global mutex.
+	if req.Pane == "" {
+		req.CWD = d.inheritedCWD(req.Workspace, req.InheritFromPane, req.CWD)
+	}
 	d.mu.Lock()
 	workspace, err := d.resolveWorkspaceLocked(req.Workspace)
 	if err != nil {
@@ -929,6 +943,35 @@ func (d *Daemon) preparePane(req workspacePaneRequest) (preparePaneResponse, err
 	return response, nil
 }
 
+// inheritedCWD resolves the directory a new pane should start in. It snapshots
+// the source pane under the lock and then does every filesystem lookup
+// unlocked, because holding the global mutex across a syscall is exactly the
+// shape that produced a previous update storm.
+//
+// Only the authoritative daemon resolves. A replica caches the origin's panes,
+// but their pids belong to the origin's process table -- reading /proc for them
+// locally would either miss or, worse, name an unrelated local process.
+func (d *Daemon) inheritedCWD(workspaceRef, sourcePaneID, requested string) string {
+	if sourcePaneID == "" {
+		return requested
+	}
+	d.mu.Lock()
+	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
+	if err != nil || workspace.RemoteHost != "" {
+		d.mu.Unlock()
+		return requested
+	}
+	source := workspace.Panes[sourcePaneID]
+	if source == nil {
+		d.mu.Unlock()
+		return requested
+	}
+	snapshot := source.Clone()
+	workspaceID := workspace.ID
+	d.mu.Unlock()
+	return inheritedPaneCWD(d.proc, workspaceID, snapshot, requested)
+}
+
 func attachmentIDForEndpointLocked(workspace *Workspace, endpoint string) string {
 	if endpoint == "" {
 		return ""
@@ -979,6 +1022,7 @@ func allocatePaneLocked(workspace *Workspace, key, cwd string, admission PaneAdm
 }
 
 func (d *Daemon) allocatePane(req allocatePaneRequest) (allocatePaneResponse, error) {
+	req.CWD = d.inheritedCWD(req.Workspace, req.InheritFromPane, req.CWD)
 	d.mu.Lock()
 	workspace, err := d.resolveWorkspaceLocked(req.Workspace)
 	if err != nil {

@@ -764,7 +764,14 @@ func dispatchRemoteControl(ctx context.Context, api API, op string, raw json.Raw
 		if err := requireAuthoritative(ctx, api, req.Workspace); err != nil {
 			return nil, err
 		}
-		result, err := api.AllocatePane(ctx, req.Workspace, req.Key, req.CWD)
+		// Deliberately sanitised. Endpoint and WindowID are attachment-local
+		// Kitty identities belonging to the *requesting* host; forwarding them
+		// would make this origin schedule pane admission against a Kitty that
+		// lives on someone else's machine.
+		result, err := api.AllocatePane(ctx, allocatePaneRequest{
+			Workspace: req.Workspace, Key: req.Key, CWD: req.CWD,
+			InheritFromPane: req.InheritFromPane,
+		})
 		value = result
 		if err != nil {
 			return nil, err

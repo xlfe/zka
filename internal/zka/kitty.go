@@ -230,6 +230,34 @@ func (k KittyClient) SetPaneState(ctx context.Context, endpoint string, view Run
 	return err
 }
 
+// PaneForWindow maps a Kitty window id to the zka pane tagged on it. It
+// returns "" for an untagged window, a window belonging to another workspace,
+// or any failure: a missing source pane must degrade to "no hint", never fail
+// the launch that asked for it.
+func (k KittyClient) PaneForWindow(ctx context.Context, endpoint, workspaceID string, windowID int64) string {
+	if endpoint == "" || windowID <= 0 {
+		return ""
+	}
+	tree, err := k.List(ctx, endpoint)
+	if err != nil {
+		return ""
+	}
+	for _, osWindow := range tree {
+		for _, tab := range osWindow.Tabs {
+			for _, window := range tab.Windows {
+				if window.ID != windowID {
+					continue
+				}
+				if window.UserVars["zka_workspace"] != workspaceID {
+					return ""
+				}
+				return window.UserVars["zka_pane"]
+			}
+		}
+	}
+	return ""
+}
+
 func (k KittyClient) SetIdentity(ctx context.Context, endpoint string, windowID int64, workspaceID, paneID string) error {
 	if endpoint == "" || windowID <= 0 {
 		return fmt.Errorf("current Kitty window identity is unavailable")

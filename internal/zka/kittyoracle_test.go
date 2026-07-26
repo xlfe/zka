@@ -176,3 +176,18 @@ func TestRealKittyReceivesPerOSWindowFocus(t *testing.T) {
 		}
 	}
 }
+
+// Working-directory inheritance leans on exactly one undocumented Kitty
+// behaviour: @active-kitty-window-id in a launch command resolves to the window
+// that was active when the launch began. If a future Kitty drops it, the
+// feature degrades silently to "no hint" -- correct, but invisible. This makes
+// that regression loud instead.
+func TestRealKittySubstitutesTheActiveWindowPlaceholder(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join(kittyLibDir(t), "kitty", "launch.py"))
+	if err != nil {
+		t.Skipf("kitty launch.py is unreadable: %v", err)
+	}
+	if !strings.Contains(string(source), "'@active-kitty-window-id'") {
+		t.Fatal("kitty no longer substitutes @active-kitty-window-id; new panes will stop inheriting a directory")
+	}
+}

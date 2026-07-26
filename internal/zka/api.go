@@ -95,9 +95,9 @@ func (a API) AdmitPane(ctx context.Context, workspace, pane, endpoint string) (*
 	return out, err
 }
 
-func (a API) AllocatePane(ctx context.Context, workspace, key, cwd string) (allocatePaneResponse, error) {
+func (a API) AllocatePane(ctx context.Context, req allocatePaneRequest) (allocatePaneResponse, error) {
 	var out allocatePaneResponse
-	err := a.client.Call(ctx, "allocate_pane", allocatePaneRequest{Workspace: workspace, Key: key, CWD: cwd}, &out)
+	err := a.client.Call(ctx, "allocate_pane", req, &out)
 	return out, err
 }
 

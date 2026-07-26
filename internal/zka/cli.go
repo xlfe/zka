@@ -1197,6 +1197,7 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 	fs := newFlagSet("pane", stderr)
 	workspaceRef := fs.String("workspace", "", "workspace id")
 	paneRef := fs.String("pane", "", "existing pane id")
+	sourceWindow := fs.String("source-window", "", "Kitty window id this pane was opened from")
 	if err := fs.Parse(args); err != nil {
 		return 2, err
 	}
@@ -1213,18 +1214,21 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 	if endpoint == "" || parseErr != nil || windowID <= 0 {
 		return 1, fmt.Errorf("managed Kitty endpoint and window id are required")
 	}
-	prepared, err := api.PreparePane(context.Background(), workspacePaneRequest{
-		Workspace: *workspaceRef, Pane: *paneRef, CWD: cwd,
-		Endpoint: endpoint, WindowID: windowID,
-	})
-	if err != nil {
-		return 1, err
-	}
 	cfg, err := LoadConfig()
 	if err != nil {
 		return 1, err
 	}
 	kitty := KittyClient{Runner: ExecRunner{}, Command: cfg.Kitty.KittenCommand}
+	inheritCtx, inheritCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	inheritFrom := kitty.PaneForWindow(inheritCtx, endpoint, *workspaceRef, sourceWindowID(*sourceWindow))
+	inheritCancel()
+	prepared, err := api.PreparePane(context.Background(), workspacePaneRequest{
+		Workspace: *workspaceRef, Pane: *paneRef, CWD: cwd,
+		Endpoint: endpoint, WindowID: windowID, InheritFromPane: inheritFrom,
+	})
+	if err != nil {
+		return 1, err
+	}
 	identityCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	identityErr := kitty.SetIdentity(identityCtx, endpoint, windowID, prepared.Workspace.ID, prepared.Pane.ID)
 	cancel()
@@ -1255,7 +1259,9 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 	}
 	cmd := exec.Command(cfg.ZMX.Command, commandArgs...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
-	if prepared.Create && prepared.Pane.CWD != "" {
+	// exec fails the whole launch when Dir does not exist, so a directory that
+	// has since been removed must become "no directory" rather than a dead pane.
+	if prepared.Create && usableDirectory(prepared.Pane.CWD) {
 		cmd.Dir = prepared.Pane.CWD
 	}
 	cmd.Env = paneCommandEnvironment(cfg, paths, prepared.Workspace.ID, prepared.Pane.ID, prepared.Create)
@@ -1452,6 +1458,31 @@ func waitForDeadPaneDismiss(stdin io.Reader) error {
 	}
 }
 
+// sourceWindowID parses Kitty's @active-kitty-window-id substitution. The flag
+// is a string, and a value that will not parse is ignored rather than
+// rejected: when there is no active window Kitty leaves the placeholder
+// literal, and an int flag would make flag parsing fail and kill the pane.
+func sourceWindowID(value string) int64 {
+	windowID, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || windowID <= 0 {
+		return 0
+	}
+	return windowID
+}
+
+// newRemotePaneAllocation builds the origin-side allocation for a pane opened
+// from a replica's Kitty. It deliberately carries no CWD: the replica's own
+// directory is a path on the wrong machine, and storing it in an origin pane
+// is how remote panes ended up in arbitrary directories. The origin resolves
+// the real directory from the source pane instead.
+func newRemotePaneAllocation(workspaceID, attachmentID, allocationID, sourcePaneID string) allocatePaneRequest {
+	return allocatePaneRequest{
+		Workspace:       workspaceID,
+		Key:             attachmentID + ":" + allocationID,
+		InheritFromPane: sourcePaneID,
+	}
+}
+
 func runPaneHost(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	fs := newFlagSet("pane-host", stderr)
 	workspaceID := fs.String("workspace", "", "workspace id")
@@ -1475,7 +1506,7 @@ func runPaneHost(args []string, paths Paths, stdin io.Reader, stdout, stderr io.
 	pane := workspace.Panes[*paneID]
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
-	if pane != nil && pane.CWD != "" {
+	if pane != nil && usableDirectory(pane.CWD) {
 		cmd.Dir = pane.CWD
 	}
 	cmd.Env = append(os.Environ(), "ZKA_WORKSPACE_ID="+*workspaceID, "ZKA_PANE_ID="+*paneID)
@@ -1542,7 +1573,7 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 	cmd := exec.Command(cfg.ZMX.Command, zmxArgs...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
 	cmd.Env = paneCommandEnvironment(cfg, paths, workspace.ID, pane.ID, prepared.Create)
-	if prepared.Create && pane.CWD != "" {
+	if prepared.Create && usableDirectory(pane.CWD) {
 		cmd.Dir = pane.CWD
 	}
 	if err := cmd.Start(); err != nil {
@@ -1664,6 +1695,7 @@ func runRemoteNewPane(args []string, paths Paths, stdin io.Reader, stdout, stder
 	host := fs.String("origin", "", "origin SSH alias")
 	workspaceID := fs.String("workspace", "", "workspace id")
 	attachment := fs.String("attachment", "", "attachment id")
+	sourceWindow := fs.String("source-window", "", "Kitty window id this pane was opened from")
 	if err := fs.Parse(args); err != nil {
 		return 2, err
 	}
@@ -1684,19 +1716,18 @@ func runRemoteNewPane(args []string, paths Paths, stdin io.Reader, stdout, stder
 	if err != nil {
 		return 1, err
 	}
-	var allocated allocatePaneResponse
-	cwd, _ := os.Getwd()
-	if err := api.RemoteCall(ctx, *host, "allocate_pane", allocatePaneRequest{
-		Workspace: *workspaceID, Key: *attachment + ":" + allocationID, CWD: cwd,
-	}, &allocated); err != nil {
-		return 1, err
-	}
 	endpoint := os.Getenv("KITTY_LISTEN_ON")
 	cfg, err := LoadConfig()
 	if err != nil {
 		return 1, err
 	}
 	kitty := KittyClient{Runner: ExecRunner{}, Command: cfg.Kitty.KittenCommand}
+	inheritFrom := kitty.PaneForWindow(ctx, endpoint, *workspaceID, sourceWindowID(*sourceWindow))
+	var allocated allocatePaneResponse
+	if err := api.RemoteCall(ctx, *host, "allocate_pane",
+		newRemotePaneAllocation(*workspaceID, *attachment, allocationID, inheritFrom), &allocated); err != nil {
+		return 1, err
+	}
 	if err := kitty.SetIdentity(ctx, endpoint, windowID, allocated.Workspace.ID, allocated.Pane.ID); err != nil {
 		return 1, err
 	}

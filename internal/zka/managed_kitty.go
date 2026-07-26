@@ -165,12 +165,22 @@ func launchManagedKitty(ctx context.Context, paths Paths, cfg Config, api API, o
 }
 
 func managedKittyOverrides(managedShell string) []string {
+	// The *_with_cwd aliases spell the managed command out rather than falling
+	// through to shell=, because Kitty only substitutes placeholders in an
+	// explicit launch command. @active-kitty-window-id resolves to the window
+	// that was active when the launch began -- the tab the user was looking at
+	// -- which is the only deterministic way to know where to inherit from.
+	// Focus is useless here: by the time the new pane runs, it already has it.
+	//
+	// --cwd=last_reported stays as a harmless fallback for the launched
+	// process's own directory; zka does not rely on it.
+	inherit := managedShell + " --source-window @active-kitty-window-id"
 	return []string{
 		"--override", "allow_remote_control=socket-only",
 		"--override", "shell=" + managedShell,
-		"--override", "action_alias new_tab_with_cwd launch --type=tab --cwd=last_reported",
-		"--override", "action_alias new_window_with_cwd launch --type=window --cwd=last_reported",
-		"--override", "action_alias new_os_window_with_cwd launch --type=os-window --cwd=last_reported",
+		"--override", "action_alias new_tab_with_cwd launch --type=tab --cwd=last_reported " + inherit,
+		"--override", "action_alias new_window_with_cwd launch --type=window --cwd=last_reported " + inherit,
+		"--override", "action_alias new_os_window_with_cwd launch --type=os-window --cwd=last_reported " + inherit,
 	}
 }
 

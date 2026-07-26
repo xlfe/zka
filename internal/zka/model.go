@@ -12,7 +12,11 @@ import (
 
 const (
 	stateSchemaVersion = 6
-	protocolVersion    = 7
+	// 8: a replica stopped sending its own working directory when allocating a
+	// remote pane, and sends the source pane instead. An origin that predates
+	// this would quietly place every remote pane in the home directory, so the
+	// version check turns that into an explicit upgrade prompt.
+	protocolVersion    = 8
 	remoteProtocolName = "zka.workspace"
 	remoteProtocolMax  = 1 << 20
 )
