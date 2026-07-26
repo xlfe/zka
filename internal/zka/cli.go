@@ -1129,11 +1129,13 @@ func writeWorkspaceDetail(w io.Writer, workspace *Workspace) {
 		if pane.BackendDead {
 			fmt.Fprintf(w, "pane_backend[%s]=dead error=%s\n", shortID(pane.ID), pane.BackendError)
 		}
-		if pane.RemovalPending {
+		if pane.Retiring() {
 			fmt.Fprintf(w, "pane_removal[%s]=pending error=%s\n", shortID(pane.ID), pane.RemovalError)
 		}
-		if pane.TopologyPending {
-			fmt.Fprintf(w, "pane_topology[%s]=pending since=%s\n", shortID(pane.ID), pane.TopologyPendingAt.Format(time.RFC3339))
+		if pane.Proposed() {
+			fmt.Fprintf(w, "pane_topology[%s]=proposed since=%s endpoint=%s window=%d\n",
+				shortID(pane.ID), pane.PhaseAt.Format(time.RFC3339),
+				pane.Admission.Endpoint, pane.Admission.WindowID)
 		}
 		for _, record := range pane.Notifications {
 			if record.LastError != "" {
@@ -1156,7 +1158,7 @@ func writeWorkspaceDetail(w io.Writer, workspace *Workspace) {
 func pendingTopologyPaneCount(workspace *Workspace) int {
 	count := 0
 	for _, pane := range workspace.Panes {
-		if pane.TopologyPending || pane.RemovalPending {
+		if !pane.Admitted() {
 			count++
 		}
 	}
@@ -1203,18 +1205,24 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 	}
 	api := NewAPI(paths)
 	cwd, _ := os.Getwd()
-	prepared, err := api.PreparePane(context.Background(), *workspaceRef, *paneRef, cwd)
+	// The Kitty window identity is read before preparing so the daemon can
+	// record which window this pane belongs to. That provenance is what lets
+	// admission be decided from evidence instead of from a timer.
+	windowID, parseErr := strconv.ParseInt(os.Getenv("KITTY_WINDOW_ID"), 10, 64)
+	endpoint := os.Getenv("KITTY_LISTEN_ON")
+	if endpoint == "" || parseErr != nil || windowID <= 0 {
+		return 1, fmt.Errorf("managed Kitty endpoint and window id are required")
+	}
+	prepared, err := api.PreparePane(context.Background(), workspacePaneRequest{
+		Workspace: *workspaceRef, Pane: *paneRef, CWD: cwd,
+		Endpoint: endpoint, WindowID: windowID,
+	})
 	if err != nil {
 		return 1, err
 	}
 	cfg, err := LoadConfig()
 	if err != nil {
 		return 1, err
-	}
-	windowID, parseErr := strconv.ParseInt(os.Getenv("KITTY_WINDOW_ID"), 10, 64)
-	endpoint := os.Getenv("KITTY_LISTEN_ON")
-	if endpoint == "" || parseErr != nil || windowID <= 0 {
-		return 1, fmt.Errorf("managed Kitty endpoint and window id are required")
 	}
 	kitty := KittyClient{Runner: ExecRunner{}, Command: cfg.Kitty.KittenCommand}
 	identityCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1278,6 +1286,12 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 		<-done
 		return 1, fmt.Errorf("mark Kitty pane ready: %w", readyErr)
 	}
+	// Ask the daemon to commit this pane into the desired topology now that the
+	// window is tagged and ready. Advisory only: the background admission
+	// worker reaches the same state, so a failure here must not fail the pane.
+	admitCtx, admitCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _ = api.AdmitPane(admitCtx, prepared.Workspace.ID, prepared.Pane.ID, endpoint)
+	admitCancel()
 	runErr = <-done
 	return finishLocalPaneAttach(api, cfg, kitty, endpoint, windowID, prepared.Workspace, prepared.Pane, runErr, stdin, stdout)
 }
@@ -1490,7 +1504,7 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 	}
 	ctx := context.Background()
 	api := NewAPI(paths)
-	prepared, err := api.PreparePane(ctx, *workspaceRef, *paneRef, "")
+	prepared, err := api.PreparePane(ctx, workspacePaneRequest{Workspace: *workspaceRef, Pane: *paneRef})
 	if err != nil {
 		return 1, err
 	}

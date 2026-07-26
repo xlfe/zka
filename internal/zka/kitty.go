@@ -33,6 +33,22 @@ type kittyTab struct {
 	IsFocused   bool            `json:"is_focused"`
 	IsActive    bool            `json:"is_active"`
 	Windows     []kittyWindow   `json:"windows"`
+
+	// TitleOverridden distinguishes a tab that was explicitly named from one
+	// reporting its active window's live title. Kitty's `ls` sends
+	// "title": tab.name or tab.title, so without this a transient program
+	// title gets captured and then pinned as a permanent tab name. A nil
+	// pointer means the field was absent, i.e. a Kitty older than 0.47.
+	TitleOverridden *bool `json:"title_overridden"`
+}
+
+// namedTitle returns the tab's explicit name, or "" when the tab is unnamed and
+// is merely echoing its active window's title.
+func (t kittyTab) namedTitle() string {
+	if t.TitleOverridden != nil && !*t.TitleOverridden {
+		return ""
+	}
+	return canonicalStrippedValue(stripStateMarker(t.Title))
 }
 
 type kittyWindow struct {
@@ -158,67 +174,38 @@ func (k KittyClient) LoadSession(ctx context.Context, endpoint, path string, anc
 	return err
 }
 
-func (k KittyClient) SetTabLayout(ctx context.Context, endpoint string, tabID int64, layout string, enabled []string) error {
-	match := "id:" + strconv.FormatInt(tabID, 10)
-	if len(enabled) != 0 {
-		args := []string{"set-enabled-layouts", "--match", match}
-		args = append(args, enabled...)
-		if _, err := k.rc(ctx, endpoint, args...); err != nil {
-			return err
-		}
+func (k KittyClient) SetEnabledLayouts(ctx context.Context, endpoint string, tabID int64, enabled []string) error {
+	if len(enabled) == 0 {
+		return nil
 	}
-	if layout != "" {
-		if _, err := k.rc(ctx, endpoint, "goto-layout", "--match", match, layout); err != nil {
-			return err
-		}
+	args := []string{"set-enabled-layouts", "--match", "id:" + strconv.FormatInt(tabID, 10)}
+	args = append(args, enabled...)
+	_, err := k.rc(ctx, endpoint, args...)
+	return err
+}
+
+func (k KittyClient) GotoLayout(ctx context.Context, endpoint string, tabID int64, layout string) error {
+	if layout == "" {
+		return nil
 	}
-	return nil
+	_, err := k.rc(ctx, endpoint, "goto-layout", "--match", "id:"+strconv.FormatInt(tabID, 10), layout)
+	return err
 }
 
 func (k KittyClient) LaunchPane(ctx context.Context, endpoint string, workspace *Workspace, pane *Pane, transport Transport, attachmentID, osWindowNodeID, tabNodeID, launchType string, anchorWindowID int64) (int64, error) {
 	if pane == nil {
 		return 0, fmt.Errorf("cannot launch an empty pane")
 	}
-	if launchType == "" {
-		launchType = "window"
-	}
 	if anchorWindowID > 0 {
 		if _, err := k.rc(ctx, endpoint, "focus-window", "--match", "id:"+strconv.FormatInt(anchorWindowID, 10)); err != nil {
 			return 0, err
 		}
 	}
-	options := stripManagedOptions(pane.LaunchOptions)
-	if transport.Kind == "ssh" {
-		options = dropLaunchOption(options, "--cwd")
-	}
-	args := []string{"launch", "--type=" + launchType, "--dont-take-focus"}
-	args = append(args, options...)
-	if anchorWindowID > 0 {
-		args = append(args, "--next-to", "id:"+strconv.FormatInt(anchorWindowID, 10))
-	}
-	if transport.Kind != "ssh" && !hasLaunchOption(options, "--cwd") && pane.CWD != "" {
-		args = append(args, "--cwd", pane.CWD)
-	}
-	if !hasLaunchOption(options, "--title") && !hasLaunchOption(options, "--window-title") && pane.Title != "" {
-		args = append(args, "--title", pane.Title)
-	}
-	args = append(args,
-		"--var", "zka_workspace="+workspace.ID,
-		"--var", "zka_pane="+pane.ID,
-		"--var", "zka_state="+string(pane.State),
-		"--var", "zka_ready=0",
-		"--var", "zka_os_window="+osWindowNodeID,
-		"--var", "zka_tab="+tabNodeID,
-		"--env", "ZKA_WORKSPACE_ID="+workspace.ID,
-		"--env", "ZKA_PANE_ID="+pane.ID,
-	)
-	if transport.Kind == "ssh" {
-		args = append(args, "zka", "remote-pane", "--origin", transport.Host,
-			"--workspace", workspace.ID, "--pane", pane.ID, "--attachment", attachmentID)
-	} else {
-		args = append(args, "zka", "pane", "--workspace", workspace.ID, "--pane", pane.ID)
-	}
-	out, err := k.rc(ctx, endpoint, args...)
+	line := buildLaunch(launchSpec{
+		Workspace: workspace, Pane: pane, Transport: transport, AttachmentID: attachmentID,
+		OSWindowNodeID: osWindowNodeID, TabNodeID: tabNodeID,
+	})
+	out, err := k.rc(ctx, endpoint, line.RCArgs(launchType, anchorWindowID, true)...)
 	if err != nil {
 		return 0, err
 	}
@@ -236,7 +223,10 @@ func (k KittyClient) SetPaneState(ctx context.Context, endpoint string, view Run
 		return err
 	}
 	title := strings.TrimSpace(stateMarker(pane.State) + " " + pane.Title)
-	_, err := k.rc(ctx, endpoint, "set-window-title", "--match", match, title)
+	// kitten expands ANSI-C escapes in the positional arguments of
+	// set-window-title, and refuses a positional that looks like an option, so
+	// the title is escaped and placed after "--".
+	_, err := k.rc(ctx, endpoint, "set-window-title", "--match", match, "--", ansiCEscape(title))
 	return err
 }
 
@@ -261,8 +251,15 @@ func (k KittyClient) SetPaneReady(ctx context.Context, endpoint string, windowID
 	return err
 }
 
+// SetTabTitle names a tab, or clears the name when title is empty so the tab
+// falls back to reporting its active window's title. Like set-window-title,
+// kitten expands ANSI-C escapes in the positional argument.
 func (k KittyClient) SetTabTitle(ctx context.Context, endpoint string, tabID int64, title string) error {
-	_, err := k.rc(ctx, endpoint, "set-tab-title", "--match", "id:"+strconv.FormatInt(tabID, 10), title)
+	args := []string{"set-tab-title", "--match", "id:" + strconv.FormatInt(tabID, 10)}
+	if title != "" {
+		args = append(args, "--", ansiCEscape(title))
+	}
+	_, err := k.rc(ctx, endpoint, args...)
 	return err
 }
 
@@ -280,7 +277,7 @@ func (k KittyClient) Notify(ctx context.Context, view RuntimeView, endpoint stri
 	return k.rc(callCtx, endpoint, "run", k.command(), "notify",
 		"--app-name", "zka", "--identifier", identifier,
 		"--urgency", urgency, "--icon", icon,
-		"--button", "Focus", "--wait-for-completion",
+		"--button", "Focus", "--wait-for-completion", "--",
 		notificationTitle(workspace, pane), notificationBody(workspace, pane, true))
 }
 
@@ -290,9 +287,58 @@ func (k KittyClient) CloseNotification(ctx context.Context, endpoint, workspaceI
 	_, _ = k.rc(callCtx, endpoint, "run", k.command(), "notify", "--identifier", "zka-"+workspaceID+"-"+paneID)
 }
 
-func findWorkspaceViews(tree []kittyOSWindow, workspaceID string) (map[string]RuntimeView, []int64) {
+// untaggedWindow is a Kitty window carrying no zka identity. Nascent ones are
+// managed panes whose `zka pane` process has not called SetIdentity yet; they
+// are a normal, momentary state and must not fail the whole capture the way a
+// genuinely foreign window does.
+type untaggedWindow struct {
+	ID      int64
+	Nascent bool
+}
+
+func foreignUntaggedWindows(windows []untaggedWindow) []int64 {
+	var foreign []int64
+	for _, window := range windows {
+		if !window.Nascent {
+			foreign = append(foreign, window.ID)
+		}
+	}
+	return foreign
+}
+
+// nascentManagedWindow reports whether an untagged window is a managed shell
+// that is still starting up. The managed Kitty runs `zka pane --workspace X`
+// as its shell, so the cmdline identifies it from creation.
+func nascentManagedWindow(window kittyWindow, workspaceID string) bool {
+	if len(window.Cmdline) < 2 {
+		return false
+	}
+	base := window.Cmdline[0]
+	if at := strings.LastIndexByte(base, '/'); at >= 0 {
+		base = base[at+1:]
+	}
+	if base != "zka" {
+		return false
+	}
+	switch window.Cmdline[1] {
+	case "pane", "remote-pane", "remote-new-pane":
+	default:
+		return false
+	}
+	if window.Env["ZKA_WORKSPACE_ID"] != "" && window.Env["ZKA_WORKSPACE_ID"] != workspaceID {
+		return false
+	}
+	for index, token := range window.Cmdline {
+		if token == "--workspace" && index+1 < len(window.Cmdline) {
+			return window.Cmdline[index+1] == workspaceID
+		}
+	}
+	return true
+}
+
+func findWorkspaceViews(tree []kittyOSWindow, workspaceID string) (map[string]RuntimeView, []untaggedWindow) {
 	result := map[string]RuntimeView{}
-	var untagged []int64
+	var untagged []untaggedWindow
 	now := time.Now().UTC()
 	for _, osWindow := range tree {
 		for _, tab := range osWindow.Tabs {
@@ -300,7 +346,9 @@ func findWorkspaceViews(tree []kittyOSWindow, workspaceID string) (map[string]Ru
 				workspace := window.UserVars["zka_workspace"]
 				pane := window.UserVars["zka_pane"]
 				if workspace == "" || pane == "" {
-					untagged = append(untagged, window.ID)
+					untagged = append(untagged, untaggedWindow{
+						ID: window.ID, Nascent: nascentManagedWindow(window, workspaceID),
+					})
 					continue
 				}
 				if workspace != workspaceID {
@@ -321,22 +369,29 @@ func findWorkspaceViews(tree []kittyOSWindow, workspaceID string) (map[string]Ru
 func topologyFromKitty(tree []kittyOSWindow, workspaceID string) ([]Node, error) {
 	var topology []Node
 	for _, osWindow := range tree {
-		osNode := Node{Kind: "os-window", State: osWindow.State, Class: osWindow.WMClass, Name: osWindow.WMName, Focused: osWindow.IsFocused}
+		osNode := Node{Kind: "os-window", State: osWindow.State,
+			Class: canonicalStrippedValue(osWindow.WMClass), Name: canonicalStrippedValue(osWindow.WMName),
+			Focused: osWindow.IsFocused}
 		osIdentityConflict := false
 		for _, tab := range osWindow.Tabs {
 			layoutState, err := logicalKittyLayoutState(tab)
 			if err != nil {
 				return nil, fmt.Errorf("normalize Kitty tab %d layout state: %w", tab.ID, err)
 			}
-			tabNode := Node{Kind: "tab", Title: stripStateMarker(tab.Title), Layout: tab.Layout, EnabledLayouts: append([]string(nil), tab.Enabled...), LayoutState: layoutState, Active: tab.IsActive, Focused: tab.IsFocused}
+			tabNode := Node{Kind: "tab", Title: tab.namedTitle(), Layout: tab.Layout, EnabledLayouts: append([]string(nil), tab.Enabled...), LayoutState: layoutState, Active: tab.IsActive, Focused: tab.IsFocused}
 			tabIdentityConflict := false
 			for _, window := range tab.Windows {
+				paneID := window.UserVars["zka_pane"]
+				if window.UserVars["zka_workspace"] == "" || paneID == "" {
+					// A managed pane that has not tagged itself yet. It is not
+					// part of the topology, and it is not an error either.
+					if nascentManagedWindow(window, workspaceID) {
+						continue
+					}
+					return nil, fmt.Errorf("%w: kitty window %d", errKittyNotQuiescent, window.ID)
+				}
 				if window.UserVars["zka_workspace"] != workspaceID {
 					return nil, fmt.Errorf("kitty window %d is not tagged for workspace %s", window.ID, workspaceID)
-				}
-				paneID := window.UserVars["zka_pane"]
-				if paneID == "" {
-					return nil, fmt.Errorf("kitty window %d has no zka_pane tag", window.ID)
 				}
 				tabID := window.UserVars["zka_tab"]
 				osWindowID := window.UserVars["zka_os_window"]
@@ -350,7 +405,9 @@ func topologyFromKitty(tree []kittyOSWindow, workspaceID string) ([]Node, error)
 				} else if osWindowID != "" && osNode.ID != osWindowID {
 					osIdentityConflict = true
 				}
-				tabNode.Children = append(tabNode.Children, Node{Kind: "pane", PaneID: paneID, Title: stripStateMarker(window.Title), CWD: window.CWD, Active: window.IsActive, Focused: window.IsFocused})
+				tabNode.Children = append(tabNode.Children, Node{Kind: "pane", PaneID: paneID,
+					Title: canonicalStrippedValue(stripStateMarker(window.Title)), CWD: window.CWD,
+					Active: window.IsActive, Focused: window.IsFocused})
 			}
 			if tabIdentityConflict {
 				tabNode.ID = ""
@@ -505,12 +562,4 @@ func remapLayoutPair(value any, groupIDs map[int64]int64) (any, error) {
 	default:
 		return nil, fmt.Errorf("split layout contains unsupported pair value %T", value)
 	}
-}
-
-func quoteKitty(value string) string {
-	value = strings.ReplaceAll(value, "\\", "\\\\")
-	value = strings.ReplaceAll(value, "\"", "\\\"")
-	value = strings.ReplaceAll(value, "$", "$$")
-	value = strings.NewReplacer("\r", " ", "\n", " ").Replace(value)
-	return "\"" + value + "\""
 }

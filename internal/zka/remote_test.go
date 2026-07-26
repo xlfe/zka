@@ -187,7 +187,7 @@ func TestRemoteCachePreservesLocalRuntimeMapping(t *testing.T) {
 	}
 	remote := &Workspace{
 		ID: remoteWorkspaceIDForTest, Name: "example-project", Origin: Host{ID: "devbox.example", Name: "devbox.example"}, Revision: 4,
-		Panes:       map[string]*Pane{"pane": {ID: "pane", Visible: true}},
+		Panes:       map[string]*Pane{"pane": {ID: "pane", Phase: PaneAdmitted}},
 		Attachments: map[string]*Attachment{},
 	}
 	if _, err := d.cacheRemoteWorkspace("devbox.example", remote); err != nil {
@@ -217,7 +217,7 @@ func TestRemoteSnapshotEvictsMissingWorkspaceAndClosesLocalView(t *testing.T) {
 	}
 	remote := &Workspace{
 		ID: remoteWorkspaceIDForTest, Name: "example-project", Origin: Host{ID: "devbox.example", Name: "devbox.example"}, Revision: 4,
-		Panes: map[string]*Pane{"pane": {ID: "pane", Visible: true}}, Attachments: map[string]*Attachment{},
+		Panes: map[string]*Pane{"pane": {ID: "pane", Phase: PaneAdmitted}}, Attachments: map[string]*Attachment{},
 	}
 	if _, err := d.cacheRemoteWorkspace("devbox.example", remote); err != nil {
 		t.Fatal(err)

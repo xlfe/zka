@@ -24,38 +24,27 @@ func attachmentEndpoint(paths Paths, attachmentID string) string {
 func templatePaneSpecs(template SessionTemplate, defaultCWD string) ([]PaneSpec, error) {
 	result := make([]PaneSpec, 0, template.Launches)
 	for _, line := range template.Lines {
-		if !line.Launch {
+		if !line.IsLaunch {
 			continue
 		}
-		options, _, err := parseLaunch(line.Tokens[1:])
-		if err != nil {
-			return nil, err
+		options := line.Launch.Options
+		cwd := ""
+		if option, ok := options.Get("--cwd"); ok {
+			cwd = option.Value
 		}
-		cwd := plainLaunchOption(options, "--cwd")
 		if cwd == "" {
 			cwd = defaultCWD
 		}
-		title := plainLaunchOption(options, "--title")
-		if title == "" {
-			title = plainLaunchOption(options, "--window-title")
+		title := ""
+		for _, name := range []string{"--title", "--window-title"} {
+			if option, ok := options.Get(name); ok && option.Value != "" {
+				title = option.Value
+				break
+			}
 		}
-		result = append(result, PaneSpec{CWD: cwd, Title: title, LaunchOptions: append([]string(nil), options...)})
+		result = append(result, PaneSpec{CWD: cwd, Title: title, LaunchOptions: options.clone()})
 	}
 	return result, nil
-}
-
-func plainLaunchOption(options []string, wanted string) string {
-	for i := 0; i < len(options); i++ {
-		name, value, inline := optionParts(options[i])
-		if !inline && launchValueOptions[name] && i+1 < len(options) {
-			value = options[i+1]
-			i++
-		}
-		if name == wanted {
-			return value
-		}
-	}
-	return ""
 }
 
 var kittyValueOptions = map[string]bool{

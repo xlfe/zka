@@ -1061,7 +1061,7 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 				local.ClientHeartbeats = authoritative.ClientHeartbeats
 				for paneID := range local.Views {
 					pane := clone.Panes[paneID]
-					if pane == nil || pane.RemovalPending {
+					if pane == nil || pane.Retiring() {
 						delete(local.Views, paneID)
 					}
 				}

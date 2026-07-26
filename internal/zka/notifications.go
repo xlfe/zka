@@ -202,41 +202,76 @@ func (d *Daemon) updateKittyState(ctx context.Context, workspace *Workspace, pan
 			}
 		}
 		if updated {
-			d.updateKittyTabTitles(ctx, attachment.Endpoint, workspace)
+			d.applyTabTitles(ctx, attachment.Endpoint, workspace)
 		}
 	}
 }
 
-func (d *Daemon) updateKittyTabTitles(ctx context.Context, endpoint string, workspace *Workspace) {
+// desiredTabName is the single formula for a managed tab's Kitty name: the
+// name the desired topology owns, decorated with the worst state among its
+// panes. An empty name means the tab must stay unnamed so Kitty falls back to
+// its active window's title.
+//
+// Having one formula matters. Previously the reconciler wrote the bare title on
+// every pass while this path wrote a decorated one, so the two overwrote each
+// other, the tab bar flickered, and the captured value oscillated.
+func desiredTabName(workspace *Workspace, tabNode Node) string {
+	if tabNode.Title == "" {
+		return ""
+	}
+	highest := StateIdle
+	for _, paneNode := range tabNode.Children {
+		if pane := workspace.Panes[paneNode.PaneID]; pane != nil {
+			if statePriority(pane.State) > statePriority(highest) {
+				highest = pane.State
+			}
+		}
+	}
+	return strings.TrimSpace(stateMarker(highest) + " " + tabNode.Title)
+}
+
+// applyTabTitles is the only caller of SetTabTitle. It writes only where the
+// live name already differs, so a settled workspace issues no calls at all.
+func (d *Daemon) applyTabTitles(ctx context.Context, endpoint string, workspace *Workspace) {
+	if len(workspace.Topology.Roots) == 0 {
+		return
+	}
 	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	tree, err := d.kitty.List(callCtx, endpoint)
 	cancel()
 	if err != nil {
 		return
 	}
+	liveTabs := map[string]kittyTab{}
 	for _, osWindow := range tree {
 		for _, tab := range osWindow.Tabs {
-			highest := StateIdle
-			hasManaged := false
 			for _, window := range tab.Windows {
-				if window.UserVars["zka_workspace"] != workspace.ID {
-					continue
-				}
-				pane := workspace.Panes[window.UserVars["zka_pane"]]
-				if pane == nil {
-					continue
-				}
-				hasManaged = true
-				if statePriority(pane.State) > statePriority(highest) {
-					highest = pane.State
+				if window.UserVars["zka_workspace"] == workspace.ID {
+					liveTabs[window.UserVars["zka_pane"]] = tab
 				}
 			}
-			if !hasManaged {
+		}
+	}
+	seen := map[int64]bool{}
+	for _, osNode := range workspace.Topology.Roots {
+		for _, tabNode := range osNode.Children {
+			if len(tabNode.Children) == 0 {
 				continue
 			}
-			title := strings.TrimSpace(stateMarker(highest) + " " + stripStateMarker(tab.Title))
+			tab, ok := liveTabs[tabNode.Children[0].PaneID]
+			if !ok || seen[tab.ID] {
+				continue
+			}
+			seen[tab.ID] = true
+			want := desiredTabName(workspace, tabNode)
+			if canonicalStrippedValue(tab.Title) == canonicalStrippedValue(want) {
+				continue
+			}
+			if want == "" && tab.namedTitle() == "" {
+				continue
+			}
 			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			_ = d.kitty.SetTabTitle(callCtx, endpoint, tab.ID, title)
+			_ = d.kitty.SetTabTitle(callCtx, endpoint, tab.ID, want)
 			cancel()
 		}
 	}

@@ -13,6 +13,27 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
+      # kitty and python3 are what the differential session-parser oracle in
+       # internal/zka needs; without them those tests skip rather than fail.
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.mkShell {
+            packages = [
+              pkgs.go
+              pkgs.gopls
+              pkgs.kitty
+              pkgs.python3
+              pkgs.shellcheck
+            ];
+            ZKA_KITTY_LIB = "${pkgs.kitty}/lib/kitty";
+          };
+        }
+      );
+
       packages = forAllSystems (
         system:
         let

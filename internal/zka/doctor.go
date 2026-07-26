@@ -107,7 +107,39 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		}
 		checks = append(checks, doctorCheck{Name: "remote-forwarded-agent", OK: forwardedOK, Detail: forwardedDetail})
 	}
+	checks = append(checks, topologyRenderableCheck(ctx, api))
 	return writeDoctorResult(checks, *jsonOut, stdout)
+}
+
+// topologyRenderableCheck turns "the desired topology cannot be expressed as a
+// Kitty session" from an outage into a diagnosable pre-flight condition. That
+// state is what drove the reconciler to rebuild every window on a timer.
+func topologyRenderableCheck(ctx context.Context, api API) doctorCheck {
+	workspaces, err := api.Workspaces(ctx)
+	if err != nil {
+		return doctorCheck{Name: "topology-renderable", OK: false, Detail: err.Error()}
+	}
+	var problems []string
+	checked := 0
+	for _, workspace := range workspaces {
+		if workspace == nil || len(workspace.Topology.Roots) == 0 {
+			continue
+		}
+		checked++
+		if digest := topologyStructuralDigest(workspace.Topology.Roots); digest != workspace.Topology.Digest {
+			problems = append(problems, fmt.Sprintf("%s: stored digest does not describe stored topology", workspace.Name))
+		}
+		if _, renderErr := renderDesiredTopologySession(workspace, Transport{Kind: "local"}, ""); renderErr != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", workspace.Name, renderErr))
+		}
+	}
+	if len(problems) != 0 {
+		return doctorCheck{Name: "topology-renderable", OK: false, Detail: strings.Join(problems, "; ")}
+	}
+	return doctorCheck{
+		Name: "topology-renderable", OK: true,
+		Detail: fmt.Sprintf("%d workspace topologies render to a Kitty session", checked),
+	}
 }
 
 func managedHookDoctorCheck(name, path, command string, enabled bool) doctorCheck {

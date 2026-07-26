@@ -1,13 +1,11 @@
 package zka
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
-	"unicode"
 )
 
 type SessionTemplate struct {
@@ -16,10 +14,9 @@ type SessionTemplate struct {
 }
 
 type templateLine struct {
-	Directive string
-	Tokens    []string
-	Launch    bool
-	Raw       string
+	Line     sessionLine
+	Launch   LaunchLine
+	IsLaunch bool
 }
 
 var safeSessionDirectives = map[string]bool{
@@ -64,42 +61,37 @@ var safeTopologyFlagOptions = map[string]bool{
 }
 
 func DefaultSessionTemplate() SessionTemplate {
-	return SessionTemplate{Lines: []templateLine{{Directive: "launch", Tokens: []string{"launch"}, Launch: true}}, Launches: 1}
+	return SessionTemplate{
+		Lines:    []templateLine{{Line: sessionLine{Directive: "launch"}, IsLaunch: true}},
+		Launches: 1,
+	}
 }
 
+// ParseSessionTemplate stays strict: a user template is authored, not captured,
+// so an unknown directive is a mistake worth reporting rather than something to
+// tolerate.
 func ParseSessionTemplate(content string) (SessionTemplate, error) {
 	var template SessionTemplate
-	for lineNumber, raw := range strings.Split(content, "\n") {
-		trimmed := strings.TrimSpace(raw)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		tokens, err := splitSessionWords(trimmed)
-		if err != nil {
-			return SessionTemplate{}, fmt.Errorf("template line %d: %w", lineNumber+1, err)
-		}
-		if len(tokens) == 0 {
-			continue
-		}
-		directive := tokens[0]
-		line := templateLine{Directive: directive, Tokens: tokens, Raw: trimmed}
-		if directive == "launch" {
-			options, command, err := parseLaunch(tokens[1:])
+	for index, line := range parseSessionLines(content) {
+		entry := templateLine{Line: line}
+		if line.Directive == "launch" {
+			launch, err := parseKittyLaunchLine(line.Rest)
 			if err != nil {
-				return SessionTemplate{}, fmt.Errorf("template line %d: %w", lineNumber+1, err)
+				return SessionTemplate{}, fmt.Errorf("template line %d: %w", index+1, err)
 			}
-			if len(command) != 0 {
-				return SessionTemplate{}, fmt.Errorf("template line %d: launch must not contain a program", lineNumber+1)
+			if len(launch.Args) != 0 {
+				return SessionTemplate{}, fmt.Errorf("template line %d: launch must not contain a program", index+1)
 			}
-			if err := validateTemplateOptions(options); err != nil {
-				return SessionTemplate{}, fmt.Errorf("template line %d: %w", lineNumber+1, err)
+			if err := validateTemplateOptions(launch.Options); err != nil {
+				return SessionTemplate{}, fmt.Errorf("template line %d: %w", index+1, err)
 			}
-			line.Launch = true
+			entry.IsLaunch = true
+			entry.Launch = launch
 			template.Launches++
-		} else if !safeSessionDirectives[directive] {
-			return SessionTemplate{}, fmt.Errorf("template line %d: directive %q is not topology-safe", lineNumber+1, directive)
+		} else if !safeSessionDirectives[line.Directive] {
+			return SessionTemplate{}, fmt.Errorf("template line %d: directive %q is not topology-safe", index+1, line.Directive)
 		}
-		template.Lines = append(template.Lines, line)
+		template.Lines = append(template.Lines, entry)
 	}
 	if template.Launches == 0 {
 		return SessionTemplate{}, fmt.Errorf("template must contain at least one bare launch")
@@ -107,24 +99,20 @@ func ParseSessionTemplate(content string) (SessionTemplate, error) {
 	return template, nil
 }
 
-func validateTemplateOptions(options []string) error {
-	for i := 0; i < len(options); i++ {
-		name, value, hasValue := optionParts(options[i])
-		if !hasValue && launchValueOptions[name] && i+1 < len(options) {
-			value, hasValue = options[i+1], true
-			i++
+func validateTemplateOptions(options launchOptions) error {
+	for _, option := range options {
+		if !safeTopologyValueOptions[option.Name] && !safeTopologyFlagOptions[option.Name] {
+			return fmt.Errorf("launch option %q is not topology-safe", option.Name)
 		}
-		if !safeTopologyValueOptions[name] && !safeTopologyFlagOptions[name] {
-			return fmt.Errorf("launch option %q is not topology-safe", name)
+		if option.Name != "--var" && option.Name != "--env" {
+			continue
 		}
-		if (name == "--var" || name == "--env") && hasValue {
-			key := value
-			if at := strings.IndexByte(key, '='); at >= 0 {
-				key = key[:at]
-			}
-			if isManagedPaneVariable(key) {
-				return fmt.Errorf("reserved variable %q is managed by zka", key)
-			}
+		key := option.Value
+		if at := strings.IndexByte(key, '='); at >= 0 {
+			key = key[:at]
+		}
+		if isManagedPaneVariable(key) {
+			return fmt.Errorf("reserved variable %q is managed by zka", key)
 		}
 	}
 	return nil
@@ -137,33 +125,9 @@ func optionParts(token string) (name, value string, hasValue bool) {
 	return token, "", false
 }
 
-func parseLaunch(tokens []string) (options, command []string, err error) {
-	for i := 0; i < len(tokens); i++ {
-		token := tokens[i]
-		if token == "--" {
-			return options, append([]string(nil), tokens[i+1:]...), nil
-		}
-		if !strings.HasPrefix(token, "-") {
-			return options, append([]string(nil), tokens[i:]...), nil
-		}
-		name, _, inline := optionParts(token)
-		if inline && !launchValueOptions[name] && !launchFlagOptions[name] {
-			return nil, nil, fmt.Errorf("unsupported launch option %q", name)
-		}
-		if launchFlagOptions[name] || inline {
-			options = append(options, token)
-			continue
-		}
-		if !launchValueOptions[name] {
-			return nil, nil, fmt.Errorf("unsupported launch option %q", name)
-		}
-		if i+1 >= len(tokens) {
-			return nil, nil, fmt.Errorf("launch option %q requires a value", name)
-		}
-		options = append(options, token, tokens[i+1])
-		i++
-	}
-	return options, nil, nil
+func isManagedPaneVariable(key string) bool {
+	return key == "zka_workspace" || key == "zka_pane" || key == "zka_state" || key == "zka_ready" ||
+		key == "zka_os_window" || key == "zka_tab" || strings.HasPrefix(key, "ZKA_")
 }
 
 func GenerateManagedSession(template SessionTemplate, workspace *Workspace) (string, error) {
@@ -171,207 +135,122 @@ func GenerateManagedSession(template SessionTemplate, workspace *Workspace) (str
 	if len(panes) != template.Launches {
 		return "", fmt.Errorf("template has %d launches but workspace has %d panes", template.Launches, len(panes))
 	}
-	var out bytes.Buffer
+	var out sessionWriter
 	paneIndex := 0
 	for _, line := range template.Lines {
-		if !line.Launch {
-			writeRawDirective(&out, line.Raw)
+		if !line.IsLaunch {
+			reemitSessionLine(&out, line.Line, false)
 			continue
 		}
-		options, _, err := parseLaunch(line.Tokens[1:])
-		if err != nil {
-			return "", err
-		}
-		writeCanonicalLaunch(&out, options, workspace, panes[paneIndex], Transport{Kind: "local"}, "")
+		pane := panes[paneIndex]
+		pane.LaunchOptions = line.Launch.Options.clone()
+		out.Launch(buildLaunch(launchSpec{Workspace: workspace, Pane: pane, Transport: Transport{Kind: "local"}}))
 		paneIndex++
 	}
 	return out.String(), nil
 }
 
-func writeCanonicalLaunch(out *bytes.Buffer, options []string, workspace *Workspace, pane *Pane, transport Transport, attachmentID string) {
-	writeCanonicalLaunchWithTopology(out, options, workspace, pane, transport, attachmentID, "", "", 0)
+// reemitSessionLine re-encodes a directive that was parsed from somewhere else.
+// decoded says whether Rest came from zka's own rendering (already "$"-escaped)
+// or from Kitty, which writes its values raw.
+func reemitSessionLine(out *sessionWriter, line sessionLine, decoded bool) {
+	value := line.Rest
+	if decoded {
+		value = line.verbatimValue()
+	}
+	switch line.Directive {
+	case "new_os_window":
+		out.NewOSWindow()
+	case "focus":
+		out.Focus()
+	case "focus_os_window":
+		out.FocusOSWindow()
+	case "focus_tab":
+		index, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil || index < 0 {
+			return
+		}
+		out.FocusTab(index)
+	case "set_layout_state":
+		// Never expanded by Kitty, so Rest is literal in both conventions.
+		out.LayoutState([]byte(line.Rest))
+	case "enabled_layouts":
+		out.EnabledLayouts(strings.Split(value, ","))
+	case "layout":
+		out.Layout(value)
+	case "new_tab":
+		out.NewTab(stripStateMarker(value))
+	case "title":
+		out.Title(stripStateMarker(value))
+	case "cd":
+		out.CD(value)
+	case "os_window_state":
+		out.OSWindowState(value)
+	case "os_window_class":
+		out.OSWindowClass(value)
+	case "os_window_name":
+		out.OSWindowName(value)
+	case "os_window_title":
+		out.OSWindowTitle(value)
+	case "os_window_size":
+		fields := strings.Fields(value)
+		if len(fields) == 2 {
+			out.OSWindowSize(fields[0], fields[1])
+		}
+	case "resize_window":
+		out.ResizeWindow(strings.Fields(value))
+	case "focus_matching_window":
+		out.FocusMatching(value)
+	}
 }
 
-func writeCanonicalLaunchWithTopology(out *bytes.Buffer, options []string, workspace *Workspace, pane *Pane, transport Transport, attachmentID, osWindowNodeID, tabNodeID string, serializedWindowID int64) {
-	clean := stripManagedOptions(options)
-	if transport.Kind == "ssh" {
-		clean = dropLaunchOption(clean, "--cwd")
-	}
-	tokens := []string{"launch"}
-	if serializedWindowID > 0 {
-		serialized, _ := json.Marshal(map[string]int64{"id": serializedWindowID})
-		tokens = append(tokens, "kitty-unserialize-data="+string(serialized))
-	}
-	tokens = append(tokens, clean...)
-	if transport.Kind != "ssh" && !hasLaunchOption(clean, "--cwd") && pane.CWD != "" {
-		tokens = append(tokens, "--cwd", pane.CWD)
-	}
-	if !hasLaunchOption(clean, "--title") && !hasLaunchOption(clean, "--window-title") && pane.Title != "" {
-		tokens = append(tokens, "--title", pane.Title)
-	}
-	tokens = append(tokens,
-		"--var", "zka_workspace="+workspace.ID,
-		"--var", "zka_pane="+pane.ID,
-		"--var", "zka_state="+string(pane.State),
-		"--var", "zka_ready=0",
-		"--env", "ZKA_WORKSPACE_ID="+workspace.ID,
-		"--env", "ZKA_PANE_ID="+pane.ID,
-	)
-	if osWindowNodeID != "" {
-		tokens = append(tokens, "--var", "zka_os_window="+osWindowNodeID)
-	}
-	if tabNodeID != "" {
-		tokens = append(tokens, "--var", "zka_tab="+tabNodeID)
-	}
-	tokens = append(tokens, "--")
-	if transport.Kind == "ssh" {
-		tokens = append(tokens, "zka", "remote-pane", "--origin", transport.Host,
-			"--workspace", workspace.ID, "--pane", pane.ID, "--attachment", attachmentID)
-	} else {
-		tokens = append(tokens, "zka", "pane", "--workspace", workspace.ID, "--pane", pane.ID)
-	}
-	writeSessionTokens(out, tokens)
-}
-
-func dropLaunchOption(options []string, unwanted string) []string {
-	clean := make([]string, 0, len(options))
-	for i := 0; i < len(options); i++ {
-		name, _, inline := optionParts(options[i])
-		consumed := 1
-		if !inline && launchValueOptions[name] && i+1 < len(options) {
-			consumed = 2
-		}
-		if name != unwanted {
-			clean = append(clean, options[i:i+consumed]...)
-		}
-		i += consumed - 1
-	}
-	return clean
-}
-
-func stripManagedOptions(options []string) []string {
-	var clean []string
-	for i := 0; i < len(options); i++ {
-		token := options[i]
-		name, value, inline := optionParts(token)
-		consumed := 1
-		if !inline && launchValueOptions[name] && i+1 < len(options) {
-			value = options[i+1]
-			consumed = 2
-		}
-		managed := !safeTopologyValueOptions[name] && !safeTopologyFlagOptions[name]
-		if name == "--var" || name == "--env" {
-			key := value
-			if at := strings.IndexByte(key, '='); at >= 0 {
-				key = key[:at]
-			}
-			managed = managed || isManagedPaneVariable(key)
-		}
-		if !managed {
-			if name == "--title" || name == "--window-title" {
-				value = stripStateMarker(value)
-				if inline {
-					clean = append(clean, name+"="+value)
-				} else {
-					clean = append(clean, name, value)
-				}
-			} else {
-				clean = append(clean, options[i:i+consumed]...)
-			}
-		}
-		i += consumed - 1
-	}
-	return clean
-}
-
-func isManagedPaneVariable(key string) bool {
-	return key == "zka_workspace" || key == "zka_pane" || key == "zka_state" || key == "zka_ready" ||
-		key == "zka_os_window" || key == "zka_tab" || strings.HasPrefix(key, "ZKA_")
-}
-
-func hasLaunchOption(options []string, wanted string) bool {
-	for _, token := range options {
-		name, _, _ := optionParts(token)
-		if name == wanted {
-			return true
-		}
-	}
-	return false
-}
-
+// CanonicalizeKittySession rewrites Kitty's own session output into zka's
+// canonical form. Directives Kitty wrote are raw, so they are re-encoded; every
+// launch is rebuilt from scratch through buildLaunch. Unknown directives are
+// dropped with the rest of the capture intact -- capture must never fail
+// because Kitty grew a directive zka has not seen.
 func CanonicalizeKittySession(content string, workspace *Workspace) (string, error) {
-	var out bytes.Buffer
+	var out sessionWriter
 	seen := map[string]bool{}
-	for lineNumber, raw := range strings.Split(content, "\n") {
-		trimmed := strings.TrimSpace(raw)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		tokens, err := splitSessionWords(trimmed)
-		if err != nil {
-			return "", fmt.Errorf("kitty session line %d: %w", lineNumber+1, err)
-		}
-		if len(tokens) == 0 {
-			continue
-		}
-		if tokens[0] != "launch" {
-			if !safeSessionDirectives[tokens[0]] {
-				return "", fmt.Errorf("kitty session line %d: unsafe directive %q", lineNumber+1, tokens[0])
-			}
-			if workspace.RemoteHost != "" && tokens[0] == "cd" {
+	for index, line := range parseSessionLines(content) {
+		if line.Directive != "launch" {
+			if !safeSessionDirectives[line.Directive] {
 				continue
 			}
-			writeRawDirective(&out, trimmed)
+			if workspace.RemoteHost != "" && line.Directive == "cd" {
+				continue
+			}
+			reemitSessionLine(&out, line, false)
 			continue
 		}
-		launchTokens := tokens[1:]
-		if len(launchTokens) > 0 && strings.HasPrefix(launchTokens[0], "kitty-unserialize-data=") {
-			launchTokens = launchTokens[1:]
-		}
-		options, _, err := parseLaunch(launchTokens)
+		launch, err := parseKittyLaunchLine(line.Rest)
 		if err != nil {
-			return "", fmt.Errorf("kitty session line %d: %w", lineNumber+1, err)
+			return "", fmt.Errorf("kitty session line %d: %w", index+1, err)
 		}
-		workspaceID := launchOptionValue(options, "--var", "zka_workspace")
-		paneID := launchOptionValue(options, "--var", "zka_pane")
+		workspaceID := launch.Options.VarValue("--var", "zka_workspace")
+		paneID := launch.Options.VarValue("--var", "zka_pane")
 		if workspaceID != workspace.ID {
-			return "", fmt.Errorf("kitty session line %d: launch is not tagged for workspace %s", lineNumber+1, workspace.ID)
+			return "", fmt.Errorf("kitty session line %d: launch is not tagged for workspace %s", index+1, workspace.ID)
 		}
 		pane := workspace.Panes[paneID]
 		if pane == nil {
-			return "", fmt.Errorf("kitty session line %d: unknown pane %q", lineNumber+1, paneID)
+			return "", fmt.Errorf("kitty session line %d: unknown pane %q", index+1, paneID)
 		}
 		if seen[paneID] {
-			return "", fmt.Errorf("kitty session line %d: pane %s is duplicated", lineNumber+1, paneID)
+			return "", fmt.Errorf("kitty session line %d: pane %s is duplicated", index+1, paneID)
 		}
 		seen[paneID] = true
+		replay := pane.Clone()
+		replay.LaunchOptions = launch.Options.clone()
 		if workspace.RemoteHost != "" {
-			options = dropLaunchOption(options, "--cwd")
+			replay.LaunchOptions = replay.LaunchOptions.Drop("--cwd")
 		}
-		writeCanonicalLaunch(&out, options, workspace, pane, Transport{Kind: "local"}, "")
+		out.Launch(buildLaunch(launchSpec{Workspace: workspace, Pane: replay, Transport: Transport{Kind: "local"}}))
 	}
 	if len(seen) == 0 {
 		return "", fmt.Errorf("kitty session contains no managed panes")
 	}
 	return out.String(), nil
-}
-
-func launchOptionValue(options []string, option, key string) string {
-	for i := 0; i < len(options); i++ {
-		name, value, inline := optionParts(options[i])
-		if !inline && launchValueOptions[name] && i+1 < len(options) {
-			value = options[i+1]
-			i++
-		}
-		if name != option {
-			continue
-		}
-		parts := strings.SplitN(value, "=", 2)
-		if len(parts) == 2 && parts[0] == key {
-			return parts[1]
-		}
-	}
-	return ""
 }
 
 func RenderAttachmentSession(workspace *Workspace, transport Transport, attachmentID string) (string, error) {
@@ -381,29 +260,21 @@ func RenderAttachmentSession(workspace *Workspace, transport Transport, attachme
 	if strings.TrimSpace(workspace.Manifest.Session) == "" {
 		return "", fmt.Errorf("workspace %s has no captured manifest", workspace.Name)
 	}
-	var out bytes.Buffer
+	var out sessionWriter
 	seen := map[string]bool{}
-	for _, raw := range strings.Split(workspace.Manifest.Session, "\n") {
-		trimmed := strings.TrimSpace(raw)
-		tokens, err := splitSessionWords(trimmed)
-		if err != nil {
-			return "", err
-		}
-		if len(tokens) == 0 {
-			continue
-		}
-		if tokens[0] != "launch" {
-			if transport.Kind == "ssh" && tokens[0] == "cd" {
+	for index, line := range parseSessionLines(workspace.Manifest.Session) {
+		if line.Directive != "launch" {
+			if transport.Kind == "ssh" && line.Directive == "cd" {
 				continue
 			}
-			writeRawDirective(&out, trimmed)
+			reemitSessionLine(&out, line, true)
 			continue
 		}
-		options, _, err := parseLaunch(tokens[1:])
+		launch, err := parseZkaLaunchLine(line.Rest)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("manifest line %d: %w", index+1, err)
 		}
-		paneID := launchOptionValue(options, "--var", "zka_pane")
+		paneID := launch.Options.VarValue("--var", "zka_pane")
 		pane := workspace.Panes[paneID]
 		if pane == nil {
 			return "", fmt.Errorf("manifest references unknown pane %s", paneID)
@@ -412,7 +283,11 @@ func RenderAttachmentSession(workspace *Workspace, transport Transport, attachme
 			return "", fmt.Errorf("manifest duplicates pane %s", paneID)
 		}
 		seen[paneID] = true
-		writeCanonicalLaunch(&out, options, workspace, pane, transport, attachmentID)
+		replay := pane.Clone()
+		replay.LaunchOptions = launch.Options.clone()
+		out.Launch(buildLaunch(launchSpec{
+			Workspace: workspace, Pane: replay, Transport: transport, AttachmentID: attachmentID,
+		}))
 	}
 	return out.String(), nil
 }
@@ -421,7 +296,7 @@ func renderDesiredTopologySession(workspace *Workspace, transport Transport, att
 	if err := validateTopology(workspace, workspace.Topology.Roots, activeTopologyPaneIDs(workspace)); err != nil {
 		return "", fmt.Errorf("invalid desired topology: %w", err)
 	}
-	var out bytes.Buffer
+	var out sessionWriter
 	focusPane := workspace.RestoreFocusPaneID
 	if focusPane == "" {
 		for _, osNode := range workspace.Topology.Roots {
@@ -436,31 +311,21 @@ func renderDesiredTopologySession(workspace *Workspace, transport Transport, att
 			}
 		}
 	}
-	focusOSIndex, focusTabIndex := 0, 0
 	for osIndex, osNode := range workspace.Topology.Roots {
 		if osIndex > 0 {
-			writeRawDirective(&out, "new_os_window")
+			out.NewOSWindow()
 		}
-		if osNode.State != "" {
-			writeSessionTokens(&out, []string{"os_window_state", osNode.State})
-		}
-		if osNode.Class != "" {
-			writeSessionTokens(&out, []string{"os_window_class", osNode.Class})
-		}
-		if osNode.Name != "" {
-			writeSessionTokens(&out, []string{"os_window_name", osNode.Name})
-		}
+		out.OSWindowState(osNode.State)
+		out.OSWindowClass(osNode.Class)
+		out.OSWindowName(osNode.Name)
+		focusTabIndex := -1
 		for tabIndex, tabNode := range osNode.Children {
-			writeSessionTokens(&out, []string{"new_tab", tabNode.Title})
-			if len(tabNode.EnabledLayouts) != 0 {
-				writeRawDirective(&out, "enabled_layouts "+strings.Join(tabNode.EnabledLayouts, ","))
-			}
-			if tabNode.Layout != "" {
-				writeSessionTokens(&out, []string{"layout", tabNode.Layout})
-			}
-			if len(tabNode.LayoutState) != 0 {
-				writeRawDirective(&out, "set_layout_state "+string(tabNode.LayoutState))
-			}
+			out.NewTab(tabNode.Title)
+			// enabled_layouts must precede layout: set_enabled_layouts resets
+			// the current layout when it is not in the new list.
+			out.EnabledLayouts(tabNode.EnabledLayouts)
+			out.Layout(tabNode.Layout)
+			out.LayoutState(tabNode.LayoutState)
 			for paneIndex, paneNode := range tabNode.Children {
 				pane := workspace.Panes[paneNode.PaneID]
 				if pane == nil {
@@ -470,40 +335,49 @@ func renderDesiredTopologySession(workspace *Workspace, transport Transport, att
 				if len(tabNode.LayoutState) != 0 {
 					serializedWindowID = int64(paneIndex + 1)
 				}
-				writeCanonicalLaunchWithTopology(&out, pane.LaunchOptions, workspace, pane, transport, attachmentID, osNode.ID, tabNode.ID, serializedWindowID)
+				out.Launch(buildLaunch(launchSpec{
+					Workspace: workspace, Pane: pane, Transport: transport, AttachmentID: attachmentID,
+					OSWindowNodeID: osNode.ID, TabNodeID: tabNode.ID, SerializedWindowID: serializedWindowID,
+				}))
 				if pane.ID == focusPane {
-					writeRawDirective(&out, "focus")
-					focusOSIndex, focusTabIndex = osIndex, tabIndex
+					out.Focus()
+					focusTabIndex = tabIndex
 				}
 			}
 		}
-	}
-	writeRawDirective(&out, fmt.Sprintf("focus_tab %d", focusTabIndex))
-	if len(workspace.Topology.Roots) > 1 {
-		writeRawDirective(&out, fmt.Sprintf("focus_os_window %d", focusOSIndex))
+		// Kitty yields and replaces its session object at every new_os_window,
+		// so focus_tab is per-OS-window and focus_os_window must sit inside the
+		// block whose window should end up focused.
+		if focusTabIndex >= 0 {
+			out.FocusTab(focusTabIndex)
+			out.FocusOSWindow()
+		}
 	}
 	return out.String(), nil
 }
 
-func applyManifestLaunchOptions(workspace *Workspace, session string) {
-	for _, raw := range strings.Split(session, "\n") {
-		tokens, err := splitSessionWords(strings.TrimSpace(raw))
-		if err != nil || len(tokens) == 0 || tokens[0] != "launch" {
+// applyManifestLaunchOptions refreshes each pane's replayable launch options
+// from a canonical manifest. It reports parse failures instead of silently
+// dropping options, which previously hid a whole class of capture damage.
+func applyManifestLaunchOptions(workspace *Workspace, session string) error {
+	for index, line := range parseSessionLines(session) {
+		if line.Directive != "launch" {
 			continue
 		}
-		options, _, err := parseLaunch(tokens[1:])
+		launch, err := parseZkaLaunchLine(line.Rest)
 		if err != nil {
+			return fmt.Errorf("manifest line %d: %w", index+1, err)
+		}
+		pane := workspace.Panes[launch.Options.VarValue("--var", "zka_pane")]
+		if pane == nil {
 			continue
 		}
-		paneID := launchOptionValue(options, "--var", "zka_pane")
-		if pane := workspace.Panes[paneID]; pane != nil {
-			clean := stripManagedOptions(options)
-			for _, derived := range []string{"--cwd", "--title", "--window-title", "--tab-title"} {
-				clean = dropLaunchOption(clean, derived)
-			}
-			pane.LaunchOptions = clean
-		}
+		// cwd and titles are derived from the pane model on every render, so
+		// keeping a captured copy here would just be a second source of truth.
+		pane.LaunchOptions = stripManagedOptions(launch.Options).
+			Drop("--cwd", "--title", "--window-title", "--tab-title")
 	}
+	return nil
 }
 
 func CaptureManifest(ctx context.Context, kitty KittyClient, endpoint string, workspace *Workspace) (Manifest, map[string]RuntimeView, error) {
@@ -512,8 +386,8 @@ func CaptureManifest(ctx context.Context, kitty KittyClient, endpoint string, wo
 		return Manifest{}, nil, err
 	}
 	views, untagged := findWorkspaceViews(tree, workspace.ID)
-	if len(untagged) > 0 {
-		return Manifest{}, nil, fmt.Errorf("kitty has untagged windows: %v", untagged)
+	if foreign := foreignUntaggedWindows(untagged); len(foreign) > 0 {
+		return Manifest{}, nil, fmt.Errorf("%w: %v", errKittyNotQuiescent, foreign)
 	}
 	topology, err := topologyFromKitty(tree, workspace.ID)
 	if err != nil {
@@ -535,91 +409,3 @@ func CaptureManifest(ctx context.Context, kitty KittyClient, endpoint string, wo
 }
 
 var timeNowUTC = func() time.Time { return time.Now().UTC() }
-
-func writeSessionTokens(out *bytes.Buffer, tokens []string) {
-	for i, token := range tokens {
-		if i > 0 {
-			out.WriteByte(' ')
-		}
-		out.WriteString(quoteSessionToken(token))
-	}
-	out.WriteByte('\n')
-}
-
-func writeRawDirective(out *bytes.Buffer, line string) {
-	line = strings.NewReplacer("\r", " ", "\n", " ").Replace(strings.TrimSpace(line))
-	if line == "" {
-		return
-	}
-	parts := strings.SplitN(line, " ", 2)
-	if len(parts) == 2 && (parts[0] == "new_tab" || parts[0] == "title") {
-		line = parts[0] + " " + stripStateMarker(strings.TrimSpace(parts[1]))
-	}
-	out.WriteString(line)
-	out.WriteByte('\n')
-}
-
-func quoteSessionToken(token string) string {
-	if token != "" && strings.IndexFunc(token, func(r rune) bool {
-		return unicode.IsSpace(r) || r == '\'' || r == '"' || r == '\\' || r == '$' || r == '#' || unicode.IsControl(r)
-	}) == -1 {
-		return token
-	}
-	return quoteKitty(token)
-}
-
-func splitSessionWords(input string) ([]string, error) {
-	var result []string
-	var word strings.Builder
-	inWord := false
-	var quote rune
-	escaped := false
-	flush := func() {
-		if inWord {
-			result = append(result, word.String())
-			word.Reset()
-			inWord = false
-		}
-	}
-	for _, r := range input {
-		if escaped {
-			word.WriteRune(r)
-			inWord = true
-			escaped = false
-			continue
-		}
-		if r == '\\' && quote != '\'' {
-			escaped = true
-			inWord = true
-			continue
-		}
-		if quote != 0 {
-			if r == quote {
-				quote = 0
-			} else {
-				word.WriteRune(r)
-			}
-			inWord = true
-			continue
-		}
-		if r == '\'' || r == '"' {
-			quote = r
-			inWord = true
-			continue
-		}
-		if unicode.IsSpace(r) {
-			flush()
-			continue
-		}
-		word.WriteRune(r)
-		inWord = true
-	}
-	if escaped {
-		return nil, fmt.Errorf("trailing escape")
-	}
-	if quote != 0 {
-		return nil, fmt.Errorf("unterminated quote")
-	}
-	flush()
-	return result, nil
-}

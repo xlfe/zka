@@ -3,6 +3,7 @@ package zka
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -12,8 +13,8 @@ func templateWorkspace() *Workspace {
 	return &Workspace{
 		ID: "workspace", Name: "example-project", Revision: 1,
 		Panes: map[string]*Pane{
-			"pane-a": {ID: "pane-a", Position: 0, CWD: "/one", Title: "One", Visible: true, State: StateIdle, CreatedAt: time.Unix(1, 0)},
-			"pane-b": {ID: "pane-b", Position: 1, CWD: "/two", Title: "Two", Visible: true, State: StateDone, CreatedAt: time.Unix(2, 0)},
+			"pane-a": {ID: "pane-a", Position: 0, CWD: "/one", Title: "One", Phase: PaneAdmitted, State: StateIdle, CreatedAt: time.Unix(1, 0)},
+			"pane-b": {ID: "pane-b", Position: 1, CWD: "/two", Title: "Two", Phase: PaneAdmitted, State: StateDone, CreatedAt: time.Unix(2, 0)},
 		},
 		Attachments: map[string]*Attachment{},
 	}
@@ -167,7 +168,7 @@ func TestCaptureManifestRequiresEveryDedicatedKittyWindowTagged(t *testing.T) {
 	runner.handler = func(_ context.Context, _ string, _ ...string) (string, string, error) {
 		return `[{"tabs":[{"windows":[{"id":4,"user_vars":{}}]}]}]`, "", nil
 	}
-	if _, _, err := CaptureManifest(context.Background(), KittyClient{Runner: runner}, "unix:/kitty", workspace); err == nil || !strings.Contains(err.Error(), "untagged") {
+	if _, _, err := CaptureManifest(context.Background(), KittyClient{Runner: runner}, "unix:/kitty", workspace); err == nil || !errors.Is(err, errKittyNotQuiescent) {
 		t.Fatalf("untagged error = %v", err)
 	}
 }
@@ -203,7 +204,7 @@ func TestRenderAttachmentSessionUsesDesiredTopologyAndStableContainerIDs(t *test
 		"zka_os_window=os-node",
 		"zka_tab=tab-node",
 		"zka remote-pane --origin origin.example",
-		`kitty-unserialize-data={\"id\":1}`,
+		`kitty-unserialize-data=`,
 	} {
 		if !strings.Contains(session, required) {
 			t.Fatalf("rendered session does not contain %q:\n%s", required, session)
@@ -215,7 +216,7 @@ func TestRenderAttachmentSessionUsesDesiredTopologyAndStableContainerIDs(t *test
 }
 
 func TestSessionWordParserDoesNotEvaluateShell(t *testing.T) {
-	tokens, err := splitSessionWords(`launch --title "$(touch nope)" --cwd '$HOME'`)
+	tokens, err := shlexSplit(`launch --title "$(touch nope)" --cwd '$HOME'`)
 	if err != nil {
 		t.Fatal(err)
 	}

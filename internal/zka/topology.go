@@ -13,41 +13,34 @@ import (
 	"time"
 )
 
-const recoveredTabPrefix = "Recovered "
-
 func activeTopologyPaneIDs(workspace *Workspace) map[string]bool {
 	result := map[string]bool{}
 	for id, pane := range workspace.Panes {
-		if !pane.RemovalPending && !pane.TopologyPending {
+		if pane.Admitted() {
 			result[id] = true
 		}
 	}
 	return result
 }
 
+// desiredPaneIDs and activeTopologyPaneIDs are provably equal whenever a
+// desired topology exists -- that is invariant I1, checked on every commit.
 func desiredPaneIDs(workspace *Workspace) map[string]bool {
 	if len(workspace.Topology.Roots) != 0 {
 		return topologyPaneIDs(workspace.Topology.Roots)
 	}
-	return manifestPaneIDsLegacy(workspace)
+	return activeTopologyPaneIDs(workspace)
 }
 
-func manifestPaneIDsLegacy(workspace *Workspace) map[string]bool {
-	result := topologyPaneIDs(workspace.Manifest.Topology)
-	if len(result) == 0 {
-		for id, pane := range workspace.Panes {
-			if pane.Visible && !pane.RemovalPending {
-				result[id] = true
-			}
-		}
-	}
-	return result
-}
-
+// canonicalTopology normalizes a tree for storage: runtime focus is dropped and
+// containers left empty are pruned. An empty container is not representable --
+// Kitty silently deletes an intermediate empty tab and fills a trailing one
+// with an unmanaged shell, which then breaks capture permanently.
 func canonicalTopology(nodes []Node) []Node {
 	result := cloneNodes(nodes)
-	var normalize func([]Node)
-	normalize = func(children []Node) {
+	var normalize func([]Node) []Node
+	normalize = func(children []Node) []Node {
+		kept := make([]Node, 0, len(children))
 		for index := range children {
 			node := &children[index]
 			node.Active = false
@@ -56,11 +49,15 @@ func canonicalTopology(nodes []Node) []Node {
 				node.State = ""
 			}
 			node.LayoutState = stableLayoutState(node.LayoutState)
-			normalize(node.Children)
+			node.Children = normalize(node.Children)
+			if node.Kind != "pane" && len(node.Children) == 0 {
+				continue
+			}
+			kept = append(kept, *node)
 		}
+		return kept
 	}
-	normalize(result)
-	return result
+	return normalize(result)
 }
 
 // Captured Kitty layout state is rewritten to stable pane-derived IDs before
@@ -83,33 +80,54 @@ func stableLayoutState(raw json.RawMessage) json.RawMessage {
 	return normalized
 }
 
-func topologyDigest(nodes []Node) string {
-	digestNodes := topologyIdentity(nodes)
-	encoded, _ := json.Marshal(digestNodes)
+// The convergence digest covers structure only: node identity, parent/child
+// membership, and sibling order. Everything else is presentation.
+//
+// Presentation is still replicated -- it is stored in Roots and written into
+// the session file whenever a window is created -- but it must never gate
+// convergence, because an attachment cannot be commanded into most of it:
+//
+//   - LayoutState carries main_bias/biased_map, which are derived from actual
+//     window geometry. Two Kitty windows of different sizes legitimately differ
+//     forever, and a user dragging a divider would otherwise bump the
+//     generation and force every other attachment to rebuild.
+//   - Class/Name are fixed when an OS window is created, and goto_session
+//     reuses the anchor window, so the first root's class cannot be changed.
+//   - EnabledLayouts comes from each process's kitty.conf.
+//   - Pane titles are owned by the running program.
+//
+// Tab Title and Layout are enforceable, so they are pushed when they differ --
+// they are simply not part of identity.
+func topologyStructuralIdentity(nodes []Node) []Node {
+	result := make([]Node, 0, len(nodes))
+	for _, node := range nodes {
+		result = append(result, Node{
+			ID:       node.ID,
+			Kind:     node.Kind,
+			PaneID:   node.PaneID,
+			Children: topologyStructuralIdentity(node.Children),
+		})
+	}
+	return result
+}
+
+func topologyStructuralDigest(nodes []Node) string {
+	encoded, _ := json.Marshal(topologyStructuralIdentity(nodes))
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
 }
 
-func topologyIdentity(nodes []Node) []Node {
-	digestNodes := canonicalTopology(nodes)
-	var normalizeLayout func([]Node)
-	normalizeLayout = func(children []Node) {
-		for index := range children {
-			switch children[index].Kind {
-			case "os-window":
-				children[index].State = ""
-			case "pane":
-				// The running shell owns cwd independently on each replica.
-				// Origin metadata is used for new panes and cold restoration.
-				children[index].CWD = ""
-			}
-			children[index].LayoutState = stableLayoutState(children[index].LayoutState)
-			normalizeLayout(children[index].Children)
-		}
-	}
-	normalizeLayout(digestNodes)
-	return digestNodes
+func topologyStructureEqual(left, right []Node) bool {
+	return topologyStructuralDigest(left) == topologyStructuralDigest(right)
 }
+
+func topologyDigest(nodes []Node) string { return topologyStructuralDigest(nodes) }
+
+// topologyIdentity is what an attachment stores as its verified baseline.
+// Keeping it structural also stops presentation drift from flipping
+// attachmentRuntimeEqual, which would bump timestamps and push a remote
+// snapshot on every divider drag.
+func topologyIdentity(nodes []Node) []Node { return topologyStructuralIdentity(nodes) }
 
 func topologyMatchesDesired(workspace *Workspace, nodes []Node) bool {
 	return topologyDigest(nodes) == workspace.Topology.Digest &&
@@ -423,33 +441,17 @@ func rebaseCapturedTopology(workspace *Workspace, baseline, captured []Node) ([]
 		return nil, err
 	}
 
-	// If a stale add targeted a container closed concurrently, preserve its
-	// live/pending pane in an explicit recovery tab instead of dropping it.
-	present := topologyPaneIDs(rebased)
-	for paneID := range topologyPaneIDs(captured) {
-		pane := workspace.Panes[paneID]
-		if pane == nil || pane.RemovalPending || present[paneID] || !pane.TopologyPending {
-			continue
-		}
-		if len(rebased) == 0 {
-			rebased = []Node{{
-				ID:   deterministicTopologyID(workspace.ID, "os-window", "recovered"),
-				Kind: "os-window",
-			}}
-		}
-		rebased[0].Children = append(rebased[0].Children, Node{
-			ID: deterministicTopologyID(workspace.ID, "tab", "recovered/"+pane.ID), Kind: "tab",
-			Title: recoveredTabPrefix + shortID(pane.ID), Layout: "splits",
-			Children: []Node{{ID: pane.ID, Kind: "pane", PaneID: pane.ID, Title: pane.Title, CWD: pane.CWD}},
-		})
-		present[paneID] = true
-	}
+	// A pane whose container was closed concurrently is deliberately NOT
+	// fabricated back into a synthetic tab. It stays proposed and is admitted
+	// against a real tab by its own attachment's next capture. Fabricated nodes
+	// carry no enabled_layouts and no layout_state, which Kitty always reports,
+	// so they could never converge.
 	return rebased, nil
 }
 
 func validateTopology(workspace *Workspace, nodes []Node, expected map[string]bool) error {
 	if len(nodes) == 0 {
-		return fmt.Errorf("topology contains no roots")
+		return fmt.Errorf("%w: topology contains no roots", errTopologyInvalid)
 	}
 	seenNodes := map[string]bool{}
 	seenPanes := map[string]bool{}
@@ -457,37 +459,43 @@ func validateTopology(workspace *Workspace, nodes []Node, expected map[string]bo
 	visit = func(children []Node, parent string) error {
 		for _, node := range children {
 			if node.ID == "" {
-				return fmt.Errorf("topology %s node has no stable id", node.Kind)
+				return fmt.Errorf("%w: topology %s node has no stable id", errTopologyInvalid, node.Kind)
 			}
 			if seenNodes[node.ID] {
-				return fmt.Errorf("topology node id %s is duplicated", node.ID)
+				return fmt.Errorf("%w: topology node id %s is duplicated", errTopologyInvalid, node.ID)
 			}
 			seenNodes[node.ID] = true
 			switch node.Kind {
 			case "os-window":
 				if parent != "" {
-					return fmt.Errorf("os-window %s is not a root", node.ID)
+					return fmt.Errorf("%w: os-window %s is not a root", errTopologyInvalid, node.ID)
 				}
 			case "tab":
 				if parent != "os-window" {
-					return fmt.Errorf("tab %s is not inside an os-window", node.ID)
+					return fmt.Errorf("%w: tab %s is not inside an os-window", errTopologyInvalid, node.ID)
 				}
 			case "pane":
 				if parent != "tab" {
-					return fmt.Errorf("pane %s is not inside a tab", node.PaneID)
+					return fmt.Errorf("%w: pane %s is not inside a tab", errTopologyInvalid, node.PaneID)
 				}
 				if node.ID != node.PaneID {
-					return fmt.Errorf("pane %s has unstable node id %s", node.PaneID, node.ID)
+					return fmt.Errorf("%w: pane %s has unstable node id %s", errTopologyInvalid, node.PaneID, node.ID)
 				}
 				if workspace.Panes[node.PaneID] == nil {
-					return fmt.Errorf("topology references unknown pane %s", node.PaneID)
+					return fmt.Errorf("%w: topology references unknown pane %s", errTopologyInvalid, node.PaneID)
 				}
 				if seenPanes[node.PaneID] {
-					return fmt.Errorf("topology contains pane %s more than once", node.PaneID)
+					return fmt.Errorf("%w: topology contains pane %s more than once", errTopologyInvalid, node.PaneID)
 				}
 				seenPanes[node.PaneID] = true
 			default:
-				return fmt.Errorf("unsupported topology node kind %q", node.Kind)
+				return fmt.Errorf("%w: unsupported topology node kind %q", errTopologyInvalid, node.Kind)
+			}
+			// A container with no children cannot be expressed in a session
+			// file: Kitty drops an intermediate empty tab and gives a trailing
+			// one an unmanaged shell, which then fails every later capture.
+			if node.Kind != "pane" && len(node.Children) == 0 {
+				return fmt.Errorf("%w: %s %s has no children", errTopologyInvalid, node.Kind, node.ID)
 			}
 			if err := visit(node.Children, node.Kind); err != nil {
 				return err
@@ -499,121 +507,130 @@ func validateTopology(workspace *Workspace, nodes []Node, expected map[string]bo
 		return err
 	}
 	if !samePaneSet(seenPanes, expected) {
-		return fmt.Errorf("topology pane set does not equal active workspace pane set")
+		return fmt.Errorf("%w: topology pane set does not equal active workspace pane set", errTopologyInvalid)
 	}
 	return nil
 }
 
-func installDesiredTopology(workspace *Workspace, nodes []Node) (bool, error) {
-	nodes, err := stabilizeTopologyIDs(workspace.ID, workspace.Topology.Roots, nodes)
-	if err != nil {
-		return false, err
-	}
-	expected := activeTopologyPaneIDs(workspace)
-	for paneID := range topologyPaneIDs(nodes) {
-		if pane := workspace.Panes[paneID]; pane != nil && pane.TopologyPending {
-			pane.TopologyPending = false
-			pane.TopologyPendingAt = time.Time{}
-			expected[paneID] = true
-		}
-	}
-	if err := validateTopology(workspace, nodes, expected); err != nil {
-		return false, err
-	}
-	digest := topologyDigest(nodes)
-	if digest == workspace.Topology.Digest {
-		return false, nil
-	}
-	workspace.Topology.Generation++
-	if workspace.Topology.Generation == 0 {
-		workspace.Topology.Generation = 1
-	}
+// setDesiredTopology is the sole writer of Roots and Digest. Routing every
+// mutation through it is what keeps Digest == topologyStructuralDigest(Roots)
+// true; the previous code recomputed the digest and then let
+// applyCapturedPaneMetadata write titles into Roots afterwards, which could
+// leave the stored target unreachable by construction.
+func setDesiredTopology(workspace *Workspace, roots []Node) bool {
+	canonical := canonicalTopology(roots)
+	digest := topologyStructuralDigest(canonical)
+	changed := digest != workspace.Topology.Digest
+	workspace.Topology.Roots = canonical
 	workspace.Topology.Digest = digest
-	workspace.Topology.Roots = canonicalTopology(nodes)
-	return true, nil
-}
-
-func appendRecoveredPane(workspace *Workspace, pane *Pane) (bool, error) {
-	nodes := cloneNodes(workspace.Topology.Roots)
-	if len(nodes) == 0 {
-		nodes = []Node{{
-			ID:   deterministicTopologyID(workspace.ID, "os-window", "recovered"),
-			Kind: "os-window",
-		}}
-	}
-	if nodes[0].Kind != "os-window" {
-		return false, fmt.Errorf("canonical topology has no recovery OS window")
-	}
-	nodes[0].Children = append(nodes[0].Children, Node{
-		ID:     deterministicTopologyID(workspace.ID, "tab", "recovered/"+pane.ID),
-		Kind:   "tab",
-		Title:  recoveredTabPrefix + shortID(pane.ID),
-		Layout: "splits",
-		Children: []Node{{
-			ID: pane.ID, Kind: "pane", PaneID: pane.ID, Title: pane.Title, CWD: pane.CWD,
-		}},
-	})
-	return installDesiredTopology(workspace, nodes)
-}
-
-func recoverMissingTopologyPanes(workspace *Workspace) (bool, error) {
-	previousDigest := workspace.Topology.Digest
-	base := workspace.Topology.Roots
-	if len(base) == 0 {
-		base = workspace.Manifest.Topology
-	}
-	stable, err := stabilizeTopologyIDs(workspace.ID, nil, base)
-	if err != nil {
-		return false, err
-	}
-	present := topologyPaneIDs(stable)
-	var missing []*Pane
-	for _, pane := range workspace.SortedPanes() {
-		if pane.RemovalPending || pane.TopologyPending || present[pane.ID] {
-			continue
-		}
-		missing = append(missing, pane)
-	}
-	if len(stable) == 0 && len(missing) != 0 {
-		stable = []Node{{
-			ID:   deterministicTopologyID(workspace.ID, "os-window", "recovered"),
-			Kind: "os-window",
-		}}
-	}
-	if len(missing) != 0 {
-		if len(stable) == 0 {
-			return false, fmt.Errorf("cannot recover panes into an empty topology")
-		}
-		if stable[0].Kind != "os-window" {
-			return false, fmt.Errorf("cannot recover panes into non-window topology")
-		}
-		for _, pane := range missing {
-			stable[0].Children = append(stable[0].Children, Node{
-				ID:     deterministicTopologyID(workspace.ID, "tab", "recovered/"+pane.ID),
-				Kind:   "tab",
-				Title:  recoveredTabPrefix + shortID(pane.ID),
-				Layout: "splits",
-				Children: []Node{{
-					ID: pane.ID, Kind: "pane", PaneID: pane.ID,
-					Title: pane.Title, CWD: pane.CWD,
-				}},
-			})
-			workspace.Panes[pane.ID].Visible = true
-		}
-	}
-	if len(stable) == 0 {
-		return false, nil
-	}
-	if err := validateTopology(workspace, stable, activeTopologyPaneIDs(workspace)); err != nil {
-		return false, err
-	}
-	workspace.Topology.Roots = canonicalTopology(stable)
-	workspace.Topology.Digest = topologyDigest(stable)
-	changed := workspace.Topology.Digest != previousDigest
 	if workspace.Topology.Generation == 0 {
 		workspace.Topology.Generation = 1
 	} else if changed {
 		workspace.Topology.Generation++
+	}
+	return changed
+}
+
+// installDesiredTopology stabilizes, validates, and only then mutates. Every
+// failure path leaves the workspace byte-identical. The previous version
+// promoted panes out of their pending state before validating and never rolled
+// back, so one rejected capture could leave a pane marked canonical while
+// absent from Roots -- a state in which the workspace can never be rendered
+// into a session again, i.e. permanently unattachable.
+func installDesiredTopology(workspace *Workspace, nodes []Node) (bool, error) {
+	stable, err := stabilizeTopologyIDs(workspace.ID, workspace.Topology.Roots, nodes)
+	if err != nil {
+		return false, err
+	}
+	stable = canonicalTopology(stable)
+	expected := activeTopologyPaneIDs(workspace)
+	var promote []string
+	for paneID := range topologyPaneIDs(stable) {
+		if pane := workspace.Panes[paneID]; pane != nil && pane.Proposed() {
+			expected[paneID] = true
+			promote = append(promote, paneID)
+		}
+	}
+	if err := validateTopology(workspace, stable, expected); err != nil {
+		return false, err
+	}
+	if topologyStructuralDigest(stable) == workspace.Topology.Digest && len(promote) == 0 {
+		// Presentation may still have moved; keep Roots current so restores
+		// replay the latest titles and split geometry.
+		workspace.Topology.Roots = stable
+		return false, nil
+	}
+	// No failure paths beyond this point.
+	now := time.Now().UTC()
+	sort.Strings(promote)
+	for _, paneID := range promote {
+		pane := workspace.Panes[paneID]
+		pane.Phase, pane.PhaseAt = PaneAdmitted, now
+		pane.Admission.MissingSince = time.Time{}
+		pane.UpdatedAt = now
+	}
+	return setDesiredTopology(workspace, stable), nil
+}
+
+// reconcileLoadedTopology re-derives pane membership from persisted state at
+// daemon start. It replaces a routine that fabricated synthetic "Recovered"
+// tabs -- nodes Kitty can never reproduce, which is what wedged convergence in
+// the first place.
+//
+// It never fabricates and never fails a load. A pane missing from the desired
+// topology becomes proposed: its Kitty window survives a daemon restart, so the
+// next real capture admits it, and if the window is genuinely gone the
+// admission worker retires it. A workspace whose stored topology will not
+// validate degrades to "re-derive from Kitty" rather than bricking the daemon.
+func reconcileLoadedTopology(workspace *Workspace) (changed bool, degraded error) {
+	now := time.Now().UTC()
+	base := workspace.Topology.Roots
+	fromManifest := false
+	if len(base) == 0 {
+		base = workspace.Manifest.Topology
+		fromManifest = true
+	}
+	if len(base) == 0 {
+		return false, nil
+	}
+	stable := base
+	if fromManifest {
+		// Only the migration path re-stabilizes. Re-running ID assignment over
+		// an already-canonical tree can silently reassign container IDs, which
+		// bumps the generation and invalidates every attachment on each start.
+		var err error
+		if stable, err = stabilizeTopologyIDs(workspace.ID, nil, base); err != nil {
+			return false, fmt.Errorf("stabilize workspace %s topology: %w", workspace.ID, err)
+		}
+	}
+	stable = canonicalTopology(stable)
+
+	// Iterate the live map: SortedPanes returns clones, which would silently
+	// discard these transitions.
+	present := topologyPaneIDs(stable)
+	for _, pane := range workspace.Panes {
+		if pane.Retiring() || present[pane.ID] || pane.Proposed() {
+			continue
+		}
+		pane.Phase, pane.PhaseAt = PaneProposed, now
+		pane.Admission = PaneAdmission{RequestedAt: now}
+		changed = true
+	}
+	if err := validateTopology(workspace, stable, activeTopologyPaneIDs(workspace)); err != nil {
+		workspace.Topology.Roots = nil
+		workspace.Topology.Digest = ""
+		for _, pane := range workspace.Panes {
+			if pane.Retiring() {
+				continue
+			}
+			pane.Phase, pane.PhaseAt = PaneProposed, now
+			pane.Admission = PaneAdmission{RequestedAt: now}
+		}
+		return true, fmt.Errorf("workspace %s topology is unusable and will be re-derived from Kitty: %w", workspace.ID, err)
+	}
+	if fromManifest || !nodesEqual(stable, workspace.Topology.Roots) ||
+		workspace.Topology.Digest != topologyStructuralDigest(stable) {
+		changed = setDesiredTopology(workspace, stable) || changed
 	}
 	return changed, nil
 }
@@ -637,7 +654,7 @@ func annotateRuntimeViews(nodes []Node, views map[string]RuntimeView) {
 func workspaceLaunchOptions(workspace *Workspace) string {
 	type paneOptions struct {
 		ID      string
-		Options []string
+		Options launchOptions
 	}
 	values := make([]paneOptions, 0, len(workspace.Panes))
 	for _, pane := range workspace.Panes {

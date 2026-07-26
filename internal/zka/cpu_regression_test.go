@@ -59,8 +59,11 @@ func TestKittyStateProjectionUsesOnlyReadyLocalAttachments(t *testing.T) {
 
 	var stateUpdates int
 	stateCalls := runner.Calls()
-	if len(stateCalls) != 3 {
-		t.Fatalf("local Kitty projection commands = %d, want 3", len(stateCalls))
+	// set-user-vars + set-window-title for the one ready local attachment.
+	// Tab titles are diffed against the desired topology, so a workspace with
+	// none issues no extra `ls`.
+	if len(stateCalls) != 2 {
+		t.Fatalf("local Kitty projection commands = %d, want 2", len(stateCalls))
 	}
 	for _, call := range stateCalls {
 		if call.Name != "kitten" {
@@ -158,7 +161,7 @@ func TestRemoteSnapshotIdempotenceAndSingleLocalPaneUpdate(t *testing.T) {
 		Origin: Host{ID: "devbox", Name: "devbox"}, Revision: 1,
 		Panes: map[string]*Pane{
 			"pane": {
-				ID: "pane", Title: "shell", Visible: true, State: StateWorking,
+				ID: "pane", Title: "shell", Phase: PaneAdmitted, State: StateWorking,
 				CreatedAt: now, UpdatedAt: now,
 			},
 		},
@@ -199,8 +202,8 @@ func TestRemoteSnapshotIdempotenceAndSingleLocalPaneUpdate(t *testing.T) {
 
 	var stateUpdates int
 	changeCalls := runner.Calls()
-	if len(changeCalls) != 3 {
-		t.Fatalf("Kitty commands after one real remote change = %d, want 3", len(changeCalls))
+	if len(changeCalls) != 2 {
+		t.Fatalf("Kitty commands after one real remote change = %d, want 2", len(changeCalls))
 	}
 	for _, call := range changeCalls {
 		if call.Name != "kitten" {
@@ -305,9 +308,28 @@ func TestUnchangedManifestCaptureDoesNotAdvanceSemanticTimestamps(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if third.Revision != second.Revision+1 || !third.UpdatedAt.After(second.UpdatedAt) {
-		t.Fatalf("real manifest change was suppressed: revision %d -> %d, updated %s -> %s",
-			second.Revision, third.Revision, second.UpdatedAt, third.UpdatedAt)
+	// A pane title is presentation, so it must be recorded without advancing
+	// the structural revision -- otherwise every title change would invalidate
+	// every other attachment and force a rebuild.
+	if !third.UpdatedAt.After(second.UpdatedAt) {
+		t.Fatalf("real manifest change was suppressed: updated %s -> %s", second.UpdatedAt, third.UpdatedAt)
+	}
+	if third.Revision != second.Revision || third.Topology.Generation != second.Topology.Generation {
+		t.Fatalf("presentation change advanced structural identity: revision %d -> %d, generation %d -> %d",
+			second.Revision, third.Revision, second.Topology.Generation, third.Topology.Generation)
+	}
+
+	// A structural change must advance both.
+	structural := second.Manifest
+	structural.Topology = cloneNodes(second.Manifest.Topology)
+	structural.Topology[0].Children = append(structural.Topology[0].Children, Node{
+		Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "unknown-pane"}},
+	})
+	if _, err := d.updateManifest(manifestUpdateRequest{
+		Workspace: second.ID, Attachment: attachment.ID, ExpectedRevision: third.Revision,
+		Manifest: structural, Views: third.Attachments[attachment.ID].Views,
+	}); err == nil {
+		t.Fatal("a capture referencing an unknown pane was accepted")
 	}
 }
 

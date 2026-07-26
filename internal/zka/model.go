@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	stateSchemaVersion = 5
-	protocolVersion    = 6
+	stateSchemaVersion = 6
+	protocolVersion    = 7
 	remoteProtocolName = "zka.workspace"
 	remoteProtocolMax  = 1 << 20
 )
@@ -111,8 +111,7 @@ type Pane struct {
 	Backend           BackendRef                    `json:"backend"`
 	CWD               string                        `json:"cwd,omitempty"`
 	Title             string                        `json:"title,omitempty"`
-	LaunchOptions     []string                      `json:"launch_options,omitempty"`
-	Visible           bool                          `json:"visible"`
+	LaunchOptions     launchOptions                 `json:"launch_options,omitempty"`
 	Agent             string                        `json:"agent,omitempty"`
 	State             AgentState                    `json:"state"`
 	Evidence          Evidence                      `json:"evidence"`
@@ -126,12 +125,45 @@ type Pane struct {
 	BackendStart      bool                          `json:"backend_starting,omitempty"`
 	BackendDead       bool                          `json:"backend_dead,omitempty"`
 	BackendError      string                        `json:"backend_error,omitempty"`
-	RemovalPending    bool                          `json:"removal_pending,omitempty"`
 	RemovalError      string                        `json:"removal_error,omitempty"`
-	TopologyPending   bool                          `json:"topology_pending,omitempty"`
-	TopologyPendingAt time.Time                     `json:"topology_pending_at,omitempty"`
+	Phase             PaneLifecycle                 `json:"phase"`
+	PhaseAt           time.Time                     `json:"phase_at,omitempty"`
+	Admission         PaneAdmission                 `json:"admission,omitempty"`
 	CreatedAt         time.Time                     `json:"created_at"`
 	UpdatedAt         time.Time                     `json:"updated_at"`
+}
+
+// PaneLifecycle replaces the overlapping Visible / TopologyPending /
+// RemovalPending flags, which disagreed with each other and with
+// Topology.Roots once the desired topology became authoritative.
+type PaneLifecycle string
+
+const (
+	// PaneProposed: allocated, not yet in the desired topology. It becomes
+	// admitted only by committing a Kitty capture that already contains its
+	// window -- never by fabricating a topology node for it.
+	PaneProposed PaneLifecycle = "proposed"
+	// PaneAdmitted: a member of the desired pane set.
+	PaneAdmitted PaneLifecycle = "admitted"
+	// PaneRetiring: scheduled for removal, already out of the desired topology.
+	PaneRetiring PaneLifecycle = "retiring"
+)
+
+func (p *Pane) Proposed() bool { return p.Phase == PaneProposed }
+func (p *Pane) Admitted() bool { return p.Phase == PaneAdmitted }
+func (p *Pane) Retiring() bool { return p.Phase == PaneRetiring }
+
+// PaneAdmission records which Kitty window a proposed pane belongs to, so
+// admission can be decided from evidence instead of from a timer.
+type PaneAdmission struct {
+	Endpoint     string    `json:"endpoint,omitempty"`
+	AttachmentID string    `json:"attachment_id,omitempty"`
+	WindowID     int64     `json:"window_id,omitempty"`
+	RequestedAt  time.Time `json:"requested_at,omitempty"`
+	// MissingSince is the first *successful* Kitty listing that lacked the
+	// window. Only successful listings set it, so an RPC outage can never
+	// cause a pane to be retired.
+	MissingSince time.Time `json:"missing_since,omitempty"`
 }
 
 func (p *Pane) Clone() *Pane {

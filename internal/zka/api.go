@@ -83,9 +83,15 @@ func (a API) ToggleAttention(ctx context.Context) (AttentionSnapshot, error) {
 	return out, err
 }
 
-func (a API) PreparePane(ctx context.Context, workspace, pane, cwd string) (preparePaneResponse, error) {
+func (a API) PreparePane(ctx context.Context, req workspacePaneRequest) (preparePaneResponse, error) {
 	var out preparePaneResponse
-	err := a.client.Call(ctx, "prepare_pane", workspacePaneRequest{Workspace: workspace, Pane: pane, CWD: cwd}, &out)
+	err := a.client.Call(ctx, "prepare_pane", req, &out)
+	return out, err
+}
+
+func (a API) AdmitPane(ctx context.Context, workspace, pane, endpoint string) (*Workspace, error) {
+	var out *Workspace
+	err := a.client.Call(ctx, "admit_pane", admitPaneRequest{Workspace: workspace, Pane: pane, Endpoint: endpoint}, &out)
 	return out, err
 }
 

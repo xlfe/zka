@@ -97,7 +97,7 @@ func TestFindWorkspaceViewsKeepsRuntimeIDsInAttachment(t *testing.T) {
 		{ID: 10, UserVars: map[string]string{}},
 	}}}}}
 	views, untagged := findWorkspaceViews(tree, "work")
-	if len(views) != 1 || !views["pane"].Focused || views["pane"].Ready || views["pane"].TabID != 2 || len(untagged) != 1 || untagged[0] != 10 {
+	if len(views) != 1 || !views["pane"].Focused || views["pane"].Ready || views["pane"].TabID != 2 || len(untagged) != 1 || untagged[0].ID != 10 || untagged[0].Nascent {
 		t.Fatalf("views=%#v untagged=%#v", views, untagged)
 	}
 	tree[0].Tabs[0].Windows[0].UserVars["zka_ready"] = "1"
@@ -163,14 +163,21 @@ func TestKittyLayoutStateUsesStableTabLocalPaneIDs(t *testing.T) {
 	}
 }
 
-func TestQuoteKitty(t *testing.T) {
-	got := quoteKitty("a \"quote\" $HOME\nlaunch evil")
-	if !strings.Contains(got, `$$HOME`) || !strings.Contains(got, ` launch evil`) || strings.ContainsRune(got, '\n') || !strings.HasPrefix(got, `"`) {
-		t.Fatalf("quoted = %q", got)
+// A launch token must survive Kitty's shlex split verbatim, and the "$"
+// doubling must survive its expandvars pass.
+func TestLaunchTokenQuoting(t *testing.T) {
+	value := "a \"quote\" $HOME launch evil"
+	quoted := shlexQuote(escapeExpandVars(value))
+	tokens, err := shlexSplit(quoted)
+	if err != nil || len(tokens) != 1 {
+		t.Fatalf("split %q = %#v, %v", quoted, tokens, err)
+	}
+	if got := unescapeExpandVars(tokens[0]); got != value {
+		t.Fatalf("round trip = %q, want %q", got, value)
 	}
 }
 
-func mustJSON(t *testing.T, value any) string {
+func mustJSON(t testing.TB, value any) string {
 	t.Helper()
 	b, err := json.Marshal(value)
 	if err != nil {

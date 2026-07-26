@@ -2,13 +2,20 @@ package zka
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestV4MigrationRecoversLivePaneMissingFromManifest(t *testing.T) {
+// A pane missing from the persisted topology must come back as *proposed*, to
+// be admitted by the next real Kitty capture. The previous behaviour -- which
+// this test used to assert -- fabricated a synthetic "Recovered" tab carrying
+// no enabled_layouts and no layout_state. Kitty always reports both, so that
+// tab could never match and the workspace rebuilt itself every 30 seconds
+// forever. Fabricating topology is now banned outright.
+func TestStateLoadProposesLivePaneMissingFromManifestWithoutFabricatingTopology(t *testing.T) {
 	paths := testPaths(t.TempDir())
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -22,11 +29,11 @@ func TestV4MigrationRecoversLivePaneMissingFromManifest(t *testing.T) {
 				ID: "workspace", Name: "work", Revision: 9,
 				Panes: map[string]*Pane{
 					"visible": {
-						ID: "visible", Position: 0, Visible: true,
+						ID: "visible", Position: 0, Phase: PaneAdmitted,
 						Backend: BackendRef{Kind: "zmx", Ref: "visible"}, CreatedAt: now, UpdatedAt: now,
 					},
 					"orphan": {
-						ID: "orphan", Position: 1, Visible: false, BackendCreated: true, BackendReady: true,
+						ID: "orphan", Position: 1, Phase: PaneProposed, BackendCreated: true, BackendReady: true,
 						Backend: BackendRef{Kind: "zmx", Ref: "orphan"}, CreatedAt: now, UpdatedAt: now,
 					},
 				},
@@ -60,23 +67,22 @@ func TestV4MigrationRecoversLivePaneMissingFromManifest(t *testing.T) {
 	if loaded.SchemaVersion != stateSchemaVersion || workspace.Topology.Generation != 1 {
 		t.Fatalf("migrated topology = %#v", workspace.Topology)
 	}
-	if got := topologyPaneIDs(workspace.Topology.Roots); !samePaneSet(got, map[string]bool{"visible": true, "orphan": true}) {
-		t.Fatalf("migrated panes = %#v", got)
+	if got := topologyPaneIDs(workspace.Topology.Roots); !samePaneSet(got, map[string]bool{"visible": true}) {
+		t.Fatalf("migrated panes = %#v, want only the pane the manifest described", got)
 	}
-	if !workspace.Panes["orphan"].Visible {
-		t.Fatal("orphan pane remained hidden")
+	if !workspace.Panes["orphan"].Proposed() {
+		t.Fatalf("orphan phase = %q, want proposed so a real capture can admit it", workspace.Panes["orphan"].Phase)
 	}
 	if len(workspace.Topology.Roots[0].Children[0].LayoutState) != 0 {
 		t.Fatalf("migration retained attachment-local layout ids: %s", workspace.Topology.Roots[0].Children[0].LayoutState)
 	}
-	recovered := false
 	for _, tab := range workspace.Topology.Roots[0].Children {
-		if len(tab.Children) == 1 && tab.Children[0].PaneID == "orphan" && tab.Title == "Recovered orphan" {
-			recovered = true
+		if strings.HasPrefix(tab.Title, "Recovered ") {
+			t.Fatalf("state load fabricated a synthetic tab Kitty cannot reproduce: %#v", tab)
 		}
 	}
-	if !recovered {
-		t.Fatalf("orphan was not placed in a recovery tab: %#v", workspace.Topology.Roots)
+	if digest := topologyStructuralDigest(workspace.Topology.Roots); digest != workspace.Topology.Digest {
+		t.Fatalf("stored digest %s does not describe stored roots (%s)", workspace.Topology.Digest, digest)
 	}
 	attachment := workspace.Attachments["local"]
 	if attachment.AppliedTopologyGeneration != 0 || attachment.ReconcileStatus != "pending" {
@@ -113,8 +119,8 @@ func TestPartialCaptureCannotHideActivePane(t *testing.T) {
 		t.Fatal("partial capture was accepted")
 	}
 	got, _ := d.getWorkspace(workspace.ID)
-	if got.Topology.Generation != 0 || !got.Panes[panes[0].ID].Visible || !got.Panes[panes[1].ID].Visible {
-		t.Fatalf("partial capture mutated canonical pane visibility: %#v", got)
+	if got.Topology.Generation != 0 || !got.Panes[panes[0].ID].Admitted() || !got.Panes[panes[1].ID].Admitted() {
+		t.Fatalf("partial capture mutated canonical pane membership: %#v", got)
 	}
 }
 
@@ -139,12 +145,12 @@ func TestMirrorCaptureCommitsPendingPaneToCanonicalTopology(t *testing.T) {
 		t.Fatal(err)
 	}
 	baseGeneration := workspace.Topology.Generation
-	allocated, err := d.allocatePane(workspace.ID, "mirror:add", "/remote/work")
+	allocated, err := testAllocatePane(d, workspace.ID, "mirror:add", "/remote/work")
 	if err != nil {
 		t.Fatal(err)
 	}
 	second := allocated.Pane
-	if !second.TopologyPending {
+	if !second.Proposed() {
 		t.Fatal("new pane was canonical before a ready capture")
 	}
 	mirror, err := d.registerAttachment(workspace.ID, Attachment{
@@ -170,7 +176,7 @@ func TestMirrorCaptureCommitsPendingPaneToCanonicalTopology(t *testing.T) {
 		!samePaneSet(desiredPaneIDs(workspace), map[string]bool{first.ID: true, second.ID: true}) {
 		t.Fatalf("mirror topology was not committed: %#v", workspace.Topology)
 	}
-	if workspace.Panes[second.ID].TopologyPending {
+	if workspace.Panes[second.ID].Proposed() {
 		t.Fatal("committed pane remained topology-pending")
 	}
 	if workspace.Attachments[source.ID].ReconcileStatus != "pending" {
@@ -287,11 +293,11 @@ func TestConcurrentMirrorAddsAreRebasedWithoutDroppingEitherPane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstAdd, err := d.allocatePane(workspace.ID, "first:add", "")
+	firstAdd, err := testAllocatePane(d, workspace.ID, "first:add", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondAdd, err := d.allocatePane(workspace.ID, "second:add", "")
+	secondAdd, err := testAllocatePane(d, workspace.ID, "second:add", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +332,7 @@ func TestConcurrentMirrorAddsAreRebasedWithoutDroppingEitherPane(t *testing.T) {
 	}
 }
 
-func TestConcurrentMetadataEditsMergeByStableNodeID(t *testing.T) {
+func TestConcurrentPresentationEditsDoNotDisturbStructure(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -381,9 +387,21 @@ func TestConcurrentMetadataEditsMergeByStableNodeID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Presentation is deliberately last-writer-wins now: it is replicated on
+	// restore and pushed when it differs, but it is not part of structural
+	// identity, so it cannot bump the generation or invalidate a peer. What
+	// must hold is that a concurrent presentation edit never disturbs
+	// structure.
 	tab := workspace.Topology.Roots[0].Children[0]
-	if tab.Title != "Renamed elsewhere" || tab.Layout != "grid" {
-		t.Fatalf("concurrent metadata did not merge: %#v", tab)
+	if tab.Layout != "grid" {
+		t.Fatalf("latest presentation edit was lost: %#v", tab)
+	}
+	if workspace.Topology.Generation != baseGeneration {
+		t.Fatalf("presentation edits advanced the generation: %d -> %d",
+			baseGeneration, workspace.Topology.Generation)
+	}
+	if !samePaneSet(topologyPaneIDs(workspace.Topology.Roots), map[string]bool{pane.ID: true}) {
+		t.Fatalf("presentation edits disturbed structure: %#v", workspace.Topology.Roots)
 	}
 }
 
@@ -440,7 +458,10 @@ func TestStaleCaptureCannotOmitPaneFromVerifiedBaseline(t *testing.T) {
 		Manifest:               manifestForPanes(workspace, panes[0].ID),
 		Views:                  viewsForPanes(panes[0].ID),
 	})
-	if err == nil || !strings.Contains(err.Error(), "omitted previously observed pane") {
+	// Either guard is acceptable; what matters is that a capture omitting a
+	// live pane is never installed.
+	if err == nil || !(strings.Contains(err.Error(), "omitted previously observed pane") ||
+		errors.Is(err, errTopologyPaneSetMismatch)) {
 		t.Fatalf("stale omission error = %v", err)
 	}
 	current, _ := d.getWorkspace(workspace.ID)
@@ -454,8 +475,9 @@ func TestReconcileVerificationIsFencedByTopologyGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workspace := createTestWorkspace(t, d, 1)
-	pane := firstPane(workspace)
+	workspace := createTestWorkspace(t, d, 2)
+	panes := workspace.SortedPanes()
+	pane := panes[0]
 	attachment, err := d.registerAttachment(workspace.ID, Attachment{
 		ID: "source", Node: Host{ID: "source"}, Transport: Transport{Kind: "ssh"}, Endpoint: "ssh:source",
 	})
@@ -464,31 +486,42 @@ func TestReconcileVerificationIsFencedByTopologyGeneration(t *testing.T) {
 	}
 	workspace, err = d.updateManifest(manifestUpdateRequest{
 		Workspace: workspace.ID, Attachment: attachment.ID,
-		Manifest: manifestForPanes(workspace, pane.ID), Views: viewsForPanes(pane.ID),
+		Manifest: manifestForPanes(workspace, panes[0].ID, panes[1].ID),
+		Views:    viewsForPanes(panes[0].ID, panes[1].ID),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	oldGeneration := workspace.Topology.Generation
-	renamed := manifestForPanes(workspace, pane.ID)
-	renamed.Topology[0].Children[0].Title = "newer"
+	// Move the second pane into a tab of its own: a genuine structural change,
+	// which is what the generation now tracks.
+	regrouped := manifestForPanes(workspace, panes[0].ID)
+	regrouped.Topology[0].Children = append(regrouped.Topology[0].Children, Node{
+		Kind: "tab", Children: []Node{{Kind: "pane", PaneID: panes[1].ID}},
+	})
 	workspace, err = d.updateManifest(manifestUpdateRequest{
 		Workspace: workspace.ID, Attachment: attachment.ID,
-		BaseTopologyGeneration: oldGeneration, Manifest: renamed, Views: viewsForPanes(pane.ID),
+		BaseTopologyGeneration: oldGeneration, Manifest: regrouped,
+		Views: viewsForPanes(panes[0].ID, panes[1].ID),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if workspace.Topology.Generation == oldGeneration {
+		t.Fatal("a structural change did not advance the generation")
+	}
 	_, err = d.updateManifest(manifestUpdateRequest{
 		Workspace: workspace.ID, Attachment: attachment.ID,
 		BaseTopologyGeneration: oldGeneration, VerifyTopologyGeneration: oldGeneration,
-		Manifest: manifestForPanes(workspace, pane.ID), Views: viewsForPanes(pane.ID),
+		Manifest: manifestForPanes(workspace, panes[0].ID, panes[1].ID),
+		Views:    viewsForPanes(panes[0].ID, panes[1].ID),
 	})
-	if err == nil || !strings.Contains(err.Error(), "topology generation changed") {
+	if err == nil || !errors.Is(err, errTopologyGenerationChanged) {
 		t.Fatalf("verification fence error = %v", err)
 	}
 	current, _ := d.getWorkspace(workspace.ID)
-	if current.Topology.Roots[0].Children[0].Title != "newer" {
+	if len(current.Topology.Roots[0].Children) != 2 {
 		t.Fatalf("stale reconcile overwrote newer topology: %#v", current.Topology.Roots)
 	}
+	_ = pane
 }

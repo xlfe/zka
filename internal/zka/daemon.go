@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,26 +36,31 @@ type Daemon struct {
 	logger   *log.Logger
 	sshAgent sshAgentInfo
 
-	ctx            context.Context
-	cancel         context.CancelFunc
-	listener       net.Listener
-	watcher        *net.UnixConn
-	conns          map[net.Conn]struct{}
-	started        bool
-	closed         bool
-	workerErr      error
-	events         chan WatcherEvent
-	capturing      map[string]bool
-	captureAgain   map[string]bool
-	reconciling    map[string]bool
-	reconcileAgain map[string]bool
-	suppressUntil  map[string]time.Time
-	cleaning       map[string]bool
-	cleanups       map[string]*sync.Mutex
-	deleted        map[string]string
-	remotes        *RemoteManager
-	agentRelays    *agentRelayManager
-	attentionSubs  map[chan struct{}]struct{}
+	ctx               context.Context
+	cancel            context.CancelFunc
+	listener          net.Listener
+	watcher           *net.UnixConn
+	conns             map[net.Conn]struct{}
+	started           bool
+	closed            bool
+	workerErr         error
+	events            chan WatcherEvent
+	capturing         map[string]bool
+	captureAgain      map[string]bool
+	admitting         map[string]bool
+	admitAgain        map[string]bool
+	reconciling       map[string]bool
+	reconcileAgain    map[string]bool
+	deferredReconcile map[string]bool
+	captureHold       map[string]int
+	captureHoldUntil  map[string]time.Time
+	backoff           map[string]*endpointBackoff
+	cleaning          map[string]bool
+	cleanups          map[string]*sync.Mutex
+	deleted           map[string]string
+	remotes           *RemoteManager
+	agentRelays       *agentRelayManager
+	attentionSubs     map[chan struct{}]struct{}
 }
 
 func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, error) {
@@ -121,21 +127,26 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 			Runner:  runner,
 			Command: cfg.Kitty.KittenCommand,
 		},
-		logger:         logger,
-		sshAgent:       newSSHAgentInfo(cfg, os.Getenv("SSH_AUTH_SOCK")),
-		ctx:            ctx,
-		cancel:         cancel,
-		events:         make(chan WatcherEvent, 128),
-		capturing:      map[string]bool{},
-		captureAgain:   map[string]bool{},
-		reconciling:    map[string]bool{},
-		reconcileAgain: map[string]bool{},
-		suppressUntil:  map[string]time.Time{},
-		cleaning:       map[string]bool{},
-		cleanups:       map[string]*sync.Mutex{},
-		deleted:        map[string]string{},
-		conns:          map[net.Conn]struct{}{},
-		attentionSubs:  map[chan struct{}]struct{}{},
+		logger:            logger,
+		sshAgent:          newSSHAgentInfo(cfg, os.Getenv("SSH_AUTH_SOCK")),
+		ctx:               ctx,
+		cancel:            cancel,
+		events:            make(chan WatcherEvent, 128),
+		capturing:         map[string]bool{},
+		captureAgain:      map[string]bool{},
+		admitting:         map[string]bool{},
+		admitAgain:        map[string]bool{},
+		reconciling:       map[string]bool{},
+		reconcileAgain:    map[string]bool{},
+		deferredReconcile: map[string]bool{},
+		captureHold:       map[string]int{},
+		captureHoldUntil:  map[string]time.Time{},
+		backoff:           map[string]*endpointBackoff{},
+		cleaning:          map[string]bool{},
+		cleanups:          map[string]*sync.Mutex{},
+		deleted:           map[string]string{},
+		conns:             map[net.Conn]struct{}{},
+		attentionSubs:     map[chan struct{}]struct{}{},
 	}
 	store.SetOnSave(d.signalAttention)
 	d.remotes = NewRemoteManager(d)
@@ -356,9 +367,9 @@ func (d *Daemon) writeResponse(w io.Writer, data any, callErr error) {
 }
 
 type PaneSpec struct {
-	CWD           string   `json:"cwd,omitempty"`
-	Title         string   `json:"title,omitempty"`
-	LaunchOptions []string `json:"launch_options,omitempty"`
+	CWD           string        `json:"cwd,omitempty"`
+	Title         string        `json:"title,omitempty"`
+	LaunchOptions launchOptions `json:"launch_options,omitempty"`
 }
 
 type createWorkspaceRequest struct {
@@ -375,6 +386,10 @@ type workspacePaneRequest struct {
 	Workspace string `json:"workspace"`
 	Pane      string `json:"pane,omitempty"`
 	CWD       string `json:"cwd,omitempty"`
+	// Endpoint and WindowID identify the Kitty window this pane belongs to, so
+	// admission can be decided from evidence rather than from a timer.
+	Endpoint string `json:"endpoint,omitempty"`
+	WindowID int64  `json:"window_id,omitempty"`
 }
 
 type preparePaneResponse struct {
@@ -392,6 +407,16 @@ type allocatePaneRequest struct {
 	Workspace string `json:"workspace"`
 	Key       string `json:"key,omitempty"`
 	CWD       string `json:"cwd,omitempty"`
+	Endpoint  string `json:"endpoint,omitempty"`
+	WindowID  int64  `json:"window_id,omitempty"`
+}
+
+// admitPaneRequest asks the daemon to commit a freshly tagged pane into the
+// desired topology from a real Kitty capture.
+type admitPaneRequest struct {
+	Workspace string `json:"workspace"`
+	Pane      string `json:"pane"`
+	Endpoint  string `json:"endpoint,omitempty"`
 }
 
 type backendReconcileRequest struct {
@@ -552,19 +577,25 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
-		return d.preparePane(req.Workspace, req.Pane, req.CWD)
+		return d.preparePane(req)
 	case "allocate_pane":
 		var req allocatePaneRequest
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
-		return d.allocatePane(req.Workspace, req.Key, req.CWD)
+		return d.allocatePane(req)
 	case "reconcile_backends":
 		var req backendReconcileRequest
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
 		return d.reconcileBackends(ctx, req.Workspace)
+	case "admit_pane":
+		var req admitPaneRequest
+		if err := decodePayload(raw, &req); err != nil {
+			return nil, err
+		}
+		return d.admitPane(ctx, req)
 	case "reconcile_topology":
 		var req topologyReconcileRequest
 		if err := decodePayload(raw, &req); err != nil {
@@ -708,7 +739,9 @@ func (d *Daemon) createWorkspace(req createWorkspaceRequest) (*Workspace, error)
 		CreatedAt: now, UpdatedAt: now,
 	}
 	for position, spec := range req.Panes {
-		pane, paneErr := newPane(workspace.ID, position, spec, now)
+		// Genesis panes are admitted from the outset: they define the workspace
+		// rather than joining an existing topology.
+		pane, paneErr := newPane(workspace.ID, position, spec, PaneAdmitted, now)
 		if paneErr != nil {
 			return nil, paneErr
 		}
@@ -729,7 +762,7 @@ func (d *Daemon) createWorkspace(req createWorkspaceRequest) (*Workspace, error)
 	return workspace.Clone(), nil
 }
 
-func newPane(workspaceID string, position int, spec PaneSpec, now time.Time) (*Pane, error) {
+func newPane(workspaceID string, position int, spec PaneSpec, phase PaneLifecycle, now time.Time) (*Pane, error) {
 	id, err := randomID()
 	if err != nil {
 		return nil, err
@@ -741,8 +774,8 @@ func newPane(workspaceID string, position int, spec PaneSpec, now time.Time) (*P
 	return &Pane{
 		ID: id, Position: position, Backend: BackendRef{Kind: "zmx", Ref: backendName(workspaceID, id)},
 		CWD: spec.CWD, Title: title, State: StateUnknown,
-		LaunchOptions: append([]string(nil), spec.LaunchOptions...),
-		Visible:       true,
+		LaunchOptions: spec.LaunchOptions.clone(),
+		Phase:         phase, PhaseAt: now,
 		Evidence:      Evidence{Source: "zka", Event: "pane_created", Timestamp: now},
 		Notifications: map[string]NotificationRecord{}, CreatedAt: now, UpdatedAt: now,
 	}, nil
@@ -839,26 +872,42 @@ func resolvePaneLocked(workspace *Workspace, ref string) (*Pane, error) {
 	return found, nil
 }
 
-func (d *Daemon) preparePane(workspaceRef, paneRef, cwd string) (preparePaneResponse, error) {
+func (d *Daemon) preparePane(req workspacePaneRequest) (preparePaneResponse, error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
+	workspace, err := d.resolveWorkspaceLocked(req.Workspace)
 	if err != nil {
+		d.mu.Unlock()
 		return preparePaneResponse{}, err
 	}
 	if err := requireWorkspaceMutable(workspace); err != nil {
+		d.mu.Unlock()
 		return preparePaneResponse{}, err
 	}
+	admission := PaneAdmission{Endpoint: req.Endpoint, WindowID: req.WindowID}
+	admission.AttachmentID = attachmentIDForEndpointLocked(workspace, req.Endpoint)
 	var pane *Pane
-	if paneRef == "" {
-		pane, _, err = allocatePaneLocked(workspace, "", cwd)
+	if req.Pane == "" {
+		// A locally opened Kitty window is identified by endpoint and window
+		// id, which makes a retried prepare idempotent.
+		key := ""
+		if req.Endpoint != "" && req.WindowID > 0 {
+			key = "kitty:" + req.Endpoint + ":" + strconv.FormatInt(req.WindowID, 10)
+		}
+		pane, _, err = allocatePaneLocked(workspace, key, req.CWD, admission)
 		if err != nil {
+			d.mu.Unlock()
 			return preparePaneResponse{}, err
 		}
 	} else {
-		pane, err = resolvePaneLocked(workspace, paneRef)
+		pane, err = resolvePaneLocked(workspace, req.Pane)
 		if err != nil {
+			d.mu.Unlock()
 			return preparePaneResponse{}, err
+		}
+		if pane.Proposed() && req.Endpoint != "" {
+			pane.Admission.Endpoint = req.Endpoint
+			pane.Admission.WindowID = req.WindowID
+			pane.Admission.AttachmentID = admission.AttachmentID
 		}
 	}
 	create := !pane.BackendCreated && !pane.BackendStart
@@ -868,22 +917,45 @@ func (d *Daemon) preparePane(workspaceRef, paneRef, cwd string) (preparePaneResp
 	}
 	workspace.UpdatedAt = time.Now().UTC()
 	if err := d.store.Save(d.state); err != nil {
+		d.mu.Unlock()
 		return preparePaneResponse{}, err
 	}
-	return preparePaneResponse{Workspace: workspace.Clone(), Pane: pane.Clone(), Create: create}, nil
+	response := preparePaneResponse{Workspace: workspace.Clone(), Pane: pane.Clone(), Create: create}
+	proposed := pane.Proposed()
+	d.mu.Unlock()
+	if proposed {
+		d.schedulePaneAdmission(req.Endpoint)
+	}
+	return response, nil
 }
 
-func allocatePaneLocked(workspace *Workspace, key, cwd string) (*Pane, bool, error) {
+func attachmentIDForEndpointLocked(workspace *Workspace, endpoint string) string {
+	if endpoint == "" {
+		return ""
+	}
+	for _, attachment := range workspace.Attachments {
+		if attachment.Endpoint == endpoint {
+			return attachment.ID
+		}
+	}
+	return ""
+}
+
+func allocatePaneLocked(workspace *Workspace, key, cwd string, admission PaneAdmission) (*Pane, bool, error) {
 	if key != "" {
 		for _, pane := range workspace.Panes {
-			if pane.AllocationKey == key {
-				if pane.CWD == "" && cwd != "" {
-					pane.CWD = cwd
-					pane.UpdatedAt = time.Now().UTC()
-					workspace.UpdatedAt = pane.UpdatedAt
-				}
-				return pane, false, nil
+			// Only a still-proposed pane may be deduplicated. Kitty window ids
+			// restart at 1 after a Kitty restart, so an admitted pane holding
+			// the same key must not swallow a genuinely new allocation.
+			if pane.AllocationKey != key || !pane.Proposed() {
+				continue
 			}
+			if pane.CWD == "" && cwd != "" {
+				pane.CWD = cwd
+				pane.UpdatedAt = time.Now().UTC()
+				workspace.UpdatedAt = pane.UpdatedAt
+			}
+			return pane, false, nil
 		}
 	}
 	position := 0
@@ -892,38 +964,49 @@ func allocatePaneLocked(workspace *Workspace, key, cwd string) (*Pane, bool, err
 			position = existing.Position + 1
 		}
 	}
-	pane, err := newPane(workspace.ID, position, PaneSpec{CWD: cwd}, time.Now().UTC())
+	now := time.Now().UTC()
+	pane, err := newPane(workspace.ID, position, PaneSpec{CWD: cwd}, PaneProposed, now)
 	if err != nil {
 		return nil, false, err
 	}
 	pane.AllocationKey = key
-	pane.TopologyPending = true
-	pane.TopologyPendingAt = time.Now().UTC()
+	admission.RequestedAt = now
+	pane.Admission = admission
 	workspace.Panes[pane.ID] = pane
 	workspace.Revision++
-	workspace.UpdatedAt = time.Now().UTC()
+	workspace.UpdatedAt = now
 	return pane, true, nil
 }
 
-func (d *Daemon) allocatePane(workspaceRef, key, cwd string) (allocatePaneResponse, error) {
+func (d *Daemon) allocatePane(req allocatePaneRequest) (allocatePaneResponse, error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
+	workspace, err := d.resolveWorkspaceLocked(req.Workspace)
 	if err != nil {
+		d.mu.Unlock()
 		return allocatePaneResponse{}, err
 	}
 	if err := requireWorkspaceMutable(workspace); err != nil {
+		d.mu.Unlock()
 		return allocatePaneResponse{}, err
 	}
-	pane, _, err := allocatePaneLocked(workspace, key, cwd)
+	admission := PaneAdmission{
+		Endpoint: req.Endpoint, WindowID: req.WindowID,
+		AttachmentID: attachmentIDForEndpointLocked(workspace, req.Endpoint),
+	}
+	pane, _, err := allocatePaneLocked(workspace, req.Key, req.CWD, admission)
 	if err != nil {
+		d.mu.Unlock()
 		return allocatePaneResponse{}, err
 	}
 	workspace.RecomputeAttention()
 	if err := d.store.Save(d.state); err != nil {
+		d.mu.Unlock()
 		return allocatePaneResponse{}, err
 	}
-	return allocatePaneResponse{Workspace: workspace.Clone(), Pane: pane.Clone()}, nil
+	response := allocatePaneResponse{Workspace: workspace.Clone(), Pane: pane.Clone()}
+	d.mu.Unlock()
+	d.schedulePaneAdmission(req.Endpoint)
+	return response, nil
 }
 
 func (d *Daemon) registerAttachment(workspaceRef string, attachment Attachment) (*Attachment, error) {
@@ -1179,7 +1262,7 @@ func (d *Daemon) setAttachmentPaneReady(req attachmentPaneReadyRequest) (*Attach
 func liveLegacyPaneIDs(workspace *Workspace) []string {
 	var ids []string
 	for _, pane := range workspace.Panes {
-		if pane.BackendCreated && !pane.BackendDead && !pane.RemovalPending && pane.AgentRelayVersion < agentRelayVersion {
+		if pane.BackendCreated && !pane.BackendDead && !pane.Retiring() && pane.AgentRelayVersion < agentRelayVersion {
 			ids = append(ids, pane.ID)
 		}
 	}
@@ -1329,16 +1412,42 @@ func validateAttachmentReady(workspace *Workspace, attachment *Attachment) error
 	return nil
 }
 
-func validateViewsReady(attachment *Attachment, paneIDs map[string]bool) error {
+// validateViewsComplete requires exactly one runtime view per expected pane.
+// This is structural: a missing or unexpected window means the capture and the
+// model disagree about what exists.
+func validateViewsComplete(attachment *Attachment, paneIDs map[string]bool) error {
 	for paneID := range paneIDs {
 		view, ok := attachment.Views[paneID]
-		if !ok || !view.Ready || view.WindowID <= 0 {
-			return fmt.Errorf("attachment %s is missing ready pane %s", attachment.ID, paneID)
+		if !ok || view.WindowID <= 0 {
+			return fmt.Errorf("%w: attachment %s is missing pane %s", errViewsNotReady, attachment.ID, paneID)
 		}
 	}
 	for paneID := range attachment.Views {
 		if !paneIDs[paneID] {
-			return fmt.Errorf("attachment %s contains unexpected pane %s", attachment.ID, paneID)
+			return fmt.Errorf("%w: attachment %s contains unexpected pane %s", errViewsNotReady, attachment.ID, paneID)
+		}
+	}
+	return nil
+}
+
+// viewsAreReady reports whether every expected pane's client has attached. It
+// is a readiness signal, not a validity one.
+func viewsAreReady(attachment *Attachment, paneIDs map[string]bool) bool {
+	for paneID := range paneIDs {
+		if view, ok := attachment.Views[paneID]; !ok || !view.Ready {
+			return false
+		}
+	}
+	return true
+}
+
+func validateViewsReady(attachment *Attachment, paneIDs map[string]bool) error {
+	if err := validateViewsComplete(attachment, paneIDs); err != nil {
+		return err
+	}
+	for paneID := range paneIDs {
+		if view, ok := attachment.Views[paneID]; !ok || !view.Ready {
+			return fmt.Errorf("%w: attachment %s is missing ready pane %s", errViewsNotReady, attachment.ID, paneID)
 		}
 	}
 	return nil
@@ -1414,11 +1523,11 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 		return nil, fmt.Errorf("attachment %s is detached or revoked", attachment.ID)
 	}
 	if req.VerifyTopologyGeneration != 0 && req.VerifyTopologyGeneration != workspace.Topology.Generation {
-		return nil, fmt.Errorf("topology generation changed: have %d, reconciling %d",
-			workspace.Topology.Generation, req.VerifyTopologyGeneration)
+		return nil, fmt.Errorf("%w: have %d, reconciling %d",
+			errTopologyGenerationChanged, workspace.Topology.Generation, req.VerifyTopologyGeneration)
 	}
 	if req.BaseTopologyGeneration == 0 && req.ExpectedRevision != 0 && req.ExpectedRevision != workspace.Revision {
-		return nil, fmt.Errorf("workspace revision changed: have %d, expected %d", workspace.Revision, req.ExpectedRevision)
+		return nil, fmt.Errorf("%w: have %d, expected %d", errWorkspaceRevisionChanged, workspace.Revision, req.ExpectedRevision)
 	}
 	if err := validateManifest(workspace, req.Manifest); err != nil {
 		attachment.Status = AttachmentUnhealthy
@@ -1432,10 +1541,15 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	if staleTopologyBase {
 		if attachment.AppliedTopologyGeneration != req.BaseTopologyGeneration ||
 			len(attachment.ObservedTopology) == 0 {
-			return nil, fmt.Errorf("attachment %s has no verified baseline for topology generation %d",
-				attachment.ID, req.BaseTopologyGeneration)
+			// No verified baseline to rebase against. Rather than refusing --
+			// which used to close the last escape hatch for a wedged
+			// attachment -- treat the capture as a fresh base. The pane-set
+			// check below is the safety property the baseline was protecting.
+			staleTopologyBase = false
+			previousTopology = workspace.Topology.Roots
+		} else {
+			previousTopology = attachment.ObservedTopology
 		}
-		previousTopology = attachment.ObservedTopology
 	}
 	stableTopology, err := stabilizeTopologyIDs(workspace.ID, previousTopology, req.Manifest.Topology)
 	if err != nil {
@@ -1445,7 +1559,7 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	if staleTopologyBase {
 		for paneID := range topologyPaneIDs(attachment.ObservedTopology) {
 			pane := workspace.Panes[paneID]
-			if pane != nil && !pane.RemovalPending && !capturedPanes[paneID] {
+			if pane != nil && !pane.Retiring() && !capturedPanes[paneID] {
 				err := fmt.Errorf("stale capture omitted previously observed pane %s", paneID)
 				attachment.Status = AttachmentUnhealthy
 				attachment.ReconcileStatus = TopologyReconcileError
@@ -1459,14 +1573,17 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	} else {
 		expectedPanes := activeTopologyPaneIDs(workspace)
 		for paneID := range capturedPanes {
-			if pane := workspace.Panes[paneID]; pane != nil && pane.TopologyPending {
+			if pane := workspace.Panes[paneID]; pane != nil && pane.Proposed() {
 				expectedPanes[paneID] = true
 			}
 		}
 		if !samePaneSet(capturedPanes, expectedPanes) {
-			err := fmt.Errorf("captured topology pane set does not equal active workspace pane set")
-			attachment.Status = AttachmentUnhealthy
-			attachment.ReconcileStatus = TopologyReconcileError
+			// Transient by nature: a pane was allocated or closed between the
+			// capture and this commit. Recorded, but not terminal.
+			err := fmt.Errorf("%w: captured topology pane set does not equal active workspace pane set",
+				errTopologyPaneSetMismatch)
+			attachment.Status = AttachmentPreparing
+			attachment.ReconcileStatus = TopologyReconcilePending
 			attachment.LastError = err.Error()
 			attachment.UpdatedAt = time.Now().UTC()
 			workspace.UpdatedAt = attachment.UpdatedAt
@@ -1476,9 +1593,12 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	}
 	candidate := attachment.Clone()
 	candidate.Views = cloneViews(req.Views)
-	if err := validateViewsReady(candidate, capturedPanes); err != nil {
+	// Structural completeness is required; client readiness is not. A pane
+	// whose zmx client is still attaching should hold the attachment in
+	// "preparing", not flip it to unhealthy and abort the commit.
+	if err := validateViewsComplete(candidate, capturedPanes); err != nil {
 		candidate.Status = AttachmentUnhealthy
-		candidate.ReconcileStatus = "error"
+		candidate.ReconcileStatus = TopologyReconcileError
 		candidate.LastError = err.Error()
 		if !attachmentRuntimeEqual(attachment, candidate) {
 			now := time.Now().UTC()
@@ -1489,12 +1609,14 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 		}
 		return nil, err
 	}
+	viewsReady := viewsAreReady(candidate, capturedPanes)
 	annotateRuntimeViews(stableTopology, candidate.Views)
 	if workspace.RemoteHost != "" {
 		if !topologyMatchesDesired(workspace, stableTopology) {
-			err := fmt.Errorf("local attachment topology differs from origin generation %d", workspace.Topology.Generation)
+			err := fmt.Errorf("%w: local attachment topology differs from origin generation %d",
+				errAttachmentTopologyStale, workspace.Topology.Generation)
 			candidate.Status = AttachmentUnhealthy
-			candidate.ReconcileStatus = "pending"
+			candidate.ReconcileStatus = TopologyReconcilePending
 			candidate.ReconcileTargetGeneration = workspace.Topology.Generation
 			candidate.LastError = err.Error()
 			if !attachmentRuntimeEqual(attachment, candidate) {
@@ -1542,10 +1664,16 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	before := workspace.Clone()
 	topologyChanged, err := installDesiredTopology(workspace, stableTopology)
 	if err != nil {
+		// installDesiredTopology validates before it mutates, but restore the
+		// snapshot anyway so this path matches every other failure exit.
+		d.state.Workspaces[workspace.ID] = before
 		return nil, err
 	}
 	beforeLaunchOptions := workspaceLaunchOptions(workspace)
-	applyManifestLaunchOptions(workspace, req.Manifest.Session)
+	if err := applyManifestLaunchOptions(workspace, req.Manifest.Session); err != nil {
+		d.state.Workspaces[workspace.ID] = before
+		return nil, err
+	}
 	launchOptionsChanged := beforeLaunchOptions != workspaceLaunchOptions(workspace)
 	metadataChanged := applyCapturedPaneMetadata(workspace, observedTopology, acceptCapturedCWD)
 	req.Manifest.Topology = cloneNodes(workspace.Topology.Roots)
@@ -1561,7 +1689,8 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	if topologyChanged {
 		nextRevision++
 	}
-	sourceMatchesDesired := topologyMatchesDesired(workspace, observedTopology) &&
+	sourceMatchesDesired := viewsReady &&
+		topologyMatchesDesired(workspace, observedTopology) &&
 		samePaneSet(capturedPanes, desiredPaneIDs(workspace))
 	candidate.LastError = ""
 	candidate.ObservedTopology = topologyIdentity(observedTopology)
@@ -1625,11 +1754,6 @@ func applyCapturedPaneMetadata(workspace *Workspace, nodes []Node, acceptCWD boo
 			if node.Kind == "pane" {
 				if pane := workspace.Panes[node.PaneID]; pane != nil {
 					paneChanged := false
-					if !pane.Visible {
-						pane.Visible = true
-						changed = true
-						paneChanged = true
-					}
 					if title := stripStateMarker(node.Title); title != "" && pane.Title != title {
 						pane.Title = title
 						changed = true
@@ -1650,15 +1774,10 @@ func applyCapturedPaneMetadata(workspace *Workspace, nodes []Node, acceptCWD boo
 		}
 	}
 	visit(nodes)
-	for id, pane := range workspace.Panes {
-		if !seen[id] && !pane.TopologyPending && !pane.RemovalPending {
-			if pane.Visible {
-				pane.Visible = false
-				changed = true
-			}
-		}
-	}
 	if acceptCWD {
+		// Presentation only: cwd and title are not part of the structural
+		// digest, so refreshing them in Roots keeps cold restores accurate
+		// without being able to move the convergence target.
 		var copyCWD func([]Node)
 		copyCWD = func(children []Node) {
 			for index := range children {

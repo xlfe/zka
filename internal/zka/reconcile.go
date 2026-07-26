@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -204,14 +203,16 @@ func (d *Daemon) captureEndpoint(ctx context.Context, endpoint string) {
 	if workspace == nil || attachment == nil {
 		return
 	}
-	if len(workspace.Topology.Roots) != 0 &&
-		(attachment.AppliedTopologyGeneration != workspace.Topology.Generation ||
-			attachment.AppliedTopologyDigest != workspace.Topology.Digest ||
-			attachment.ReconcileStatus == "pending" ||
-			attachment.ReconcileStatus == "error") {
-		d.scheduleTopologyReconcile(endpoint)
+	// Admission owns a proposed pane's commit and is never suppressed, so it
+	// runs before anything else that might hold captures off.
+	if d.endpointHasProposedPanes(endpoint) {
+		d.schedulePaneAdmission(endpoint)
 		return
 	}
+	// The capture is NOT skipped when the attachment is out of sync. Bailing
+	// straight into a reconcile here is what made the wedge unrecoverable: the
+	// only code that can adopt reality into the desired topology lives behind
+	// updateManifest, and it was unreachable exactly when it was needed.
 	if attachment.Revoked {
 		if !attachment.RevocationClosed {
 			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -281,7 +282,7 @@ func (d *Daemon) captureEndpoint(ctx context.Context, endpoint string) {
 			_, err = d.closePanes(ctx, request)
 		}
 		if err != nil {
-			if strings.Contains(err.Error(), "revision changed") || strings.Contains(err.Error(), "missing ready pane") {
+			if errors.Is(err, errWorkspaceRevisionChanged) || errors.Is(err, errViewsNotReady) {
 				d.scheduleFreshCapture(endpoint)
 			} else {
 				d.markAttachmentUnhealthy(workspace.ID, attachment.ID, err)
@@ -316,15 +317,22 @@ func (d *Daemon) captureEndpoint(ctx context.Context, endpoint string) {
 			Manifest: manifest, Views: views,
 		})
 	}
-	if err != nil && (strings.Contains(err.Error(), "topology generation changed") ||
-		strings.Contains(err.Error(), "topology pane set") ||
-		strings.Contains(err.Error(), "differs from origin generation")) {
+	switch {
+	case err == nil:
+	case errors.Is(err, errTopologyGenerationChanged), errors.Is(err, errTopologyPaneSetMismatch),
+		errors.Is(err, errAttachmentTopologyStale), errors.Is(err, errPaneAdmissionPending):
 		d.scheduleTopologyReconcile(endpoint)
 		return
-	}
-	if err != nil && !strings.Contains(err.Error(), "revision changed") {
+	case errors.Is(err, errWorkspaceRevisionChanged):
+		// Optimistic concurrency: another writer won, and the next capture
+		// will carry the newer revision.
+		return
+	default:
 		d.markAttachmentUnhealthy(workspace.ID, attachment.ID, err)
 		return
+	}
+	if d.endpointNeedsTopologyReconcile(endpoint) {
+		d.scheduleTopologyReconcile(endpoint)
 	}
 	for paneID, view := range views {
 		if view.Focused {
@@ -353,7 +361,7 @@ func closedPaneIDs(workspace *Workspace, attachment *Attachment, views map[strin
 	var closed []string
 	for paneID := range attachment.Views {
 		pane := workspace.Panes[paneID]
-		if pane == nil || pane.RemovalPending {
+		if pane == nil || pane.Retiring() {
 			continue
 		}
 		if _, present := views[paneID]; !present {
@@ -371,7 +379,7 @@ func (d *Daemon) closeEventsCoverWorkspace(endpoint string, closed map[string]bo
 	}
 	active := 0
 	for paneID, pane := range workspace.Panes {
-		if pane.RemovalPending {
+		if pane.Retiring() {
 			continue
 		}
 		if _, owned := attachment.Views[paneID]; !owned {

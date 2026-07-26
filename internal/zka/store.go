@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -13,9 +14,13 @@ import (
 type Store struct {
 	paths  Paths
 	onSave func()
+	logger *log.Logger
 }
 
 func NewStore(paths Paths) *Store { return &Store{paths: paths} }
+
+// SetLogger installs an optional logger for migration and invariant diagnostics.
+func (s *Store) SetLogger(logger *log.Logger) { s.logger = logger }
 
 // SetOnSave installs an optional daemon-only change signal. Standalone store
 // users remain unaware of subscriptions, and the callback runs only after a
@@ -71,11 +76,11 @@ func (s *Store) Load() (StateData, error) {
 		}
 		return newStateData(), nil
 	}
-	if header.SchemaVersion != 3 && header.SchemaVersion != 4 && header.SchemaVersion != stateSchemaVersion {
+	if header.SchemaVersion < 3 || header.SchemaVersion > stateSchemaVersion {
 		return StateData{}, fmt.Errorf("unsupported state schema %d (want %d)", header.SchemaVersion, stateSchemaVersion)
 	}
-	if header.SchemaVersion == 4 {
-		if err := s.writeMigrationBackup(b, 4); err != nil {
+	if header.SchemaVersion == 4 || header.SchemaVersion == 5 {
+		if err := s.writeMigrationBackup(b, header.SchemaVersion); err != nil {
 			return StateData{}, err
 		}
 	}
@@ -89,27 +94,62 @@ func (s *Store) Load() (StateData, error) {
 	if state.Remotes == nil {
 		state.Remotes = map[string]*RemoteCache{}
 	}
+	legacy := header.SchemaVersion < 6
+	legacyPhases := map[string]map[string]PaneLifecycle{}
+	if legacy {
+		legacyPhases = decodeLegacyPanePhases(b)
+	}
 	for _, workspace := range state.Workspaces {
 		normalizeWorkspace(workspace)
-		if header.SchemaVersion != stateSchemaVersion {
-			applyManifestLaunchOptions(workspace, workspace.Manifest.Session)
+		if legacy {
+			now := time.Now().UTC()
+			for id, pane := range workspace.Panes {
+				pane.Phase = legacyPhases[workspace.ID][id]
+				if pane.Phase == "" {
+					pane.Phase = PaneAdmitted
+				}
+				if pane.PhaseAt.IsZero() {
+					pane.PhaseAt = now
+				}
+			}
+		}
+		if header.SchemaVersion < 5 {
+			if err := applyManifestLaunchOptions(workspace, workspace.Manifest.Session); err != nil {
+				s.logf("workspace %s: drop unparsable manifest launch options: %v", workspace.ID, err)
+			}
 			// Pre-v5 layout_state contains attachment-local Kitty IDs and
 			// cannot be made replica-safe without the original runtime tree.
 			clearTopologyLayoutState(workspace.Manifest.Topology)
 			clearTopologyLayoutState(workspace.Topology.Roots)
 		}
-		topologyRecovered, recoverErr := recoverMissingTopologyPanes(workspace)
-		if recoverErr != nil {
-			return StateData{}, fmt.Errorf("migrate workspace %s topology: %w", workspace.ID, recoverErr)
+		// Snapshot the pre-migration structure so a converged attachment can be
+		// carried across the upgrade instead of being forced to rebuild every
+		// open Kitty window -- which is exactly the behaviour this release
+		// exists to remove.
+		converged := map[string]bool{}
+		for id, attachment := range workspace.Attachments {
+			converged[id] = attachment.AppliedTopologyGeneration == workspace.Topology.Generation &&
+				len(attachment.ObservedTopology) != 0 &&
+				topologyStructureEqual(attachment.ObservedTopology, workspace.Topology.Roots)
 		}
-		if header.SchemaVersion != stateSchemaVersion || topologyRecovered {
-			for _, attachment := range workspace.Attachments {
-				attachment.AppliedTopologyGeneration = 0
-				attachment.AppliedTopologyDigest = ""
-				attachment.ObservedTopology = nil
-				attachment.ReconcileTargetGeneration = workspace.Topology.Generation
-				attachment.ReconcileStatus = "pending"
+		topologyChanged, degraded := reconcileLoadedTopology(workspace)
+		if degraded != nil {
+			s.logf("%v", degraded)
+		}
+		for id, attachment := range workspace.Attachments {
+			if legacy && converged[id] && !topologyChanged {
+				attachment.AppliedTopologyDigest = workspace.Topology.Digest
+				attachment.ObservedTopology = topologyStructuralIdentity(attachment.ObservedTopology)
+				continue
 			}
+			if !legacy && !topologyChanged {
+				continue
+			}
+			attachment.AppliedTopologyGeneration = 0
+			attachment.AppliedTopologyDigest = ""
+			attachment.ObservedTopology = nil
+			attachment.ReconcileTargetGeneration = workspace.Topology.Generation
+			attachment.ReconcileStatus = "pending"
 		}
 	}
 	// v3 panes predate the stable agent relay. Leaving their zero relay
@@ -117,6 +157,63 @@ func (s *Store) Load() (StateData, error) {
 	// recreated before a forwarded agent can be claimed safely.
 	state.SchemaVersion = stateSchemaVersion
 	return state, nil
+}
+
+// decodeLegacyPanePhases maps the pre-v6 boolean flags onto the explicit pane
+// lifecycle. The three flags overlapped and could disagree; removal wins over
+// proposal because a pane being torn down is already out of the topology.
+func decodeLegacyPanePhases(data []byte) map[string]map[string]PaneLifecycle {
+	var legacy struct {
+		Workspaces map[string]struct {
+			Panes map[string]struct {
+				RemovalPending  bool `json:"removal_pending"`
+				TopologyPending bool `json:"topology_pending"`
+			} `json:"panes"`
+		} `json:"workspaces"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return nil
+	}
+	result := make(map[string]map[string]PaneLifecycle, len(legacy.Workspaces))
+	for workspaceID, workspace := range legacy.Workspaces {
+		phases := make(map[string]PaneLifecycle, len(workspace.Panes))
+		for paneID, pane := range workspace.Panes {
+			switch {
+			case pane.RemovalPending:
+				phases[paneID] = PaneRetiring
+			case pane.TopologyPending:
+				phases[paneID] = PaneProposed
+			default:
+				phases[paneID] = PaneAdmitted
+			}
+		}
+		result[workspaceID] = phases
+	}
+	return result
+}
+
+// enforceTopologyInvariants is a last line of defence on the way to disk. The
+// digest must always be derivable from the stored tree; the previous code let
+// callers rewrite Roots after the digest had been computed, which could persist
+// a convergence target that was unreachable by construction. Repairing here
+// costs one tree walk against an already O(state) marshal.
+func (s *Store) enforceTopologyInvariants(state StateData) {
+	for _, workspace := range state.Workspaces {
+		if len(workspace.Topology.Roots) == 0 {
+			continue
+		}
+		if digest := topologyStructuralDigest(workspace.Topology.Roots); digest != workspace.Topology.Digest {
+			s.logf("workspace %s: repairing topology digest that disagreed with its roots", workspace.ID)
+			workspace.Topology.Digest = digest
+		}
+	}
+}
+
+func (s *Store) logf(format string, args ...any) {
+	if s.logger == nil {
+		return
+	}
+	s.logger.Printf(format, args...)
 }
 
 func (s *Store) writeMigrationBackup(data []byte, version int) error {
@@ -195,6 +292,7 @@ func (s *Store) Save(state StateData) error {
 	if err := s.Ensure(); err != nil {
 		return err
 	}
+	s.enforceTopologyInvariants(state)
 	state.SchemaVersion = stateSchemaVersion
 	b, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {

@@ -107,7 +107,7 @@ func (d *Daemon) beginPaneClosure(req closePanesRequest) (*Workspace, bool, erro
 		requested[paneID] = true
 		if pane := workspace.Panes[paneID]; pane != nil {
 			allAlreadyRemoved = false
-			if !pane.RemovalPending {
+			if !pane.Retiring() {
 				allAlreadyScheduled = false
 			}
 		}
@@ -146,7 +146,7 @@ func (d *Daemon) beginPaneClosure(req closePanesRequest) (*Workspace, bool, erro
 
 	remaining := map[string]bool{}
 	for paneID, pane := range workspace.Panes {
-		if !requested[paneID] && !pane.RemovalPending {
+		if !requested[paneID] && pane.Admitted() {
 			remaining[paneID] = true
 		}
 	}
@@ -183,8 +183,7 @@ func (d *Daemon) beginPaneClosure(req closePanesRequest) (*Workspace, bool, erro
 	}
 	for paneID := range requested {
 		pane := workspace.Panes[paneID]
-		pane.Visible = false
-		pane.RemovalPending = true
+		pane.Phase, pane.PhaseAt = PaneRetiring, now
 		pane.RemovalError = ""
 		pane.UpdatedAt = now
 	}
@@ -321,7 +320,7 @@ func (d *Daemon) cleanupWorkspaceOnce(ctx context.Context, workspaceID string) b
 	deleting := workspace.DeletionPending
 	var targets []*Pane
 	for _, pane := range workspace.Panes {
-		if deleting || pane.RemovalPending {
+		if deleting || pane.Retiring() {
 			targets = append(targets, pane.Clone())
 		}
 	}
@@ -422,7 +421,7 @@ func (d *Daemon) cleanupWorkspaceOnce(ctx context.Context, workspaceID string) b
 	var removedPaneIDs []string
 	for _, pane := range targets {
 		currentPane := current.Panes[pane.ID]
-		if currentPane == nil || !currentPane.RemovalPending {
+		if currentPane == nil || !currentPane.Retiring() {
 			continue
 		}
 		if remaining[pane.ID] {
@@ -445,7 +444,7 @@ func (d *Daemon) cleanupWorkspaceOnce(ctx context.Context, workspaceID string) b
 	}
 	done := true
 	for _, pane := range current.Panes {
-		if pane.RemovalPending {
+		if pane.Retiring() {
 			done = false
 			break
 		}
@@ -502,6 +501,10 @@ func (d *Daemon) backendReconcileLoop(ctx context.Context) {
 }
 
 func (d *Daemon) reconcileBackends(ctx context.Context, workspaceRef string) (backendReconcileResponse, error) {
+	// The session list is read before the lock, so a pane mutated in between
+	// would be judged against a listing that predates it. Panes newer than this
+	// timestamp are skipped and reconsidered on the next tick.
+	listedBefore := time.Now().UTC()
 	active, err := listZMXSessions(ctx, d.runner, d.config.ZMX.Command)
 	if err != nil {
 		return backendReconcileResponse{}, fmt.Errorf("list zmx sessions: %w", err)
@@ -531,6 +534,8 @@ func (d *Daemon) reconcileBackends(ctx context.Context, workspaceRef string) (ba
 	response := backendReconcileResponse{}
 	var deleteIDs []string
 	var topologyEndpoints []string
+	var admitEndpoints []string
+	var cleanupIDs []string
 	changed := false
 	changedBefore := map[string]*Workspace{}
 	now := time.Now().UTC()
@@ -541,54 +546,46 @@ func (d *Daemon) reconcileBackends(ctx context.Context, workspaceRef string) (ba
 		pending, live, established, removalPending := false, false, false, false
 		workspaceChanged := false
 		for paneID, pane := range workspace.Panes {
-			if pane.RemovalPending {
+			if pane.Retiring() {
 				removalPending = true
 				continue
 			}
-			if pane.TopologyPending {
-				startedAt := pane.TopologyPendingAt
-				if startedAt.IsZero() {
-					startedAt = pane.UpdatedAt
-				}
-				if active[pane.Backend.Ref] {
-					if !workspaceChanged {
-						changedBefore[workspace.ID] = workspace.Clone()
-					}
-					if _, topologyErr := appendRecoveredPane(workspace, pane); topologyErr != nil {
-						d.mu.Unlock()
-						return backendReconcileResponse{}, topologyErr
-					}
-					pane.Visible = true
-					pane.UpdatedAt = now
-					workspace.Revision++
-					for _, attachment := range workspace.Attachments {
-						if attachment.Status == AttachmentDetached || attachment.Revoked {
-							continue
-						}
-						attachment.ReconcileTargetGeneration = workspace.Topology.Generation
-						attachment.ReconcileStatus = "pending"
-						if isLocalUnixAttachment(attachment, d.state.Node.ID) {
-							topologyEndpoints = append(topologyEndpoints, attachment.Endpoint)
-						}
-					}
-					response.Recovered = append(response.Recovered, pane.ID)
-					workspaceChanged = true
-				} else if !startedAt.IsZero() && now.Sub(startedAt) >= backendStartupGrace {
-					if !workspaceChanged {
-						changedBefore[workspace.ID] = workspace.Clone()
-					}
-					delete(workspace.Panes, paneID)
-					for _, attachment := range workspace.Attachments {
-						delete(attachment.Views, paneID)
-						delete(attachment.ClientHeartbeats, paneID)
-					}
-					workspace.Revision++
-					workspaceChanged = true
-					continue
-				} else {
+			if !pane.UpdatedAt.Before(listedBefore) {
+				// The zmx listing predates this pane's last mutation, so its
+				// liveness verdict is not causally valid yet.
+				pending = true
+				continue
+			}
+			// A proposed pane is never fabricated into the desired topology.
+			// It is admitted only by a capture that already contains its Kitty
+			// window, and retired only once successful listings have shown its
+			// window to be gone. This branch used to invent a synthetic tab the
+			// moment a pane's zmx backend came up -- which is milliseconds
+			// after allocation and long before any capture can land -- and the
+			// invented node was one Kitty could never reproduce.
+			if pane.Proposed() {
+				if !retirableProposedPane(pane, d.endpointHasLiveAttachmentLocked(pane.Admission.Endpoint), now) {
 					pending = true
+					if pane.Admission.Endpoint != "" {
+						admitEndpoints = append(admitEndpoints, pane.Admission.Endpoint)
+					}
 					continue
 				}
+				if !workspaceChanged {
+					changedBefore[workspace.ID] = workspace.Clone()
+				}
+				// Retire through the normal closure path so the zmx session is
+				// killed, views and heartbeats are purged, and the agent relay
+				// is cleared -- all of which the old delete skipped.
+				pane.Phase, pane.PhaseAt = PaneRetiring, now
+				pane.RemovalError = "pane was never admitted into the desired topology"
+				pane.UpdatedAt = now
+				workspace.Revision++
+				workspaceChanged = true
+				removalPending = true
+				cleanupIDs = append(cleanupIDs, workspace.ID)
+				_ = paneID
+				continue
 			}
 			if !pane.BackendCreated && !pane.BackendDead {
 				startedAt := pane.UpdatedAt
@@ -670,6 +667,12 @@ func (d *Daemon) reconcileBackends(ctx context.Context, workspaceRef string) (ba
 	for _, endpoint := range sortedEndpointSet(topologyEndpoints) {
 		d.scheduleTopologyReconcile(endpoint)
 	}
+	for _, endpoint := range sortedEndpointSet(admitEndpoints) {
+		d.schedulePaneAdmission(endpoint)
+	}
+	for _, workspaceID := range sortedEndpointSet(cleanupIDs) {
+		d.scheduleLifecycleCleanup(workspaceID)
+	}
 
 	for _, workspaceID := range deleteIDs {
 		if _, err := d.killWorkspace(ctx, workspaceID); err != nil {
@@ -693,7 +696,7 @@ func (d *Daemon) recordLifecycleError(workspaceID string, panes []*Pane, detail 
 		workspace.DeletionError = detail
 	}
 	for _, pane := range panes {
-		if current := workspace.Panes[pane.ID]; current != nil && current.RemovalPending {
+		if current := workspace.Panes[pane.ID]; current != nil && current.Retiring() {
 			current.RemovalError = detail
 		}
 	}
@@ -710,7 +713,7 @@ func (d *Daemon) pendingBackendNames(workspaceID string) []string {
 	}
 	var candidates []string
 	for _, pane := range workspace.Panes {
-		if workspace.DeletionPending || pane.RemovalPending {
+		if workspace.DeletionPending || pane.Retiring() {
 			candidates = append(candidates, pane.Backend.Ref)
 		}
 	}
@@ -738,7 +741,7 @@ func (d *Daemon) resumeLifecycleCleanup() {
 	for id, workspace := range d.state.Workspaces {
 		pending := workspace.DeletionPending
 		for _, pane := range workspace.Panes {
-			pending = pending || pane.RemovalPending
+			pending = pending || pane.Retiring()
 		}
 		if pending && workspace.RemoteHost == "" {
 			ids = append(ids, id)

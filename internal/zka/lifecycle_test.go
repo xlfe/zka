@@ -27,6 +27,12 @@ func newLifecycleRunner(names ...string) *lifecycleRunner {
 	return runner
 }
 
+func (r *lifecycleRunner) Calls() []runnerCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]runnerCall(nil), r.calls...)
+}
+
 func (r *lifecycleRunner) setSession(name string, exists bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -423,7 +429,7 @@ func TestPaneRemovalFailurePersistsAndRestartResumesCleanup(t *testing.T) {
 		t.Fatal("failed zmx kill completed pane removal")
 	}
 	pending, err := d.getWorkspace(workspace.ID)
-	if err != nil || !pending.Panes[panes[0].ID].RemovalPending || pending.Panes[panes[0].ID].RemovalError == "" {
+	if err != nil || !pending.Panes[panes[0].ID].Retiring() || pending.Panes[panes[0].ID].RemovalError == "" {
 		t.Fatalf("pending pane = %#v, %v", pending, err)
 	}
 	runner.failKill = false
@@ -469,7 +475,7 @@ func TestDeletionPendingRejectsMutations(t *testing.T) {
 	if _, err := d.renameWorkspace(renameWorkspaceRequest{Workspace: workspace.ID, Name: "new"}); err == nil {
 		t.Fatal("rename succeeded while deletion was pending")
 	}
-	if _, err := d.allocatePane(workspace.ID, "new", ""); err == nil {
+	if _, err := testAllocatePane(d, workspace.ID, "new", ""); err == nil {
 		t.Fatal("pane allocation succeeded while deletion was pending")
 	}
 	if _, err := d.detachAttachment(workspace.ID, "missing"); err == nil || !strings.Contains(err.Error(), "being deleted") {

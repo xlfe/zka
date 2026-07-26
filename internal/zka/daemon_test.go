@@ -311,15 +311,15 @@ func TestPreparePaneAllocatesAndNeverRestartsMissingBackend(t *testing.T) {
 	}
 	workspace := createTestWorkspace(t, d, 1)
 	pane := firstPane(workspace)
-	first, err := d.preparePane(workspace.ID, pane.ID, "")
+	first, err := testPreparePane(d, workspace.ID, pane.ID, "")
 	if err != nil || !first.Create {
 		t.Fatalf("first = %#v, %v", first, err)
 	}
-	second, err := d.preparePane(workspace.ID, pane.ID, "")
+	second, err := testPreparePane(d, workspace.ID, pane.ID, "")
 	if err != nil || second.Create {
 		t.Fatalf("second = %#v, %v", second, err)
 	}
-	created, err := d.preparePane(workspace.ID, "", "/work/project")
+	created, err := testPreparePane(d, workspace.ID, "", "/work/project")
 	if err != nil || !created.Create || created.Pane.ID == pane.ID || created.Workspace.Revision != workspace.Revision+1 {
 		t.Fatalf("allocated = %#v, %v", created, err)
 	}
@@ -334,11 +334,11 @@ func TestPaneAllocationKeyMakesRemoteRetryIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspace := createTestWorkspace(t, d, 1)
-	first, err := d.allocatePane(workspace.ID, "attachment:request", "/remote/project")
+	first, err := testAllocatePane(d, workspace.ID, "attachment:request", "/remote/project")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := d.allocatePane(workspace.ID, "attachment:request", "")
+	second, err := testAllocatePane(d, workspace.ID, "attachment:request", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +415,14 @@ func TestManifestDoesNotBecomeReadyBeforeZMXClient(t *testing.T) {
 	view := views[pane.ID]
 	view.Ready = false
 	views[pane.ID] = view
-	if _, err := d.updateManifest(manifestUpdateRequest{Workspace: workspace.ID, Attachment: attachment.ID, Manifest: testManifest(workspace), Views: views}); err == nil {
+	// A pane whose zmx client has not attached yet is a normal intermediate
+	// state, so the capture is accepted but must leave the attachment short of
+	// ready. Rejecting it outright used to flap the attachment to unhealthy.
+	got, err := d.updateManifest(manifestUpdateRequest{Workspace: workspace.ID, Attachment: attachment.ID, Manifest: testManifest(workspace), Views: views})
+	if err != nil {
+		t.Fatalf("capture with an unready client was rejected: %v", err)
+	}
+	if got.Attachments[attachment.ID].Status == AttachmentReady {
 		t.Fatal("manifest became ready before its zmx client")
 	}
 	views[pane.ID] = RuntimeView{PaneID: pane.ID, WindowID: 1, Ready: true}
