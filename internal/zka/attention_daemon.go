@@ -21,7 +21,7 @@ func (d *Daemon) attentionStateEnabled(state AgentState) bool {
 func (d *Daemon) attentionSnapshot() AttentionSnapshot {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return buildAttentionSnapshot(d.state, d.config.Attention.States)
+	return buildAttentionSnapshot(d.state, d.config.Attention.States, d.config.NotificationPolicy())
 }
 
 func (d *Daemon) setAttentionPaused(paused bool) (AttentionSnapshot, error) {
@@ -44,7 +44,7 @@ func (d *Daemon) changeAttentionPaused(resolve func(bool) bool) (AttentionSnapsh
 			return AttentionSnapshot{}, err
 		}
 	}
-	snapshot := buildAttentionSnapshot(d.state, d.config.Attention.States)
+	snapshot := buildAttentionSnapshot(d.state, d.config.Attention.States, d.config.NotificationPolicy())
 	workspaces := make([]*Workspace, 0, len(d.state.Workspaces))
 	if previous != paused && paused {
 		for _, workspace := range d.state.Workspaces {

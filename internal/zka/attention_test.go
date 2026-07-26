@@ -35,7 +35,7 @@ func TestBuildAttentionSnapshotOrdersLiveItemsAndSuppressesFocusedDone(t *testin
 		Panes: map[string]*Pane{"error": {ID: "error", State: StateError, Evidence: Evidence{Event: "stop", Timestamp: base.Add(-time.Minute)}}},
 	}
 
-	snapshot := buildAttentionSnapshot(state, []AgentState{StateBlocked, StateError, StateDone})
+	snapshot := buildAttentionSnapshot(state, []AgentState{StateBlocked, StateError, StateDone}, NotificationPolicy{Desktop: true, Ntfy: true})
 	if !snapshot.Paused || snapshot.Version != attentionSchemaVersion || snapshot.Highest != StateBlocked {
 		t.Fatalf("snapshot header = %#v", snapshot)
 	}
@@ -72,7 +72,7 @@ func TestBuildAttentionSnapshotOnlyMarksViewsOnThisNodeAttached(t *testing.T) {
 		}},
 	}
 
-	snapshot := buildAttentionSnapshot(state, []AgentState{StateError})
+	snapshot := buildAttentionSnapshot(state, []AgentState{StateError}, NotificationPolicy{Desktop: true, Ntfy: true})
 	if len(snapshot.Items) != 1 || snapshot.Items[0].Attached || !snapshot.Items[0].Focused {
 		t.Fatalf("remote origin view looked locally attached: %#v", snapshot.Items)
 	}
@@ -90,12 +90,12 @@ func TestBuildAttentionSnapshotSuppressesOnlyTheAcknowledgedEvent(t *testing.T) 
 		ID: "workspace", Panes: map[string]*Pane{pane.ID: pane},
 	}
 
-	if snapshot := buildAttentionSnapshot(state, []AgentState{StateError}); snapshot.Counts.Total != 0 {
+	if snapshot := buildAttentionSnapshot(state, []AgentState{StateError}, NotificationPolicy{Desktop: true, Ntfy: true}); snapshot.Counts.Total != 0 {
 		t.Fatalf("acknowledged event remained actionable: %#v", snapshot)
 	}
 
 	pane.Evidence = Evidence{Event: "agent_error", Timestamp: base.Add(time.Minute)}
-	if snapshot := buildAttentionSnapshot(state, []AgentState{StateError}); snapshot.Counts.Total != 1 {
+	if snapshot := buildAttentionSnapshot(state, []AgentState{StateError}, NotificationPolicy{Desktop: true, Ntfy: true}); snapshot.Counts.Total != 1 {
 		t.Fatalf("new error was hidden by stale acknowledgement: %#v", snapshot)
 	}
 }

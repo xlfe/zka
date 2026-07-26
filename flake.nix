@@ -44,7 +44,7 @@
             pname = "zka";
             version = "0.7.0";
             src = ./.;
-            vendorHash = "sha256-IhE5JsdUYV1sRGOA2reDd7iLSJ7xF2IAqLpgD7JBXH0=";
+            vendorHash = "sha256-beIm25whY72wrzIyiHd8YzcsRQd+NDYx14aK+ODhjFg=";
             subPackages = [
               "cmd/zka"
               "cmd/zka-launch"
@@ -91,6 +91,10 @@
                 services.zka.ssh.identityAgent = "/run/user/%i/ssh-agent.socket";
                 services.zka.ssh.forwardAgent = true;
                 services.zka.ssh.extraOptions = [ "-o" "IdentitiesOnly=yes" ];
+              # A stand-in for pkgs.sway: what matters is that an absolute store
+              # path reaches the runtime config, because zkad's PATH comes from
+              # the unit and a bare "swaymsg" does not resolve there.
+              services.zka.sway.package = pkgs.writeShellScriptBin "swaymsg" "";
               }
             ];
           };
@@ -135,6 +139,8 @@
             grep -q '"desktop_enabled": *true' "$runtimeConfig"
             grep -q '"ntfy_enabled": *true' "$runtimeConfig"
             grep -q '"ntfy_include_evidence": *false' "$runtimeConfig"
+            grep -qE '"sway_command": *"/nix/store/[^"]*/bin/swaymsg"' "$runtimeConfig"
+            grep -q '"sway_command": *"swaymsg"' "$disabledRuntimeConfig"
             grep -q '"blocked"' "$runtimeConfig"
             grep -q '"codex_managed_hooks": *true' "$runtimeConfig"
             grep -q '"claude_managed_hooks": *true' "$runtimeConfig"

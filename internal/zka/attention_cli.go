@@ -254,7 +254,7 @@ func writeAttentionOutput(w io.Writer, mode attentionOutputMode, snapshot Attent
 		if snapshot.Paused {
 			state = "paused"
 		}
-		_, err := fmt.Fprintf(w, "%s\t%d\tblocked=%d\terror=%d\tdone=%d\n", state, snapshot.Counts.Total, snapshot.Counts.Blocked, snapshot.Counts.Error, snapshot.Counts.Done)
+		_, err := fmt.Fprintf(w, "%s\t%d\tblocked=%d\terror=%d\tdone=%d\tundelivered=%d\n", state, snapshot.Counts.Total, snapshot.Counts.Blocked, snapshot.Counts.Error, snapshot.Counts.Done, snapshot.Counts.Undelivered)
 		return err
 	}
 }
@@ -263,15 +263,28 @@ func attentionWaybar(snapshot AttentionSnapshot, unavailable error) waybarAttent
 	if unavailable != nil {
 		return waybarAttention{Text: "?", Tooltip: "zka daemon unavailable: " + unavailable.Error(), Class: "unavailable"}
 	}
+	// A delivery defect outranks a pause because a pause is intentional and this
+	// is not. The tooltip still says the queue is paused.
 	class := "clear"
-	if snapshot.Paused {
+	switch {
+	case snapshot.Delivery.Broken():
+		class = "notify-failed"
+	case snapshot.Paused:
 		class = "paused"
-	} else if snapshot.Counts.Total > 0 {
+	case snapshot.Counts.Total > 0:
 		class = string(snapshot.Highest)
 	}
+	text := fmt.Sprint(snapshot.Counts.Total)
 	lines := []string{fmt.Sprintf("zka: %d pane(s) need attention", snapshot.Counts.Total)}
 	if snapshot.Paused {
 		lines[0] = fmt.Sprintf("zka attention paused: %d pending", snapshot.Counts.Total)
+	}
+	// The suffix and the tooltip line matter more than the class: a user whose
+	// CSS predates notify-failed would otherwise see a broken channel rendered
+	// exactly like a healthy one, in the surface meant to make it obvious.
+	if snapshot.Delivery.Broken() {
+		text += "!"
+		lines = append([]string{attentionDeliveryWarning(snapshot)}, lines...)
 	}
 	for _, item := range snapshot.Items {
 		label := item.WorkspaceName + " · " + item.PaneTitle
@@ -285,9 +298,31 @@ func attentionWaybar(snapshot AttentionSnapshot, unavailable error) waybarAttent
 		if item.Detail != "" {
 			line += " — " + item.Detail
 		}
+		if item.Undelivered() {
+			line += " [not delivered]"
+		}
 		lines = append(lines, line)
 	}
-	return waybarAttention{Text: fmt.Sprint(snapshot.Counts.Total), Tooltip: html.EscapeString(strings.Join(lines, "\n")), Class: class}
+	return waybarAttention{Text: text, Tooltip: html.EscapeString(strings.Join(lines, "\n")), Class: class}
+}
+
+// attentionDeliveryWarning is the one sentence every surface uses to say that a
+// notification channel could not reach the user.
+func attentionDeliveryWarning(snapshot AttentionSnapshot) string {
+	delivery := snapshot.Delivery
+	if !delivery.Broken() {
+		return ""
+	}
+	channels := strings.Join(delivery.Channels, ", ")
+	if channels == "" {
+		channels = "notification"
+	}
+	warning := fmt.Sprintf("zka cannot deliver %s notifications (%d failed, %d retrying)",
+		channels, delivery.Failed, delivery.Retrying)
+	if delivery.LastError != "" {
+		warning += ": " + delivery.LastError
+	}
+	return warning
 }
 
 func attentionStateLabel(state AgentState) string {

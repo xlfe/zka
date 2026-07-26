@@ -7,15 +7,48 @@ import (
 	"time"
 )
 
-const attentionSchemaVersion = 1
+// attentionSchemaVersion is 2 because counts.total no longer means "nothing is
+// wrong": delivery.failed can be non-zero while items is empty. A v1 consumer
+// reading only the count would under-report, and the version is what lets it
+// detect that. Every change is additive, and the fields that carry detail are
+// omitempty, so a healthy snapshot stays as quiet as it was.
+const attentionSchemaVersion = 2
 
 // AttentionCounts is the live aggregate of panes that currently need the
 // user's attention. It is deliberately not a notification history.
 type AttentionCounts struct {
-	Total   int `json:"total"`
-	Blocked int `json:"blocked"`
-	Error   int `json:"error"`
-	Done    int `json:"done"`
+	Total       int `json:"total"`
+	Blocked     int `json:"blocked"`
+	Error       int `json:"error"`
+	Done        int `json:"done"`
+	Undelivered int `json:"undelivered"`
+}
+
+// NotificationDelivery is the delivery outcome for the exact event an item
+// describes. Without it every surface renders a pane that needs you identically
+// whether or not you were ever actually told about it.
+type NotificationDelivery struct {
+	Channel     string    `json:"channel"`
+	Status      string    `json:"status"`
+	Attempts    int       `json:"attempts,omitempty"`
+	LastError   string    `json:"last_error,omitempty"`
+	NextRetryAt time.Time `json:"next_retry_at,omitempty"`
+}
+
+// AttentionDelivery is workspace-wide notification health. It is deliberately
+// NOT filtered by the predicate that hides resolved items: a channel that cannot
+// deliver must stay visible after the pane it failed for is gone, or glancing at
+// that pane would erase the only evidence that the channel is broken.
+type AttentionDelivery struct {
+	Failed    int      `json:"failed,omitempty"`
+	Retrying  int      `json:"retrying,omitempty"`
+	Channels  []string `json:"channels,omitempty"`
+	LastError string   `json:"last_error,omitempty"`
+}
+
+// Broken reports whether any channel currently cannot deliver.
+func (a AttentionDelivery) Broken() bool {
+	return a.Failed > 0 || a.Retrying > 0
 }
 
 // AttentionItem identifies one actionable pane. ID remains stable while the
@@ -35,6 +68,19 @@ type AttentionItem struct {
 	TransitionedAt time.Time  `json:"transitioned_at"`
 	Attached       bool       `json:"attached"`
 	Focused        bool       `json:"focused"`
+
+	Delivery []NotificationDelivery `json:"delivery,omitempty"`
+}
+
+// Undelivered reports whether any channel failed to tell the user about this
+// exact item.
+func (i AttentionItem) Undelivered() bool {
+	for _, delivery := range i.Delivery {
+		if delivery.Status == "failed" || delivery.Status == "retrying" {
+			return true
+		}
+	}
+	return false
 }
 
 // WorkspaceRef returns the CLI reference that can restore or focus this item.
@@ -49,23 +95,25 @@ func (i AttentionItem) WorkspaceRef() string {
 // It intentionally has no generated-at field so identical snapshots compare
 // byte-for-byte for streaming de-duplication.
 type AttentionSnapshot struct {
-	Version int             `json:"version"`
-	Paused  bool            `json:"paused"`
-	Highest AgentState      `json:"highest"`
-	Counts  AttentionCounts `json:"counts"`
-	Items   []AttentionItem `json:"items"`
+	Version  int               `json:"version"`
+	Paused   bool              `json:"paused"`
+	Highest  AgentState        `json:"highest"`
+	Counts   AttentionCounts   `json:"counts"`
+	Delivery AttentionDelivery `json:"delivery"`
+	Items    []AttentionItem   `json:"items"`
 }
 
-func buildAttentionSnapshot(state StateData, enabled []AgentState) AttentionSnapshot {
+func buildAttentionSnapshot(state StateData, enabled []AgentState, policy NotificationPolicy) AttentionSnapshot {
 	allowed := make(map[AgentState]bool, len(enabled))
 	for _, candidate := range enabled {
 		allowed[candidate] = true
 	}
 	snapshot := AttentionSnapshot{
-		Version: attentionSchemaVersion,
-		Paused:  state.AttentionPaused,
-		Highest: StateIdle,
-		Items:   []AttentionItem{},
+		Version:  attentionSchemaVersion,
+		Paused:   state.AttentionPaused,
+		Highest:  StateIdle,
+		Delivery: aggregateDelivery(state, policy),
+		Items:    []AttentionItem{},
 	}
 	for _, workspace := range state.Workspaces {
 		if workspace == nil || workspace.DeletionPending {
@@ -110,7 +158,11 @@ func buildAttentionSnapshot(state StateData, enabled []AgentState) AttentionSnap
 				TransitionedAt: transitioned,
 				Attached:       attached,
 				Focused:        focused,
+				Delivery:       paneDelivery(pane, policy),
 			})
+			if snapshot.Items[len(snapshot.Items)-1].Undelivered() {
+				snapshot.Counts.Undelivered++
+			}
 			switch pane.State {
 			case StateBlocked:
 				snapshot.Counts.Blocked++
@@ -148,6 +200,78 @@ func buildAttentionSnapshot(state StateData, enabled []AgentState) AttentionSnap
 		snapshot.Highest = snapshot.Items[0].State
 	}
 	return snapshot
+}
+
+// paneDelivery projects records for the pane's current event only. Records from
+// earlier turns describe news the user has already moved past, so reporting them
+// against the current item would be misleading.
+func paneDelivery(pane *Pane, policy NotificationPolicy) []NotificationDelivery {
+	if len(pane.Notifications) == 0 {
+		return nil
+	}
+	current := eventIdentity(pane)
+	var delivery []NotificationDelivery
+	for _, record := range pane.SortedNotifications() {
+		if !strings.HasSuffix(record.Key, ":"+current) {
+			continue
+		}
+		if !policy.enabled(record.Channel) {
+			continue
+		}
+		status := notificationRecordStatus(record)
+		if status == "sent" {
+			continue
+		}
+		delivery = append(delivery, NotificationDelivery{
+			Channel:     record.Channel,
+			Status:      status,
+			Attempts:    record.Attempts,
+			LastError:   record.LastError,
+			NextRetryAt: record.NextRetryAt,
+		})
+	}
+	return delivery
+}
+
+// aggregateDelivery reports channel health across every pane, including panes
+// that are no longer actionable. NextRetryAt is absolute and no relative
+// duration is included, so two identical states still marshal byte-for-byte and
+// the streaming de-duplication in watchAttention keeps working.
+func aggregateDelivery(state StateData, policy NotificationPolicy) AttentionDelivery {
+	var delivery AttentionDelivery
+	channels := map[string]bool{}
+	for _, workspace := range state.Workspaces {
+		if workspace == nil || workspace.DeletionPending {
+			continue
+		}
+		for _, pane := range workspace.Panes {
+			if pane == nil {
+				continue
+			}
+			for _, record := range pane.SortedNotifications() {
+				if !policy.enabled(record.Channel) {
+					continue
+				}
+				switch notificationRecordStatus(record) {
+				case "failed":
+					delivery.Failed++
+				case "retrying":
+					delivery.Retrying++
+				default:
+					continue
+				}
+				channels[record.Channel] = true
+				if delivery.LastError == "" {
+					delivery.LastError = record.LastError
+				}
+			}
+		}
+	}
+	for channel := range channels {
+		delivery.Channels = append(delivery.Channels, channel)
+	}
+	sort.Strings(delivery.Channels)
+	return delivery
 }
 
 func attentionPriority(state AgentState) int {

@@ -1032,7 +1032,7 @@ func focusAttachment(ctx context.Context, paths Paths, workspace *Workspace, att
 	if err := kitty.FocusPane(ctx, attachment.Endpoint, workspace.ID, paneID); err != nil {
 		return err
 	}
-	if err := focusSwayWindow(ctx, runner, attachment.PID); err != nil {
+	if err := focusSwayWindow(ctx, runner, cfg.Focus.SwayCommand, attachment.PID); err != nil {
 		return err
 	}
 	api := NewAPI(paths)
@@ -1137,10 +1137,17 @@ func writeWorkspaceDetail(w io.Writer, workspace *Workspace) {
 				shortID(pane.ID), pane.PhaseAt.Format(time.RFC3339),
 				pane.Admission.Endpoint, pane.Admission.WindowID)
 		}
-		for _, record := range pane.Notifications {
-			if record.LastError != "" {
-				fmt.Fprintf(w, "notification_error[%s]=%s\n", record.Channel, record.LastError)
+		// Sorted and keyed, so two inspect runs of the same state can be diffed,
+		// and "pending" is printed at all: a reservation that was never attempted
+		// used to produce no output whatsoever.
+		for _, record := range pane.SortedNotifications() {
+			status := notificationRecordStatus(record)
+			if status == "sent" {
+				continue
 			}
+			fmt.Fprintf(w, "notification[%s/%s]=%s key=%s attempts=%d next_retry=%s error=%s\n",
+				shortID(pane.ID), record.Channel, status, record.Key, record.Attempts,
+				formatOptionalTime(record.NextRetryAt), record.LastError)
 		}
 	}
 	for _, attachment := range workspace.SortedAttachments() {

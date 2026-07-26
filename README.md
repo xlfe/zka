@@ -367,7 +367,7 @@ then completed work, oldest first within each state.
 ```sh
 zka attention show             # graphical queue of actionable panes
 zka attention status           # one human-readable snapshot
-zka attention status --json    # versioned machine-readable snapshot
+zka attention status --json    # versioned machine-readable snapshot (v2)
 zka attention focus-next       # restore/focus the highest-priority exact pane
 zka attention pause            # silence interruptions; agents keep running
 zka attention resume
@@ -376,8 +376,30 @@ zka attention toggle
 
 Kitty titles and local notifications reflect pane state. By default, zka sends
 desktop and `ntfy-send` notifications for `blocked` and `error`, and for `done`
-when the pane has no attached view. Delivery is deduplicated; failures remain
-visible in `zka workspace inspect`.
+when the pane has no attached view.
+
+Desktop notifications go straight to `org.freedesktop.Notifications` on the
+session bus, so they need no helper binary on `PATH`. Clicking the notification
+body or its **Focus** button focuses that exact pane and raises the Kitty window
+that owns it; resolving a pane withdraws its notification, and a pane that
+changes state updates its notification in place rather than stacking a new one.
+A host with no session bus — a headless or remote origin — simply has no desktop
+channel, which is not an error.
+
+Delivery is deduplicated per event. A failure is retried three times immediately,
+then on a backoff from 30 seconds to 15 minutes, for up to 8 attempts or two
+hours, after which it is abandoned and reported rather than retried forever.
+Retries stop early once the pane is no longer actionable, so a resolved pane is
+never notified about late. Every failure is logged to `journalctl --user -u
+zkad`, counted in `zka attention status`, listed by `zka workspace inspect`, and
+checked by `zka doctor`.
+
+`zka attention status --json` reports `"version": 2`. The change from 1 is
+additive — `counts.undelivered`, a top-level `delivery` aggregate, and a
+per-item `delivery` array — but the version is worth checking, because
+`counts.total` alone no longer means nothing is wrong: `delivery.failed` can be
+non-zero while `items` is empty, since a channel that cannot deliver stays
+reported after the pane it failed for has resolved.
 
 Pause persists across daemon restarts. It suppresses locally generated desktop
 and ntfy notifications while agents and remote synchronization continue. The
@@ -404,15 +426,23 @@ or process per update:
 ```
 
 The module always emits a count, including `0`, plus one of the CSS classes
-`clear`, `blocked`, `error`, `done`, `paused`, or `unavailable`:
+`clear`, `blocked`, `error`, `done`, `paused`, `notify-failed`, or
+`unavailable`:
 
 ```css
 #custom-zka { color: #99a8b8; }
 #custom-zka.blocked, #custom-zka.error { color: #ff8f91; }
 #custom-zka.done { color: #6ed5c0; }
 #custom-zka.paused { color: #7b8794; }
+#custom-zka.notify-failed { color: #ffb454; }
 #custom-zka.unavailable { color: #d2a8ff; }
 ```
+
+When a notification channel cannot reach you, the count also gains a `!` suffix
+(`0!`, `3!`) and the tooltip names the channel and the error, so the failure is
+visible even without the `notify-failed` rule above. That class outranks
+`paused`, because a pause is deliberate and a broken channel is not; the tooltip
+still reports the queue as paused.
 
 Bind the launcher and inbox directly in Sway:
 
@@ -453,6 +483,12 @@ services.zka = {
     "-o" "ServerAliveCountMax=3"
     "-o" "BatchMode=yes"
   ];
+
+  # Provides swaymsg, used to raise the Kitty window owning a pane when a
+  # notification is actioned. Defaults to pkgs.sway when programs.sway.enable
+  # is set, and to null otherwise. zkad runs from a systemd unit, so the
+  # absolute store path is what makes this resolvable at all.
+  # sway.package = pkgs.sway;
 
   notifications = {
     desktopEnabled = true;

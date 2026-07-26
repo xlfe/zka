@@ -39,6 +39,12 @@ type Config struct {
 		NtfyIncludeEvidence bool   `json:"ntfy_include_evidence"`
 		NtfyCommand         string `json:"ntfy_command"`
 	} `json:"notifications"`
+	// Focus holds the compositor helper used to raise the window owning a pane.
+	// It is a configured command rather than a bare name because zkad runs from
+	// a systemd unit whose PATH is the module's servicePath, not a login shell's.
+	Focus struct {
+		SwayCommand string `json:"sway_command"`
+	} `json:"focus"`
 	Integrations struct {
 		CodexManagedHooks  bool `json:"codex_managed_hooks"`
 		ClaudeManagedHooks bool `json:"claude_managed_hooks"`
@@ -63,6 +69,7 @@ func defaultConfig() Config {
 	cfg.Notifications.NtfyEnabled = true
 	cfg.Notifications.NtfyIncludeEvidence = false
 	cfg.Notifications.NtfyCommand = "ntfy-send"
+	cfg.Focus.SwayCommand = "swaymsg"
 	cfg.Integrations.CodexManagedHooks = true
 	cfg.Integrations.ClaudeManagedHooks = true
 	return cfg
@@ -103,6 +110,7 @@ func LoadConfig() (Config, error) {
 		"zmx.command":                cfg.ZMX.Command,
 		"ssh.command":                cfg.SSH.Command,
 		"notifications.ntfy_command": cfg.Notifications.NtfyCommand,
+		"focus.sway_command":         cfg.Focus.SwayCommand,
 	} {
 		if command == "" {
 			return Config{}, fmt.Errorf("%s must not be empty", label)
@@ -227,6 +235,9 @@ func applyConfigEnvironment(cfg *Config) {
 	}
 	if value := os.Getenv("ZKA_NTFY_COMMAND"); value != "" {
 		cfg.Notifications.NtfyCommand = value
+	}
+	if value := os.Getenv("ZKA_SWAY_COMMAND"); value != "" {
+		cfg.Focus.SwayCommand = value
 	}
 }
 

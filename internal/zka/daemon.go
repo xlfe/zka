@@ -34,6 +34,7 @@ type Daemon struct {
 	runner   CommandRunner
 	proc     processTree
 	kitty    KittyClient
+	desktop  DesktopNotifier
 	logger   *log.Logger
 	sshAgent sshAgentInfo
 
@@ -97,8 +98,14 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 	}
 	state.Node.Platform = runtime.GOOS + "/" + runtime.GOARCH
 	now := time.Now().UTC()
+	sweptNotifications := 0
 	for _, workspace := range state.Workspaces {
 		normalizeWorkspace(workspace)
+		// A reservation can only be owned by a live worker, and at process start
+		// there are none, so anything still marked in flight was lost to a crash
+		// or a kill. Convert it to a retryable failure rather than a phantom
+		// that is neither delivered nor retried.
+		sweptNotifications += sweepInFlightNotifications(workspace, now)
 		for _, pane := range workspace.Panes {
 			if pane.State == StateWorking || pane.State == StateBlocked {
 				pane.State = StateUnknown
@@ -116,6 +123,9 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 	}
 	if err := store.Save(state); err != nil {
 		return nil, err
+	}
+	if sweptNotifications > 0 {
+		logger.Printf("recovered %d notification(s) reserved before shutdown", sweptNotifications)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Daemon{
@@ -151,6 +161,10 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 		attentionSubs:     map[chan struct{}]struct{}{},
 	}
 	store.SetOnSave(d.signalAttention)
+	// Constructor injection rather than a setter: d exists by this point, so
+	// there is no window in which the notifier can receive a button press
+	// without a handler to route it to.
+	d.desktop = newDBusNotifier(logger, d.handleDesktopAction)
 	d.remotes = NewRemoteManager(d)
 	d.agentRelays = newAgentRelayManager(paths.AgentDir, d.sshAgent.EffectiveSocket)
 	return d, nil
@@ -204,6 +218,7 @@ func (d *Daemon) Start() error {
 	d.startWorkerLocked(func(ctx context.Context) { d.watcherReadLoop(ctx) })
 	d.startWorkerLocked(func(ctx context.Context) { d.topologyLoop(ctx) })
 	d.startWorkerLocked(func(ctx context.Context) { d.backendReconcileLoop(ctx) })
+	d.startWorkerLocked(func(ctx context.Context) { d.notificationRetryLoop(ctx) })
 	d.lifeMu.Unlock()
 	d.resumeLifecycleCleanup()
 	d.resumeTopologyReconciliation()
@@ -230,6 +245,11 @@ func (d *Daemon) Close() error {
 	d.remotes.Close()
 	d.agentRelays.close()
 	d.lifeMu.Unlock()
+	// After the unlock and before the join: the notifier's signal goroutine
+	// calls startWorker, which takes lifeMu. Shutting it down while holding
+	// lifeMu would deadlock, and startWorker's closed check does not help
+	// because it acquires the lock before observing it.
+	d.desktop.Shutdown()
 	d.wg.Wait()
 	_ = os.Remove(d.paths.Socket)
 	_ = os.Remove(d.paths.WatcherSocket)

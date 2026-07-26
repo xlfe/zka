@@ -328,6 +328,13 @@ func (ui *attentionUI) layout(gtx layout.Context) layout.Dimensions {
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				message := ui.errorMessage
 				danger := message != ""
+				// A channel that cannot reach the user outranks the reconnect
+				// notice: the queue on screen is then the only place the work is
+				// visible at all.
+				if message == "" && ui.snapshot.Delivery.Broken() {
+					message = attentionDeliveryWarning(ui.snapshot)
+					danger = true
+				}
 				if message == "" && ui.unavailable != "" {
 					message = "Live updates unavailable; reconnecting: " + ui.unavailable
 					danger = true
@@ -406,12 +413,34 @@ func attentionItemSummary(item zka.AttentionItem, now time.Time) string {
 	if !item.TransitionedAt.IsZero() {
 		parts = append(parts, waitingAge(now.Sub(item.TransitionedAt)))
 	}
+	if item.Undelivered() {
+		parts = append(parts, "not delivered")
+	}
 	if item.Detail != "" {
 		parts = append(parts, item.Detail)
 	} else if item.Evidence != "" {
 		parts = append(parts, item.Evidence)
 	}
 	return strings.Join(parts, "  ·  ")
+}
+
+// attentionDeliveryWarning states that a notification channel could not reach
+// the user. It mirrors the Waybar tooltip so both surfaces say the same thing.
+func attentionDeliveryWarning(snapshot zka.AttentionSnapshot) string {
+	delivery := snapshot.Delivery
+	if !delivery.Broken() {
+		return ""
+	}
+	channels := strings.Join(delivery.Channels, ", ")
+	if channels == "" {
+		channels = "notification"
+	}
+	warning := fmt.Sprintf("Cannot deliver %s notifications (%d failed, %d retrying)",
+		channels, delivery.Failed, delivery.Retrying)
+	if delivery.LastError != "" {
+		warning += ": " + delivery.LastError
+	}
+	return warning
 }
 
 func attentionItemState(state zka.AgentState) string {

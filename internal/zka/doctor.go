@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,6 +48,10 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		{"kitty", cfg.Kitty.Command}, {"kitten", cfg.Kitty.KittenCommand},
 		{"zmx", cfg.ZMX.Command}, {"ssh", cfg.SSH.Command},
 		{"ntfy-send", cfg.Notifications.NtfyCommand},
+		// Meaningful only because the config now carries an absolute store path:
+		// a bare name resolves differently from a login shell and from zkad's
+		// systemd unit, which is exactly how this one stayed broken unnoticed.
+		{"swaymsg", cfg.Focus.SwayCommand},
 	}
 	if cfg.Integrations.CodexManagedHooks {
 		commands = append(commands, struct{ name, command string }{"codex", "codex"})
@@ -107,15 +113,99 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		}
 		checks = append(checks, doctorCheck{Name: "remote-forwarded-agent", OK: forwardedOK, Detail: forwardedDetail})
 	}
-	checks = append(checks, topologyRenderableCheck(ctx, api))
+	// One round trip shared by both checks that need the workspace set.
+	workspaces, workspacesErr := api.Workspaces(ctx)
+	checks = append(checks,
+		notificationDeliveryCheck(workspaces, workspacesErr, time.Now().UTC()),
+		desktopNotificationCheck(ctx, cfg.Notifications.DesktopEnabled, probeDesktopNotifier),
+		topologyRenderableCheck(workspaces, workspacesErr),
+	)
 	return writeDoctorResult(checks, *jsonOut, stdout)
+}
+
+// desktopNotifyProbe proves the desktop channel and names what answered.
+type desktopNotifyProbe func(context.Context) (string, error)
+
+// probeDesktopNotifier is the production probe: it posts and immediately
+// withdraws a real notification through the same transport the daemon uses.
+// Nothing ever proved that path before, which is how a transport that could
+// never work survived for the life of the project.
+func probeDesktopNotifier(ctx context.Context) (string, error) {
+	notifier := newDBusNotifier(log.New(io.Discard, "", 0), nil)
+	defer notifier.Shutdown()
+	return notifier.Probe(ctx)
+}
+
+func desktopNotificationCheck(ctx context.Context, enabled bool, probe desktopNotifyProbe) doctorCheck {
+	const name = "notification-desktop"
+	if !enabled {
+		return doctorCheck{Name: name, OK: true, Detail: "disabled in zka configuration"}
+	}
+	server, err := probe(ctx)
+	if err != nil {
+		// A machine with no session bus is a headless or remote origin, not a
+		// broken one: the desktop channel only ever fires where there is a local
+		// Kitty attachment anyway.
+		if errors.Is(err, errNoSessionBus) {
+			return doctorCheck{Name: name, OK: true, Detail: "no session bus to probe"}
+		}
+		return doctorCheck{Name: name, Detail: err.Error()}
+	}
+	return doctorCheck{Name: name, OK: true, Detail: "delivered and withdrew a probe via " + server}
+}
+
+// notificationDeliveryCheck turns the delivery ledger that only `zka workspace
+// inspect` ever showed into a pass/fail signal. An abandoned record is a channel
+// that spent its retry budget; a long-stale pending record is a reservation no
+// worker ever owned, which is the signature of a shutdown that dropped it.
+func notificationDeliveryCheck(workspaces []*Workspace, listErr error, now time.Time) doctorCheck {
+	const name = "notification-delivery"
+	if listErr != nil {
+		return doctorCheck{Name: name, Detail: listErr.Error()}
+	}
+	const stalePending = 5 * time.Minute
+	sent, retrying := 0, 0
+	var problems []string
+	for _, workspace := range workspaces {
+		if workspace == nil {
+			continue
+		}
+		for _, pane := range workspace.Panes {
+			if pane == nil {
+				continue
+			}
+			for _, record := range pane.SortedNotifications() {
+				switch notificationRecordStatus(record) {
+				case "sent":
+					sent++
+				case "retrying":
+					retrying++
+				case "failed":
+					problems = append(problems, fmt.Sprintf("%s: %s/%s abandoned after %d attempts (%s)",
+						record.Channel, workspace.Name, shortID(pane.ID), record.Attempts, record.LastError))
+				case "pending":
+					if !record.LastTriedAt.IsZero() && now.Sub(record.LastTriedAt) >= stalePending {
+						problems = append(problems, fmt.Sprintf("%s: %s/%s reserved but never attempted (%s ago)",
+							record.Channel, workspace.Name, shortID(pane.ID),
+							now.Sub(record.LastTriedAt).Round(time.Minute)))
+					}
+				}
+			}
+		}
+	}
+	if len(problems) != 0 {
+		return doctorCheck{Name: name, Detail: strings.Join(problems, "; ")}
+	}
+	return doctorCheck{
+		Name: name, OK: true,
+		Detail: fmt.Sprintf("%d delivered, %d retrying, 0 failed", sent, retrying),
+	}
 }
 
 // topologyRenderableCheck turns "the desired topology cannot be expressed as a
 // Kitty session" from an outage into a diagnosable pre-flight condition. That
 // state is what drove the reconciler to rebuild every window on a timer.
-func topologyRenderableCheck(ctx context.Context, api API) doctorCheck {
-	workspaces, err := api.Workspaces(ctx)
+func topologyRenderableCheck(workspaces []*Workspace, err error) doctorCheck {
 	if err != nil {
 		return doctorCheck{Name: "topology-renderable", OK: false, Detail: err.Error()}
 	}

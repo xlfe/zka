@@ -291,29 +291,10 @@ func (k KittyClient) SetTabTitle(ctx context.Context, endpoint string, tabID int
 	return err
 }
 
-func (k KittyClient) Notify(ctx context.Context, view RuntimeView, endpoint string, workspace *Workspace, pane *Pane) (string, error) {
-	urgency, icon := "normal", "info"
-	switch pane.State {
-	case StateBlocked:
-		urgency, icon = "critical", "question"
-	case StateError:
-		urgency, icon = "critical", "error"
-	}
-	identifier := "zka-" + workspace.ID + "-" + pane.ID
-	callCtx, cancel := context.WithTimeout(ctx, 24*time.Hour)
-	defer cancel()
-	return k.rc(callCtx, endpoint, "run", k.command(), "notify",
-		"--app-name", "zka", "--identifier", identifier,
-		"--urgency", urgency, "--icon", icon,
-		"--button", "Focus", "--wait-for-completion", "--",
-		notificationTitle(workspace, pane), notificationBody(workspace, pane, true))
-}
-
-func (k KittyClient) CloseNotification(ctx context.Context, endpoint, workspaceID, paneID string) {
-	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	_, _ = k.rc(callCtx, endpoint, "run", k.command(), "notify", "--identifier", "zka-"+workspaceID+"-"+paneID)
-}
+// Desktop notifications deliberately do not live here. They used to run
+// `kitty @ run kitten notify --wait-for-completion`, which could never work:
+// kitty @ run gives the child no controlling terminal, and that kitten writes
+// an OSC 99 escape sequence to a tty. See DesktopNotifier in desktop.go.
 
 // untaggedWindow is a Kitty window carrying no zka identity. Nascent ones are
 // managed panes whose `zka pane` process has not called SetIdentity yet; they

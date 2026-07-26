@@ -99,11 +99,23 @@ type ProcessStatus struct {
 	Exited   time.Time `json:"exited_at,omitempty"`
 }
 
+// NotificationRecord is the durable delivery ledger for one (channel, event)
+// pair. Attempts and NextRetryAt exist because a failed delivery used to be
+// terminal: reserveNotification refused the key forever, so a transient failure
+// and a permanently broken channel were indistinguishable, and both were silent.
+//
+// A record with neither SentAt nor LastError means delivery is in flight. That
+// invariant is what makes an abandoned reservation detectable after a crash.
 type NotificationRecord struct {
-	Key       string    `json:"key"`
-	Channel   string    `json:"channel"`
-	SentAt    time.Time `json:"sent_at,omitempty"`
-	LastError string    `json:"last_error,omitempty"`
+	Key          string    `json:"key"`
+	Channel      string    `json:"channel"`
+	SentAt       time.Time `json:"sent_at,omitempty"`
+	LastError    string    `json:"last_error,omitempty"`
+	Attempts     int       `json:"attempts,omitempty"`
+	FirstTriedAt time.Time `json:"first_tried_at,omitempty"`
+	LastTriedAt  time.Time `json:"last_tried_at,omitempty"`
+	NextRetryAt  time.Time `json:"next_retry_at,omitempty"`
+	Abandoned    bool      `json:"abandoned,omitempty"`
 }
 
 // Pane is the durable identity of one Kitty terminal pane and its hidden zmx

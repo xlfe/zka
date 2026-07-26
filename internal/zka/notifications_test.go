@@ -34,6 +34,71 @@ func setPaneForNotificationWithDetail(t *testing.T, d *Daemon, workspace *Worksp
 	return copy, copy.Panes[pane.ID]
 }
 
+// The Focus button is the whole point of the desktop channel. Both halves must
+// fire: focusing the Kitty pane without raising the compositor window leaves the
+// pane focused inside a window the user cannot see.
+func TestDesktopActionFocusesPaneAndMarksSeen(t *testing.T) {
+	t.Setenv("SWAYSOCK", "/run/user/1234/sway-ipc.sock")
+	runner := quietRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Focus.SwayCommand = "swaymsg"
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	d.mu.Lock()
+	actual := d.state.Workspaces[workspace.ID]
+	actual.Panes[pane.ID].State = StateBlocked
+	actual.Panes[pane.ID].LastTurnID = "action-turn"
+	actual.Attachments["local"] = &Attachment{
+		ID: "local", Node: d.state.Node, Endpoint: "unix:/kitty", Status: AttachmentReady,
+		PID: 4242, Views: readyView(pane.ID, 7),
+	}
+	actual.RecomputeAttention()
+	if err := d.store.Save(d.state); err != nil {
+		d.mu.Unlock()
+		t.Fatal(err)
+	}
+	d.mu.Unlock()
+
+	d.handleDesktopAction(workspace.ID, pane.ID)
+
+	waitFor(t, func() bool {
+		var focused, raised bool
+		for _, call := range runner.Calls() {
+			joined := strings.Join(call.Args, " ")
+			if call.Name == "kitten" && strings.Contains(joined, "focus-window") &&
+				strings.Contains(joined, "var:zka_pane="+pane.ID) {
+				focused = true
+			}
+			if call.Name == "swaymsg" && joined == "[pid=4242] focus" {
+				raised = true
+			}
+		}
+		return focused && raised
+	})
+
+	// Acting on the notification must also resolve the item, or the queue keeps
+	// showing work the user has already been taken to.
+	waitFor(t, func() bool {
+		got, err := d.getWorkspace(workspace.ID)
+		if err != nil {
+			return false
+		}
+		return got.Panes[pane.ID].AttentionSeen != ""
+	})
+}
+
+// A click that arrives after the pane is gone must not panic or fabricate work.
+func TestDesktopActionOnUnknownWorkspaceIsQuiet(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.handleDesktopAction("missing-workspace", "missing-pane")
+}
+
 func TestNtfyEvidenceIsOptIn(t *testing.T) {
 	const rawEvidence = "approve production deploy with token secret-value"
 	for _, test := range []struct {
@@ -98,11 +163,17 @@ func TestNotificationDedupeIsPerPane(t *testing.T) {
 	workspace := createTestWorkspace(t, d, 1)
 	pane := firstPane(workspace)
 	key := "ntfy:error:event"
-	if !d.reserveNotification(workspace.ID, pane.ID, key, "ntfy") {
-		t.Fatal("first reservation failed")
+	if admission := d.reserveNotification(workspace.ID, pane.ID, key, "ntfy"); !admission.Allowed {
+		t.Fatalf("first reservation refused: %s", admission.Reason)
 	}
-	if d.reserveNotification(workspace.ID, pane.ID, key, "ntfy") {
+	// The second refusal must be attributable: an in-flight delivery is not the
+	// same thing as a spent retry budget, and the caller has to be able to tell.
+	admission := d.reserveNotification(workspace.ID, pane.ID, key, "ntfy")
+	if admission.Allowed {
 		t.Fatal("duplicate reservation succeeded")
+	}
+	if admission.Reason != notificationReasonInFlight {
+		t.Fatalf("reason = %q, want %q", admission.Reason, notificationReasonInFlight)
 	}
 }
 
@@ -203,10 +274,8 @@ func TestNotificationChannelsCanBeDisabledIndependently(t *testing.T) {
 		d.mu.Unlock()
 		workspace, pane = setPaneForNotification(t, d, workspace, StateBlocked, "turn-desktop-disabled")
 		d.afterTransition(context.Background(), StateWorking, workspace, pane.ID)
-		for _, call := range runner.Calls() {
-			if call.Name == "kitten" && strings.Contains(strings.Join(call.Args, " "), " notify ") {
-				t.Fatalf("disabled desktop channel invoked Kitty notify: %#v", call.Args)
-			}
+		if notes := fakeDesktop(t, d).Notes(); len(notes) != 0 {
+			t.Fatalf("disabled desktop channel posted notifications: %#v", notes)
 		}
 	})
 }
@@ -247,14 +316,8 @@ func TestRemoteMirrorUsesKittyNotificationButNeverDuplicatesNtfy(t *testing.T) {
 	copy := actual.Clone()
 	d.mu.Unlock()
 	d.afterRemoteTransition(context.Background(), copy, pane.ID)
-	waitFor(t, func() bool {
-		for _, call := range runner.Calls() {
-			if call.Name == "kitten" && strings.Contains(strings.Join(call.Args, " "), " notify ") {
-				return true
-			}
-		}
-		return false
-	})
+	notifier := fakeDesktop(t, d)
+	waitFor(t, func() bool { return len(notifier.Notes()) == 1 })
 	if hasCommand(runner.Calls(), "ntfy-send") {
 		t.Fatal("remote mirror duplicated origin ntfy notification")
 	}

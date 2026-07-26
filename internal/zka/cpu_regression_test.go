@@ -3,6 +3,7 @@ package zka
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -81,18 +82,18 @@ func TestKittyStateProjectionUsesOnlyReadyLocalAttachments(t *testing.T) {
 		t.Fatalf("local pane state updates = %d, want 1", stateUpdates)
 	}
 
+	// Withdrawal no longer consults attachments at all: the notifier's registry
+	// is the authority on what was actually posted, so this issues no Kitty
+	// remote-control command and exactly one withdrawal for the named pane.
 	notificationRunner := quietRunner()
 	d.kitty.Runner = notificationRunner
 	d.closeDesktopNotifications(context.Background(), workspace, pane.ID)
-	notificationCalls := notificationRunner.Calls()
-	if len(notificationCalls) != 1 {
-		t.Fatalf("local Kitty notification close calls = %d, want 1", len(notificationCalls))
+	if calls := notificationRunner.Calls(); len(calls) != 0 {
+		t.Fatalf("notification withdrawal issued Kitty commands: %#v", calls)
 	}
-	for _, call := range notificationCalls {
-		joined := strings.Join(call.Args, " ")
-		if !strings.Contains(joined, "--to unix:/laptop.sock") {
-			t.Fatalf("Kitty notification command targeted an ineligible attachment: %#v", call.Args)
-		}
+	want := []paneRef{{Workspace: workspace.ID, Pane: pane.ID}}
+	if got := fakeDesktop(t, d).Withdrawn(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("withdrawn = %#v, want %#v", got, want)
 	}
 }
 

@@ -1,6 +1,7 @@
 package zka
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -54,6 +55,67 @@ func quietRunner() *fakeRunner {
 	}}
 }
 
+// fakeNotifier replaces the D-Bus desktop notifier in tests. D-Bus has no argv,
+// so fakeRunner cannot intercept it; without this a test machine that happens to
+// have a session bus would post real notifications to the developer's screen.
+type fakeNotifier struct {
+	mu        sync.Mutex
+	notes     []DesktopNotification
+	withdrawn []paneRef
+	probes    int
+	err       error
+}
+
+func (f *fakeNotifier) Notify(_ context.Context, note DesktopNotification) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notes = append(f.notes, note)
+	return f.err
+}
+
+func (f *fakeNotifier) Withdraw(_ context.Context, workspaceID, paneID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.withdrawn = append(f.withdrawn, paneRef{Workspace: workspaceID, Pane: paneID})
+}
+
+func (f *fakeNotifier) Probe(context.Context) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.probes++
+	return "fake notification server", f.err
+}
+
+func (f *fakeNotifier) Shutdown() {}
+
+func (f *fakeNotifier) Notes() []DesktopNotification {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]DesktopNotification(nil), f.notes...)
+}
+
+func (f *fakeNotifier) Withdrawn() []paneRef {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]paneRef(nil), f.withdrawn...)
+}
+
+func (f *fakeNotifier) SetError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
+// fakeDesktop returns the notifier installed by the test daemon constructors.
+func fakeDesktop(t testing.TB, d *Daemon) *fakeNotifier {
+	t.Helper()
+	notifier, ok := d.desktop.(*fakeNotifier)
+	if !ok {
+		t.Fatalf("desktop notifier is %T, want *fakeNotifier", d.desktop)
+	}
+	return notifier
+}
+
 func testPaths(root string) Paths {
 	state := filepath.Join(root, "state")
 	runtime := filepath.Join(root, "run")
@@ -73,9 +135,44 @@ func newTestDaemon(t testing.TB, root string, runner CommandRunner) (*Daemon, er
 	t.Setenv("ZKA_CONFIG", "")
 	d, err := NewDaemon(testPaths(root), runner, log.New(io.Discard, "", 0))
 	if err == nil {
+		d.desktop = &fakeNotifier{}
 		t.Cleanup(func() { _ = d.Close() })
 	}
 	return d, err
+}
+
+// syncBuffer captures the daemon journal. log.Logger is written from several
+// workers at once, so the buffer needs its own lock.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// newTestDaemonWithLog is newTestDaemon plus a readable journal. A delivery
+// failure is observable only through the logger, so a test that cannot read it
+// cannot prove the failure was reported.
+func newTestDaemonWithLog(t testing.TB, root string, runner CommandRunner) (*Daemon, *syncBuffer, error) {
+	t.Helper()
+	t.Setenv("ZKA_CONFIG", "")
+	journal := &syncBuffer{}
+	d, err := NewDaemon(testPaths(root), runner, log.New(journal, "", 0))
+	if err == nil {
+		d.desktop = &fakeNotifier{}
+		t.Cleanup(func() { _ = d.Close() })
+	}
+	return d, journal, err
 }
 
 func serveTestDaemon(t testing.TB, d *Daemon) {
@@ -222,6 +319,7 @@ func newTestDaemonAtPaths(t testing.TB, paths Paths, runner CommandRunner) (*Dae
 	t.Setenv("ZKA_CONFIG", "")
 	d, err := NewDaemon(paths, runner, log.New(io.Discard, "", 0))
 	if err == nil {
+		d.desktop = &fakeNotifier{}
 		t.Cleanup(func() { _ = d.Close() })
 	}
 	return d, err

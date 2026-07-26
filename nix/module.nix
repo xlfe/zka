@@ -123,6 +123,8 @@ let
       ntfy_include_evidence = cfg.notifications.ntfyIncludeEvidence;
       ntfy_command = cfg.notifications.ntfyCommand;
     };
+    focus.sway_command =
+      if cfg.sway.package == null then "swaymsg" else "${cfg.sway.package}/bin/swaymsg";
     integrations = {
       codex_managed_hooks = cfg.codex.enableManagedHooks;
       claude_managed_hooks = cfg.claude.enableManagedHooks;
@@ -135,6 +137,7 @@ let
     cfg.ssh.package
   ]
   ++ lib.optional (cfg.zmx.package != null) cfg.zmx.package
+  ++ lib.optional (cfg.sway.package != null) cfg.sway.package
   ++ cfg.extraPackages;
 in
 {
@@ -179,6 +182,22 @@ in
       type = lib.types.nullOr lib.types.package;
       default = null;
       description = "Optional zmx package; leave null when zmx is supplied system-wide.";
+    };
+
+    sway = {
+      package = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = if config.programs.sway.enable then pkgs.sway else null;
+        defaultText = lib.literalExpression "if config.programs.sway.enable then pkgs.sway else null";
+        description = ''
+          Package providing swaymsg, used to raise the Kitty window owning a pane
+          when a desktop notification is actioned. zkad runs from a systemd unit
+          whose PATH is this module's, not a login shell's, so a bare `swaymsg`
+          would not resolve; the absolute store path is written into the runtime
+          configuration. Defaults to null on hosts that do not enable Sway, where
+          compositor focus is a no-op anyway.
+        '';
+      };
     };
 
     ssh = {
