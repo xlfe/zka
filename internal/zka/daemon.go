@@ -398,6 +398,11 @@ type createWorkspaceRequest struct {
 	Name  string     `json:"name,omitempty"`
 	Shell []string   `json:"shell,omitempty"`
 	Panes []PaneSpec `json:"panes"`
+	// Topology, when non-empty, makes creation a headless genesis: the desired
+	// topology and manifest are installed atomically with the panes, so the
+	// workspace is attachable before any Kitty has ever displayed it.
+	Topology  []GenesisOSWindow `json:"topology,omitempty"`
+	FocusPane *int              `json:"focus_pane,omitempty"`
 }
 
 type refRequest struct {
@@ -737,6 +742,9 @@ func (d *Daemon) createWorkspace(req createWorkspaceRequest) (*Workspace, error)
 	if len(req.Panes) == 0 {
 		req.Panes = []PaneSpec{{}}
 	}
+	if err := validateGenesisRequest(&req); err != nil {
+		return nil, err
+	}
 	if len(req.Shell) == 0 {
 		req.Shell = append([]string(nil), d.config.Shell.Command...)
 	}
@@ -747,7 +755,8 @@ func (d *Daemon) createWorkspace(req createWorkspaceRequest) (*Workspace, error)
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(req.Name) == "" {
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
 		req.Name = "workspace-" + shortID(id)
 	}
 	if err := validateName(req.Name); err != nil {
@@ -767,6 +776,7 @@ func (d *Daemon) createWorkspace(req createWorkspaceRequest) (*Workspace, error)
 		Attachments: map[string]*Attachment{}, Attention: StateUnknown,
 		CreatedAt: now, UpdatedAt: now,
 	}
+	paneIDs := make([]string, 0, len(req.Panes))
 	for position, spec := range req.Panes {
 		// Genesis panes are admitted from the outset: they define the workspace
 		// rather than joining an existing topology.
@@ -775,8 +785,16 @@ func (d *Daemon) createWorkspace(req createWorkspaceRequest) (*Workspace, error)
 			return nil, paneErr
 		}
 		workspace.Panes[pane.ID] = pane
+		paneIDs = append(paneIDs, pane.ID)
 	}
 	workspace.RecomputeAttention()
+	if len(req.Topology) != 0 {
+		// The workspace is not yet in d.state, so a failed install persists
+		// nothing at all.
+		if err := installGenesisTopology(workspace, req, paneIDs); err != nil {
+			return nil, err
+		}
+	}
 	if d.config.SSH.ForwardAgent {
 		if _, err := d.agentRelays.ensure(workspace.ID, ""); err != nil {
 			return nil, err

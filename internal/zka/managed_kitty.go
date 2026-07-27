@@ -27,24 +27,33 @@ func templatePaneSpecs(template SessionTemplate, defaultCWD string) ([]PaneSpec,
 		if !line.IsLaunch {
 			continue
 		}
-		options := line.Launch.Options
-		cwd := ""
-		if option, ok := options.Get("--cwd"); ok {
-			cwd = option.Value
-		}
-		if cwd == "" {
-			cwd = defaultCWD
-		}
-		title := ""
-		for _, name := range []string{"--title", "--window-title"} {
-			if option, ok := options.Get(name); ok && option.Value != "" {
-				title = option.Value
-				break
-			}
-		}
-		result = append(result, PaneSpec{CWD: cwd, Title: title, LaunchOptions: options.clone()})
+		spec := paneSpecFromLaunch(line.Launch.Options, defaultCWD, "")
+		spec.LaunchOptions = line.Launch.Options.clone()
+		result = append(result, spec)
 	}
 	return result, nil
+}
+
+// paneSpecFromLaunch extracts the pane-model fields of one template launch.
+// pendingTitle is a preceding `title` directive, which Kitty applies to the
+// next launch unless the launch carries its own title option. The returned
+// spec has no LaunchOptions; each caller decides which options it stores.
+func paneSpecFromLaunch(options launchOptions, defaultCWD, pendingTitle string) PaneSpec {
+	cwd := ""
+	if option, ok := options.Get("--cwd"); ok {
+		cwd = option.Value
+	}
+	if cwd == "" {
+		cwd = defaultCWD
+	}
+	title := pendingTitle
+	for _, name := range []string{"--title", "--window-title"} {
+		if option, ok := options.Get(name); ok && option.Value != "" {
+			title = option.Value
+			break
+		}
+	}
+	return PaneSpec{CWD: cwd, Title: title}
 }
 
 var kittyValueOptions = map[string]bool{
