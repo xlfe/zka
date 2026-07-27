@@ -300,7 +300,7 @@ func (ui *attentionUI) layout(gtx layout.Context) layout.Dimensions {
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						brand := material.H6(ui.base.theme, "zka")
 						brand.Color = ui.base.colors.accent
-						return brand.Layout(gtx)
+						return ui.base.selectableLabel(gtx, "attention:brand", brand)
 					}),
 					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions { return layout.Dimensions{} }),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -315,14 +315,14 @@ func (ui *attentionUI) layout(gtx layout.Context) layout.Dimensions {
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Top: 14}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					heading := material.H5(ui.base.theme, attentionHeading(ui.snapshot))
-					return heading.Layout(gtx)
+					return ui.base.selectableLabel(gtx, "attention:heading", heading)
 				})
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Top: 5, Bottom: 14}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					label := material.Body2(ui.base.theme, attentionSubtitle(ui.snapshot))
 					label.Color = ui.base.colors.muted
-					return label.Layout(gtx)
+					return ui.base.selectableLabel(gtx, "attention:subtitle", label)
 				})
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -346,7 +346,7 @@ func (ui *attentionUI) layout(gtx layout.Context) layout.Dimensions {
 					return layout.Dimensions{}
 				}
 				return layout.Inset{Bottom: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					return ui.base.message(gtx, message, danger)
+					return ui.base.message(gtx, "attention:message", message, danger)
 				})
 			}),
 			layout.Flexed(1, ui.layoutItems),
@@ -354,7 +354,7 @@ func (ui *attentionUI) layout(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Top: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					footer := material.Caption(ui.base.theme, "↑↓ Navigate    Enter Open pane    P Pause/Resume notifications    Esc Close")
 					footer.Color = ui.base.colors.muted
-					return footer.Layout(gtx)
+					return ui.base.selectableLabel(gtx, "attention:footer", footer)
 				})
 			}),
 		)
@@ -375,7 +375,7 @@ func (ui *attentionUI) layoutItems(gtx layout.Context) layout.Dimensions {
 			title += "  /  " + item.PaneTitle
 		}
 		return layout.Inset{Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return ui.base.actionCard(gtx, ui.row(item.ID), title, attentionItemSummary(item, gtx.Now), "Open →", ui.selected == index)
+			return ui.base.actionCard(gtx, "attention-item:"+item.ID, ui.row(item.ID), title, attentionItemSummary(item, gtx.Now), "Open →", ui.selected == index)
 		})
 	})
 }
