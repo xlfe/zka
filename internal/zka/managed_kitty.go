@@ -211,9 +211,20 @@ func waitForAttachmentReady(ctx context.Context, api API, kitty KittyClient, wor
 				Manifest: manifest, Views: views,
 			})
 			if updateErr == nil {
-				return updated, nil
+				workspace = updated
+				current := updated.Attachments[attachment.ID]
+				if current == nil {
+					lastErr = fmt.Errorf("attachment %s disappeared while waiting for readiness", attachment.ID)
+				} else {
+					attachment = current
+					if current.Status == AttachmentReady {
+						return updated, nil
+					}
+					lastErr = fmt.Errorf("%w: attachment %s is %s", errViewsNotReady, current.ID, current.Status)
+				}
+			} else {
+				lastErr, validationErr = updateErr, updateErr
 			}
-			lastErr, validationErr = updateErr, updateErr
 		} else {
 			lastErr = err
 		}

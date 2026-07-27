@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWorkspaceAgentClaimUsesStableRelayAndFailsClosedOnDetach(t *testing.T) {
@@ -428,6 +429,120 @@ func TestManifestDoesNotBecomeReadyBeforeZMXClient(t *testing.T) {
 	views[pane.ID] = RuntimeView{PaneID: pane.ID, WindowID: 1, Ready: true}
 	if _, err := d.updateManifest(manifestUpdateRequest{Workspace: workspace.ID, Attachment: attachment.ID, Manifest: testManifest(workspace), Views: views}); err != nil {
 		t.Fatalf("ready manifest: %v", err)
+	}
+}
+
+func TestRemoteReplicaManifestDoesNotBecomeReadyBeforeZMXClient(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	source, err := d.registerAttachment(workspace.ID, Attachment{
+		ID: "source", Node: d.state.Node, Transport: Transport{Kind: "local"}, Endpoint: "unix:/source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err = d.updateManifest(manifestUpdateRequest{
+		Workspace: workspace.ID, Attachment: source.ID, Manifest: testManifest(workspace), Views: readyView(pane.ID, 1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.state.Workspaces[workspace.ID].RemoteHost = "origin.example"
+	workspace.RemoteHost = "origin.example"
+	attachment, err := d.registerAttachment(workspace.ID, Attachment{
+		ID: "local", Node: d.state.Node, Transport: Transport{Kind: "ssh", Host: workspace.RemoteHost}, Endpoint: "unix:/kitty",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	views := readyView(pane.ID, 1)
+	view := views[pane.ID]
+	view.Ready = false
+	views[pane.ID] = view
+
+	got, err := d.updateManifest(manifestUpdateRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID, Manifest: testManifest(workspace), Views: views,
+	})
+	if err != nil {
+		t.Fatalf("capture with an unready remote client was rejected: %v", err)
+	}
+	if got.Attachments[attachment.ID].Status == AttachmentReady {
+		t.Fatal("remote replica manifest became ready before its zmx client")
+	}
+	views[pane.ID] = RuntimeView{PaneID: pane.ID, WindowID: 1, Ready: true}
+	got, err = d.updateManifest(manifestUpdateRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID, Manifest: testManifest(workspace), Views: views,
+	})
+	if err != nil {
+		t.Fatalf("ready remote replica manifest: %v", err)
+	}
+	if got.Attachments[attachment.ID].Status != AttachmentReady {
+		t.Fatalf("remote replica attachment status = %q, want ready", got.Attachments[attachment.ID].Status)
+	}
+}
+
+func TestWaitForAttachmentReadyWaitsForRemoteClients(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	source, err := d.registerAttachment(workspace.ID, Attachment{
+		ID: "source", Node: d.state.Node, Transport: Transport{Kind: "local"}, Endpoint: "unix:/source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err = d.updateManifest(manifestUpdateRequest{
+		Workspace: workspace.ID, Attachment: source.ID, Manifest: testManifest(workspace), Views: readyView(pane.ID, 1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.state.Workspaces[workspace.ID].RemoteHost = "origin.example"
+	workspace.RemoteHost = "origin.example"
+	attachment, err := d.registerAttachment(workspace.ID, Attachment{
+		ID: "local", Node: d.state.Node, Transport: Transport{Kind: "ssh", Host: workspace.RemoteHost}, Endpoint: "unix:/kitty",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+
+	listCalls := 0
+	runner := &fakeRunner{handler: func(_ context.Context, _ string, args ...string) (string, string, error) {
+		tree := kittyTreeForTabs(workspace.ID, [][]string{{pane.ID}})
+		if strings.HasSuffix(strings.Join(args, " "), " ls") {
+			listCalls++
+			if listCalls == 1 {
+				tree[0].Tabs[0].Windows[0].UserVars["zka_ready"] = "0"
+			}
+		}
+		return kittyResponse(t, args, tree, workspace)
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	got, err := waitForAttachmentReady(
+		ctx,
+		NewAPI(d.paths),
+		KittyClient{Runner: runner, Command: "kitten-test"},
+		workspace,
+		attachment,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listCalls < 2 {
+		t.Fatalf("Kitty captures = %d, want at least two", listCalls)
+	}
+	if got.Attachments[attachment.ID].Status != AttachmentReady ||
+		!got.Attachments[attachment.ID].Views[pane.ID].Ready {
+		t.Fatalf("attachment returned before its remote client was ready: %#v", got.Attachments[attachment.ID])
 	}
 }
 

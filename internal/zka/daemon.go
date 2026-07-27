@@ -1692,14 +1692,19 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 			}
 			return nil, err
 		}
-		candidate.Status = AttachmentReady
 		candidate.LastError = ""
 		candidate.ObservedTopology = topologyIdentity(stableTopology)
-		candidate.AppliedTopologyGeneration = workspace.Topology.Generation
-		candidate.AppliedTopologyDigest = workspace.Topology.Digest
 		candidate.ReconcileTargetGeneration = workspace.Topology.Generation
-		candidate.ReconcileStatus = "ready"
-		candidate.AppliedRevision = workspace.Revision
+		if viewsReady {
+			candidate.Status = AttachmentReady
+			candidate.AppliedTopologyGeneration = workspace.Topology.Generation
+			candidate.AppliedTopologyDigest = workspace.Topology.Digest
+			candidate.ReconcileStatus = TopologyReconcileReady
+			candidate.AppliedRevision = workspace.Revision
+		} else {
+			candidate.Status = AttachmentPreparing
+			candidate.ReconcileStatus = TopologyReconcilePending
+		}
 		if attachmentRuntimeEqual(attachment, candidate) {
 			return workspace.Clone(), nil
 		}
