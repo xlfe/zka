@@ -12,11 +12,15 @@ import (
 
 const (
 	stateSchemaVersion = 6
+	// 9: workspace birth crossed the remote-control protocol
+	// (create_workspace). A pre-9 origin would reject the op with a bare
+	// "unknown remote operation", so the version check turns skew into an
+	// explicit upgrade prompt instead.
 	// 8: a replica stopped sending its own working directory when allocating a
 	// remote pane, and sends the source pane instead. An origin that predates
 	// this would quietly place every remote pane in the home directory, so the
 	// version check turns that into an explicit upgrade prompt.
-	protocolVersion    = 8
+	protocolVersion    = 9
 	remoteProtocolName = "zka.workspace"
 	remoteProtocolMax  = 1 << 20
 )
@@ -275,8 +279,11 @@ func (a *Attachment) SortedViews() []RuntimeView {
 }
 
 type Workspace struct {
-	ID                  string                 `json:"id"`
-	Name                string                 `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// CreationKey deduplicates replays of the same birth request after a
+	// dropped SSH response; see createWorkspaceRequest.CreationKey.
+	CreationKey         string                 `json:"creation_key,omitempty"`
 	Origin              Host                   `json:"origin"`
 	RemoteHost          string                 `json:"remote_host,omitempty"`
 	Revision            uint64                 `json:"revision"`

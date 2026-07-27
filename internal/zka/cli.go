@@ -298,6 +298,8 @@ func runWorkspace(args []string, paths Paths, stdout, stderr io.Writer) (int, er
 		return runWorkspaceInspect(args[1:], paths, stdout, stderr)
 	case "reconcile":
 		return runWorkspaceReconcile(args[1:], paths, stdout, stderr)
+	case "create":
+		return runWorkspaceCreate(args[1:], paths, stdout, stderr)
 	case "attach":
 		return runWorkspaceAttach(args[1:], paths, false, stdout, stderr)
 	case "move":
@@ -326,6 +328,7 @@ func printWorkspaceUsage(w io.Writer) {
   list [--origin SSH_ALIAS] [--json]
   inspect [SSH_ALIAS:]REF [--json]
   reconcile [SSH_ALIAS:]REF [--attachment ID]
+  create [SSH_ALIAS:]NAME [--template FILE] [--cwd DIR] [--attach]
   attach [SSH_ALIAS:]REF [--pane PANE]
   move [SSH_ALIAS:]REF [--pane PANE]
   detach REF
@@ -336,6 +339,98 @@ func printWorkspaceUsage(w io.Writer) {
   agent claim [SSH_ALIAS:]REF
   agent release [SSH_ALIAS:]REF
   agent status [--json] [SSH_ALIAS:]REF`)
+}
+
+// runWorkspaceCreate births a workspace without launching Kitty, locally or on
+// a remote origin. The workspace comes out dormant — fully attachable, with no
+// view anywhere — which is the whole point: agents on a headless origin can be
+// set up from any machine and attached to later.
+func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("workspace create", stderr)
+	cwd := fs.String("cwd", "", "default pane working directory on the origin")
+	templatePath := fs.String("template", "", "topology-only Kitty session template")
+	attach := fs.Bool("attach", false, "attach the workspace here after creating it")
+	if err := parseInterspersed(fs, args); err != nil {
+		return 2, err
+	}
+	if fs.NArg() != 1 {
+		return 2, fmt.Errorf("workspace create requires one [SSH_ALIAS:]NAME argument")
+	}
+	host, name := splitWorkspaceRef(fs.Arg(0))
+	if host == "" && strings.TrimSpace(name) == "" {
+		return 2, fmt.Errorf("workspace create requires a name (append SSH_ALIAS: for an automatic remote name)")
+	}
+	if *cwd != "" && !filepath.IsAbs(*cwd) {
+		if host != "" {
+			// A relative path resolved on this machine would silently mean a
+			// different directory on the origin.
+			return 2, fmt.Errorf("--cwd %q must be an absolute path on %s", *cwd, host)
+		}
+		resolved, err := filepath.Abs(*cwd)
+		if err != nil {
+			return 1, err
+		}
+		*cwd = resolved
+	}
+	template := DefaultSessionTemplate()
+	if *templatePath != "" {
+		content, err := os.ReadFile(*templatePath)
+		if err != nil {
+			return 1, fmt.Errorf("read Kitty template: %w", err)
+		}
+		template, err = ParseSessionTemplate(string(content))
+		if err != nil {
+			return 2, err
+		}
+	}
+	plan, err := TemplateGenesis(template, *cwd)
+	if err != nil {
+		return 2, err
+	}
+	key, err := randomID()
+	if err != nil {
+		return 1, err
+	}
+	// Shell is deliberately left empty: the origin's configured shell must
+	// win, and for a remote create this machine's config describes the wrong
+	// host. Empty pane directories default to the origin's home the same way.
+	request := createWorkspaceRequest{
+		Name: name, Panes: plan.Panes, Topology: plan.Topology,
+		FocusPane: plan.FocusPane, CreationKey: key,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	api := NewAPI(paths)
+	var workspace *Workspace
+	if host == "" {
+		workspace, err = api.CreateWorkspace(ctx, request)
+	} else {
+		var created Workspace
+		if err = api.RemoteCall(ctx, host, "create_workspace", request, &created); err != nil {
+			err = fmt.Errorf("create workspace on %s: %w", host, err)
+		} else {
+			workspace = &created
+		}
+	}
+	if err != nil {
+		if host != "" && strings.Contains(err.Error(), "already exists") {
+			fmt.Fprintf(stderr, "zka: attach the existing workspace with: zka workspace attach %s:%s\n", host, name)
+		}
+		return 1, err
+	}
+	if !*attach {
+		fmt.Fprintf(stdout, "%s\t%s\n", workspace.ID, workspace.Name)
+		return 0, nil
+	}
+	ref := workspace.ID
+	if host != "" {
+		ref = host + ":" + workspace.ID
+	}
+	code, err := runWorkspaceAttach([]string{ref}, paths, false, stdout, stderr)
+	if err != nil {
+		return code, fmt.Errorf("workspace %s created but not attached; retry with: zka workspace attach %s: %w", workspace.Name, ref, err)
+	}
+	return code, nil
 }
 
 func runWorkspaceReconcile(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
@@ -1312,6 +1407,10 @@ func writeWorkspaceTable(w io.Writer, workspaces []*Workspace) {
 			origin = workspace.RemoteHost
 		}
 		state := string(workspace.Attention)
+		if len(workspace.Attachments) == 0 {
+			// Created, never attached anywhere: waiting for its first view.
+			state = "dormant"
+		}
 		if workspace.DeletionPending {
 			state = "deleting"
 		}
@@ -1326,6 +1425,9 @@ func writeWorkspaceDetail(w io.Writer, workspace *Workspace) {
 	fmt.Fprintf(w, "topology_generation=%d\ntopology_digest=%s\ntopology_panes=%d\ntopology_pending=%d\n",
 		workspace.Topology.Generation, shortDigest(workspace.Topology.Digest),
 		len(desiredPaneIDs(workspace)), pendingTopologyPaneCount(workspace))
+	if len(workspace.Attachments) == 0 {
+		fmt.Fprintln(w, "dormant=true")
+	}
 	if workspace.DeletionPending {
 		fmt.Fprintf(w, "deletion_pending=true\ndeletion_error=%s\n", workspace.DeletionError)
 	}

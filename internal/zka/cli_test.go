@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -67,6 +68,91 @@ func TestInterspersedWorkspaceFlagsMatchDocumentedSyntax(t *testing.T) {
 	}
 	if fs.NArg() != 1 || fs.Arg(0) != "devbox.example:example-project" || *pane != "abc" || !*jsonOut {
 		t.Fatalf("args=%#v pane=%q json=%v", fs.Args(), *pane, *jsonOut)
+	}
+}
+
+func TestWorkspaceCreateDispatchAndUsage(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code, err := runWorkspace([]string{"create"}, Paths{}, &stdout, &stderr)
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "requires one [SSH_ALIAS:]NAME") {
+		t.Fatalf("no argument: code=%d err=%v", code, err)
+	}
+	code, err = runWorkspace([]string{"create", ""}, Paths{}, &stdout, &stderr)
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "requires a name") {
+		t.Fatalf("empty local name: code=%d err=%v", code, err)
+	}
+	code, err = runWorkspace([]string{"create", "one", "two"}, Paths{}, &stdout, &stderr)
+	if code != 2 || err == nil {
+		t.Fatalf("two arguments: code=%d err=%v", code, err)
+	}
+	// A relative --cwd for a remote origin is rejected before any RPC: it
+	// would silently mean a different directory over there.
+	code, err = runWorkspace([]string{"create", "devbox.example:api", "--cwd", "relative"}, Paths{}, &stdout, &stderr)
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "absolute path on devbox.example") {
+		t.Fatalf("relative remote cwd: code=%d err=%v", code, err)
+	}
+	stdout.Reset()
+	if code, err := runWorkspace([]string{"help"}, Paths{}, &stdout, &stderr); code != 0 || err != nil {
+		t.Fatalf("help: code=%d err=%v", code, err)
+	}
+	if !strings.Contains(stdout.String(), "\n  create ") {
+		t.Fatalf("workspace usage does not advertise create: %q", stdout.String())
+	}
+}
+
+func TestWorkspaceCreateSurfacesTemplateErrorsBeforeAnyRPC(t *testing.T) {
+	// Paths{} has no reachable socket, so any error that mentions the
+	// template proves parsing happened before an RPC was attempted.
+	var stdout, stderr bytes.Buffer
+	code, err := runWorkspace([]string{"create", "api", "--template", "/definitely/missing.session"}, Paths{}, &stdout, &stderr)
+	if code != 1 || err == nil || !strings.Contains(err.Error(), "read Kitty template") {
+		t.Fatalf("missing template: code=%d err=%v", code, err)
+	}
+	unsafe := filepath.Join(t.TempDir(), "bad.session")
+	if err := os.WriteFile(unsafe, []byte("detach_window\nlaunch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, err = runWorkspace([]string{"create", "api", "--template", unsafe}, Paths{}, &stdout, &stderr)
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "not topology-safe") {
+		t.Fatalf("unsafe template: code=%d err=%v", code, err)
+	}
+}
+
+func TestWorkspaceCreateLocalCreatesDormantWorkspace(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+	var stdout, stderr bytes.Buffer
+	code, err := runWorkspace([]string{"create", "api"}, d.paths, &stdout, &stderr)
+	if code != 0 || err != nil {
+		t.Fatalf("create: code=%d err=%v stderr=%q", code, err, stderr.String())
+	}
+	fields := strings.Fields(stdout.String())
+	if len(fields) != 2 || fields[1] != "api" {
+		t.Fatalf("create output = %q", stdout.String())
+	}
+	workspace, err := d.getWorkspace(fields[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(workspace.Attachments) != 0 || workspace.Topology.Generation != 1 {
+		t.Fatalf("created workspace = attachments %d, generation %d", len(workspace.Attachments), workspace.Topology.Generation)
+	}
+	stdout.Reset()
+	if code, err := runWorkspace([]string{"list"}, d.paths, &stdout, &stderr); code != 0 || err != nil {
+		t.Fatalf("list: code=%d err=%v", code, err)
+	}
+	if !strings.Contains(stdout.String(), "dormant") {
+		t.Fatalf("list does not mark the workspace dormant: %q", stdout.String())
+	}
+	stdout.Reset()
+	if code, err := runWorkspace([]string{"inspect", fields[0]}, d.paths, &stdout, &stderr); code != 0 || err != nil {
+		t.Fatalf("inspect: code=%d err=%v", code, err)
+	}
+	if !strings.Contains(stdout.String(), "dormant=true") {
+		t.Fatalf("inspect does not report dormancy: %q", stdout.String())
 	}
 }
 

@@ -147,7 +147,7 @@ func (m *RemoteManager) cacheResult(host, op string, result json.RawMessage) err
 			return fmt.Errorf("decode remote workspace list from %s: %w", host, err)
 		}
 		return m.daemon.cacheRemoteSnapshot(host, workspaces)
-	case "get", "update_attachment", "update_manifest", "detach_attachment", "seen", "rename_workspace", "close_panes":
+	case "get", "update_attachment", "update_manifest", "detach_attachment", "seen", "rename_workspace", "close_panes", "create_workspace":
 		var workspace Workspace
 		if err := json.Unmarshal(result, &workspace); err != nil {
 			return fmt.Errorf("decode remote workspace response from %s: %w", host, err)
@@ -597,7 +597,7 @@ func (w *remoteControlWriter) send(message remoteEnvelope) error {
 
 func runRemoteControl(ctx context.Context, paths Paths, stdin io.Reader, stdout io.Writer) error {
 	writer := &remoteControlWriter{enc: json.NewEncoder(stdout)}
-	if err := writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "hello", Capabilities: []string{"workspace-snapshots", "events", "two-phase-move", "revocation", "workspace-lifecycle", "ssh-agent-relay-v1", "topology-replica-v1"}}); err != nil {
+	if err := writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "hello", Capabilities: []string{"workspace-snapshots", "events", "two-phase-move", "revocation", "workspace-lifecycle", "ssh-agent-relay-v1", "topology-replica-v1", "workspace-create"}}); err != nil {
 		return err
 	}
 	api := NewAPI(paths)
@@ -727,6 +727,22 @@ func dispatchRemoteControl(ctx context.Context, api API, op string, raw json.Raw
 	case "list":
 		workspaces, err := authoritativeWorkspaces(ctx, api)
 		value = workspaces
+		if err != nil {
+			return nil, err
+		}
+	case "create_workspace":
+		var req createWorkspaceRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		// Deliberately unsanitised: the request carries no host-local Kitty
+		// identity (contrast allocate_pane below), createWorkspace pins the
+		// origin to this node, an empty shell resolves to this origin's
+		// configured shell, and pane directories are validated as
+		// origin-absolute. The creation key makes a replay after a dropped
+		// response return the workspace it already created.
+		workspace, err := api.CreateWorkspace(ctx, req)
+		value = workspace
 		if err != nil {
 			return nil, err
 		}

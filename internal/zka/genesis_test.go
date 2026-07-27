@@ -375,6 +375,41 @@ func TestGenesisTopologyConvergesOnFirstCapture(t *testing.T) {
 	}
 }
 
+func TestCreateWorkspaceCreationKeyReplaySafety(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "00112233445566778899aabbccddeeff"
+	first, err := d.createWorkspace(createWorkspaceRequest{Name: "one", Shell: []string{"fish"}, Panes: []PaneSpec{{}}, CreationKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Attachments) != 0 {
+		t.Fatalf("created workspace is not dormant: %#v", first.Attachments)
+	}
+	// The key is a replay token, not a content hash: the same key returns the
+	// original workspace even under a different name, checked before name
+	// uniqueness so a replay can never collide with itself.
+	replayed, err := d.createWorkspace(createWorkspaceRequest{Name: "two", Shell: []string{"fish"}, Panes: []PaneSpec{{}}, CreationKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.ID != first.ID {
+		t.Fatalf("replay created %s, want %s", replayed.ID, first.ID)
+	}
+	d.mu.Lock()
+	count := len(d.state.Workspaces)
+	d.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("workspace count = %d", count)
+	}
+	if _, err := d.createWorkspace(createWorkspaceRequest{Name: "three", Shell: []string{"fish"}, Panes: []PaneSpec{{}}, CreationKey: "short"}); err == nil ||
+		!strings.Contains(err.Error(), "creation key") {
+		t.Fatalf("malformed key error = %v", err)
+	}
+}
+
 func TestGenesisWorkspaceCanBeRolledBackAndKilled(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {

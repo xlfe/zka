@@ -129,6 +129,13 @@ func attachArgs(host string, workspace *zka.Workspace) []string {
 	return []string{"workspace", "attach", ref}
 }
 
+// createRemoteArgs births a workspace on the origin and attaches it here in
+// one gesture. A blank name yields the ref "HOST:", which the origin answers
+// with an automatically named workspace.
+func createRemoteArgs(host, name string) []string {
+	return []string{"workspace", "create", host + ":" + strings.TrimSpace(name), "--attach"}
+}
+
 func detachArgs(workspace *zka.Workspace) []string {
 	return []string{"workspace", "detach", workspace.ID}
 }

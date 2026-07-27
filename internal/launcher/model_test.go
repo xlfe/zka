@@ -84,6 +84,8 @@ func TestLauncherBuildsExistingCLICommandsWithoutAShell(t *testing.T) {
 		{name: "explicit name", got: createArgs("  shell work  "), want: []string{"kitty", "--name", "shell work"}},
 		{name: "local attach", got: attachArgs("", workspace), want: []string{"workspace", "attach", workspace.ID}},
 		{name: "remote attach", got: attachArgs("devbox.example", workspace), want: []string{"workspace", "attach", "devbox.example:" + workspace.ID}},
+		{name: "remote create", got: createRemoteArgs("devbox.example", " api "), want: []string{"workspace", "create", "devbox.example:api", "--attach"}},
+		{name: "remote create auto name", got: createRemoteArgs("devbox.example", "  "), want: []string{"workspace", "create", "devbox.example:", "--attach"}},
 		{name: "detach", got: detachArgs(workspace), want: []string{"workspace", "detach", workspace.ID}},
 	} {
 		t.Run(test.name, func(t *testing.T) {

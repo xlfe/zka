@@ -403,6 +403,13 @@ type createWorkspaceRequest struct {
 	// workspace is attachable before any Kitty has ever displayed it.
 	Topology  []GenesisOSWindow `json:"topology,omitempty"`
 	FocusPane *int              `json:"focus_pane,omitempty"`
+	// CreationKey deduplicates replays of the same birth request: the caller
+	// generates it once per command invocation, the daemon persists it on the
+	// workspace, and a request carrying an already-seen key returns that
+	// workspace instead of a name collision. The remote-call retry loop
+	// replays the identical payload after an SSH drop, which is exactly the
+	// window this closes. Empty means no deduplication.
+	CreationKey string `json:"creation_key,omitempty"`
 }
 
 type refRequest struct {
@@ -762,8 +769,20 @@ func (d *Daemon) createWorkspace(req createWorkspaceRequest) (*Workspace, error)
 	if err := validateName(req.Name); err != nil {
 		return nil, err
 	}
+	if req.CreationKey != "" && validateRemoteWorkspaceID(req.CreationKey) != nil {
+		return nil, fmt.Errorf("creation key %q must be 32 lowercase hexadecimal characters", req.CreationKey)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if req.CreationKey != "" {
+		for _, existing := range d.state.Workspaces {
+			if existing.RemoteHost == "" && existing.CreationKey == req.CreationKey {
+				// A replayed birth after a dropped response returns the
+				// workspace it already created instead of a name collision.
+				return existing.Clone(), nil
+			}
+		}
+	}
 	for _, existing := range d.state.Workspaces {
 		if existing.RemoteHost == "" && existing.Name == req.Name {
 			return nil, fmt.Errorf("workspace name %q already exists", req.Name)
@@ -771,7 +790,7 @@ func (d *Daemon) createWorkspace(req createWorkspaceRequest) (*Workspace, error)
 	}
 	now := time.Now().UTC()
 	workspace := &Workspace{
-		ID: id, Name: req.Name, Origin: d.state.Node, Revision: 1,
+		ID: id, Name: req.Name, CreationKey: req.CreationKey, Origin: d.state.Node, Revision: 1,
 		Shell: append([]string(nil), req.Shell...), Panes: map[string]*Pane{},
 		Attachments: map[string]*Attachment{}, Attention: StateUnknown,
 		CreatedAt: now, UpdatedAt: now,

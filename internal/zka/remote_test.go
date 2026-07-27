@@ -180,6 +180,106 @@ func TestSSHHostAliasIsSafeForKittyShellCommand(t *testing.T) {
 	}
 }
 
+func TestRemoteControlCreatesWorkspaceIdempotently(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+	api := NewAPI(d.paths)
+	key := "00112233445566778899aabbccddeeff"
+	payload, _ := json.Marshal(createWorkspaceRequest{Name: "  shell-work  ", CreationKey: key})
+	raw, err := dispatchRemoteControl(context.Background(), api, "create_workspace", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created Workspace
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Name != "shell-work" || created.RemoteHost != "" || created.Origin.ID != d.state.Node.ID {
+		t.Fatalf("created = %#v", created)
+	}
+	if len(created.Shell) == 0 || created.Shell[0] != "fish" {
+		t.Fatalf("origin shell default was not applied: %#v", created.Shell)
+	}
+	// A replay of the identical payload — what the remote-call retry loop
+	// sends after a dropped response — returns the same workspace.
+	raw, err = dispatchRemoteControl(context.Background(), api, "create_workspace", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replayed Workspace
+	if err := json.Unmarshal(raw, &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.ID != created.ID {
+		t.Fatalf("replay created a second workspace: %s != %s", replayed.ID, created.ID)
+	}
+	d.mu.Lock()
+	count := len(d.state.Workspaces)
+	d.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("workspace count after replay = %d", count)
+	}
+	// A different invocation reusing the name is a genuine collision.
+	payload, _ = json.Marshal(createWorkspaceRequest{Name: "shell-work", CreationKey: "ffeeddccbbaa99887766554433221100"})
+	if _, err := dispatchRemoteControl(context.Background(), api, "create_workspace", payload); err == nil ||
+		!strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("collision error = %v", err)
+	}
+	// A genesis topology travels the wire and is attachable on arrival.
+	plan, err := TemplateGenesis(mustParseTemplate(t, "new_tab work\nlayout splits\nlaunch\nlaunch\n"), "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(createWorkspaceRequest{
+		Name: "genesis", Panes: plan.Panes, Topology: plan.Topology, CreationKey: "aabbccddeeff00112233445566778899",
+	})
+	raw, err = dispatchRemoteControl(context.Background(), api, "create_workspace", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var genesis Workspace
+	if err := json.Unmarshal(raw, &genesis); err != nil {
+		t.Fatal(err)
+	}
+	if genesis.Topology.Generation != 1 || strings.TrimSpace(genesis.Manifest.Session) == "" {
+		t.Fatalf("genesis over the wire = generation %d, session %q", genesis.Topology.Generation, genesis.Manifest.Session)
+	}
+}
+
+func TestRemoteCreateResponseIsCachedOnDestination(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &Workspace{
+		ID: remoteWorkspaceIDForTest, Name: "born-remote",
+		Origin: Host{ID: "devbox.example", Name: "devbox.example"}, Revision: 1,
+		Panes: map[string]*Pane{}, Attachments: map[string]*Attachment{},
+	}
+	raw, _ := json.Marshal(remote)
+	// Without this cacheResult case the follow-up attach cannot resolve the
+	// workspace it just created.
+	if err := d.remotes.cacheResult("devbox.example", "create_workspace", raw); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.getWorkspace(remoteWorkspaceIDForTest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RemoteHost != "devbox.example" {
+		t.Fatalf("cached workspace = %#v", got)
+	}
+	d.mu.Lock()
+	_, cached := d.state.Remotes["devbox.example"].Workspaces[remoteWorkspaceIDForTest]
+	d.mu.Unlock()
+	if !cached {
+		t.Fatal("create response missing from the remote cache")
+	}
+}
+
 func TestRemoteCachePreservesLocalRuntimeMapping(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {
