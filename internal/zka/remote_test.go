@@ -209,6 +209,42 @@ func TestRemoteCachePreservesLocalRuntimeMapping(t *testing.T) {
 	}
 }
 
+func TestRemoteCacheKeepsDetachedAttachmentDetached(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &Workspace{
+		ID: remoteWorkspaceIDForTest, Name: "example-project", Origin: Host{ID: "devbox.example", Name: "devbox.example"}, Revision: 4,
+		Topology:    DesiredTopology{Generation: 1, Digest: "aaaa"},
+		Panes:       map[string]*Pane{"pane": {ID: "pane", Phase: PaneAdmitted}},
+		Attachments: map[string]*Attachment{},
+	}
+	if _, err := d.cacheRemoteWorkspace("devbox.example", remote); err != nil {
+		t.Fatal(err)
+	}
+	// The local view is gone and its detach RPC never reached the origin, so
+	// the authoritative copy still shows the attachment as ready.
+	d.mu.Lock()
+	d.state.Workspaces[remote.ID].Attachments["local"] = &Attachment{
+		ID: "local", Endpoint: "unix:/kitty", Node: d.state.Node, Status: AttachmentDetached,
+	}
+	d.mu.Unlock()
+	remote.Revision = 5
+	remote.Topology = DesiredTopology{Generation: 2, Digest: "bbbb"}
+	remote.Attachments["local"] = &Attachment{ID: "local", Endpoint: "ssh:laptop.example", Status: AttachmentReady, AppliedRevision: 5}
+	cached, err := d.cacheRemoteWorkspace("devbox.example", remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A topology bump must not resurrect the detached attachment to Preparing:
+	// there is no Kitty behind it, and pendingDetaches only re-sends the origin
+	// detach while the local status stays Detached.
+	if got := cached.Attachments["local"].Status; got != AttachmentDetached {
+		t.Fatalf("detached attachment resurrected to %q by a topology bump", got)
+	}
+}
+
 func TestRemoteSnapshotEvictsMissingWorkspaceAndClosesLocalView(t *testing.T) {
 	runner := quietRunner()
 	d, err := newTestDaemon(t, t.TempDir(), runner)

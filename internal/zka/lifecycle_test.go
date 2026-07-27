@@ -563,6 +563,91 @@ func TestConfirmedQuitDeletesButDetachPreserves(t *testing.T) {
 	})
 }
 
+// cachedRemoteWorkspaceWithLocalView seeds the destination-side shape a quit
+// event finds: a cached remote workspace whose local Kitty attachment is ready
+// and owns every pane view.
+func cachedRemoteWorkspaceWithLocalView(t *testing.T, d *Daemon) *Workspace {
+	t.Helper()
+	remote := &Workspace{
+		ID: remoteWorkspaceIDForTest, Name: "example-project", Origin: Host{ID: "devbox.example", Name: "devbox.example"}, Revision: 4,
+		Panes:       map[string]*Pane{"pane": {ID: "pane", Phase: PaneAdmitted}},
+		Attachments: map[string]*Attachment{},
+	}
+	if _, err := d.cacheRemoteWorkspace("devbox.example", remote); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	d.state.Workspaces[remote.ID].Attachments["local"] = &Attachment{
+		ID: "local", Endpoint: "unix:/kitty", Node: d.state.Node, Status: AttachmentReady, Views: readyView("pane", 9),
+	}
+	d.mu.Unlock()
+	return remote
+}
+
+func TestConfirmedQuitOnRemoteWorkspaceDetachesNotKills(t *testing.T) {
+	t.Setenv("ZKA_SSH_COMMAND", "/definitely/missing/zka-ssh")
+	d, journal, err := newTestDaemonWithLog(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := cachedRemoteWorkspaceWithLocalView(t, d)
+	serveTestDaemon(t, d)
+	d.events <- WatcherEvent{Version: 1, Endpoint: "unix:/kitty", Kind: "quit", Confirmed: true}
+	waitFor(t, func() bool {
+		got, getErr := d.getWorkspace(remote.ID)
+		return getErr == nil && got.Attachments["local"].Status == AttachmentDetached
+	})
+	got, err := d.getWorkspace(remote.ID)
+	if err != nil {
+		t.Fatalf("quit removed the remote workspace: %v", err)
+	}
+	if got.DeletionPending {
+		t.Fatal("quit on a remote workspace scheduled deletion")
+	}
+	d.mu.Lock()
+	_, cached := d.state.Remotes["devbox.example"].Workspaces[remote.ID]
+	d.mu.Unlock()
+	if !cached {
+		t.Fatal("quit evicted the cached remote workspace")
+	}
+	// The origin-side detach was attempted (and failed against the missing SSH
+	// binary), and no kill was ever issued.
+	waitFor(t, func() bool { return strings.Contains(journal.String(), "detach remote workspace") })
+	if strings.Contains(journal.String(), "delete remote workspace") {
+		t.Fatal("quit on a remote workspace attempted kill_workspace")
+	}
+	// A repeated quit finds the attachment detached and is a no-op.
+	d.events <- WatcherEvent{Version: 1, Endpoint: "unix:/kitty", Kind: "quit", Confirmed: true}
+	time.Sleep(100 * time.Millisecond)
+	if _, err := d.getWorkspace(remote.ID); err != nil {
+		t.Fatalf("repeated quit removed the workspace: %v", err)
+	}
+}
+
+func TestRemoteCloseBurstWithoutQuitDetachesNotKills(t *testing.T) {
+	t.Setenv("ZKA_SSH_COMMAND", "/definitely/missing/zka-ssh")
+	d, journal, err := newTestDaemonWithLog(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := cachedRemoteWorkspaceWithLocalView(t, d)
+	serveTestDaemon(t, d)
+	// A dying Kitty whose quit datagram was lost still emits close events for
+	// every pane; covering the workspace must detach, not kill.
+	d.events <- WatcherEvent{Version: 1, Endpoint: "unix:/kitty", Kind: "close", PaneID: "pane", Workspace: remote.ID}
+	waitFor(t, func() bool {
+		got, getErr := d.getWorkspace(remote.ID)
+		return getErr == nil && got.Attachments["local"].Status == AttachmentDetached
+	})
+	if got, err := d.getWorkspace(remote.ID); err != nil || got.DeletionPending {
+		t.Fatalf("close burst destroyed the remote workspace: %#v, %v", got, err)
+	}
+	waitFor(t, func() bool { return strings.Contains(journal.String(), "detach remote workspace") })
+	if strings.Contains(journal.String(), "delete remote workspace") {
+		t.Fatal("close burst on a remote workspace attempted kill_workspace")
+	}
+}
+
 func createTestWorkspaceNamed(t testing.TB, daemon *Daemon, name string) *Workspace {
 	t.Helper()
 	workspace, err := daemon.createWorkspace(createWorkspaceRequest{Name: name, Shell: []string{"fish"}, Panes: []PaneSpec{{CWD: "/work", Title: "pane"}}})

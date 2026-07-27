@@ -64,7 +64,7 @@ func (d *Daemon) topologyLoop(ctx context.Context) {
 				if event.Confirmed && !event.Aborted {
 					delete(pending, event.Endpoint)
 					delete(closing, event.Endpoint)
-					d.scheduleEndpointDeletion(event.Endpoint)
+					d.scheduleEndpointTeardown(event.Endpoint)
 				}
 				continue
 			}
@@ -91,7 +91,7 @@ func (d *Daemon) topologyLoop(ctx context.Context) {
 					if d.closeEventsCoverWorkspace(event.Endpoint, closing[event.Endpoint]) {
 						delete(pending, event.Endpoint)
 						delete(closing, event.Endpoint)
-						d.scheduleEndpointDeletion(event.Endpoint)
+						d.scheduleEndpointTeardown(event.Endpoint)
 						continue
 					}
 				}
@@ -393,21 +393,38 @@ func (d *Daemon) closeEventsCoverWorkspace(endpoint string, closed map[string]bo
 	return active != 0
 }
 
-func (d *Daemon) scheduleEndpointDeletion(endpoint string) {
+// scheduleEndpointTeardown ends this endpoint's claim on its workspace once
+// its Kitty view is gone for good: a confirmed quit, or close hints covering
+// every pane. A workspace this machine owns dies with its last view; an
+// attachment of a remote workspace only detaches, because the zmx sessions
+// live on the origin and other attachments may still be using them.
+func (d *Daemon) scheduleEndpointTeardown(endpoint string) {
 	workspace, attachment := d.endpointAttachment(endpoint)
 	if workspace == nil || attachment == nil || attachment.Status == AttachmentDetached || attachment.Revoked {
+		return
+	}
+	if workspace.RemoteHost != "" {
+		// Detach locally before anything else: the lossy quit datagram races
+		// the dying Kitty's close burst, and the next event from this endpoint
+		// must already find the attachment detached.
+		if _, err := d.detachAttachment(workspace.ID, attachment.ID); err != nil {
+			d.logger.Printf("detach attachment %s after Kitty close: %v", attachment.ID, err)
+			return
+		}
+		d.startWorker(func(ctx context.Context) {
+			callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			if _, err := d.remotes.Call(callCtx, workspace.RemoteHost, "detach_attachment", attachmentRefRequest{Workspace: workspace.ID, Attachment: attachment.ID}); err != nil {
+				// cacheRemoteWorkspace re-sends detach_attachment while the
+				// origin still reports this attachment as attached.
+				d.logger.Printf("detach remote workspace %s after Kitty close: %v", workspace.ID, err)
+			}
+		})
 		return
 	}
 	d.startWorker(func(ctx context.Context) {
 		callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
-		if workspace.RemoteHost != "" {
-			_, err := d.remotes.Call(callCtx, workspace.RemoteHost, "kill_workspace", killWorkspaceRequest{WorkspaceID: workspace.ID})
-			if err != nil {
-				d.logger.Printf("delete remote workspace %s after Kitty close: %v", workspace.ID, err)
-			}
-			return
-		}
 		if _, err := d.killWorkspace(callCtx, workspace.ID); err != nil {
 			d.logger.Printf("delete workspace %s after Kitty close: %v", workspace.ID, err)
 		}

@@ -1081,8 +1081,12 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 				if local.Revoked && !local.RevocationClosed && local.Status != AttachmentDetached {
 					revokedEndpoints = append(revokedEndpoints, local.Endpoint)
 				}
-				if topologyChanged || local.AppliedTopologyGeneration != clone.Topology.Generation ||
-					local.AppliedTopologyDigest != clone.Topology.Digest {
+				// A detached attachment has no Kitty view left to reconcile.
+				// Resurrecting it to Preparing here would also stop the
+				// pendingDetaches re-send below from ever converging the origin.
+				if local.Status != AttachmentDetached &&
+					(topologyChanged || local.AppliedTopologyGeneration != clone.Topology.Generation ||
+						local.AppliedTopologyDigest != clone.Topology.Digest) {
 					local.Status = AttachmentPreparing
 					local.ReconcileStatus = "pending"
 					local.ReconcileTargetGeneration = clone.Topology.Generation

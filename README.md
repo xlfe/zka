@@ -235,7 +235,8 @@ The difference between closing and detaching is intentional:
 | Close a split or tab | Remove that pane and kill its zmx session. |
 | Detach a workspace | Close only the local Kitty attachment; preserve all zmx sessions. |
 | Attach a workspace | Focus the existing view or recreate it around the same sessions. |
-| Confirm Kitty quit / close the final pane | Kill the workspace. |
+| Confirm Kitty quit / close the final pane (workspace owned by this machine) | Kill the workspace. |
+| Confirm Kitty quit / tear down the whole view (remote workspace attached here) | Detach only this attachment; the origin's zmx sessions and other attachments survive. Kill explicitly with `zka workspace kill`. |
 | Kitty crash or lost control socket | Preserve the sessions and mark the attachment unhealthy. |
 | Kill a workspace | Persist cleanup intent, terminate its zmx sessions, and retry partial cleanup durably. |
 | One backend dies | Restore a removable `zmx backend is dead` placeholder while other panes survive. |
