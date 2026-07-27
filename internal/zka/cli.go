@@ -613,13 +613,22 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	}
 	if attachmentUsable(existing) && attachmentTopologyCurrent(workspace, existing) {
 		if move && workspace.PrimaryAttachmentID != existing.ID {
+			var moved *Workspace
 			if host != "" {
-				workspace, err = commitRemoteMove(ctx, api, host, workspace, existing)
+				moved, err = commitRemoteMove(ctx, api, host, workspace, existing)
 			} else {
-				workspace, err = commitLocalMove(ctx, api, workspace, existing)
+				moved, err = commitLocalMove(ctx, api, workspace, existing)
 			}
 			if err != nil {
 				return 1, err
+			}
+			if err := validateWorkspaceTransition(workspace, moved); err != nil {
+				return 1, err
+			}
+			workspace = moved
+			existing = workspace.Attachments[existing.ID]
+			if existing == nil {
+				return 1, fmt.Errorf("moved workspace %s lost attachment %s", workspace.ID, attachmentID)
 			}
 		}
 		if err := focusAttachment(ctx, paths, workspace, existing, *paneRef); err != nil {
@@ -635,7 +644,7 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 				return 1, err
 			}
 		} else {
-			if err := closeAndDetachLocal(ctx, paths, api, workspace, existing); err != nil {
+			if err := closeAndDetachLocal(ctx, api, workspace.ID, existing); err != nil {
 				var closeErr *kittyCloseError
 				if !errors.As(err, &closeErr) {
 					return 1, err
@@ -656,13 +665,6 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 		transport = Transport{Kind: "ssh", Host: host}
 	}
 	attachment := Attachment{ID: attachmentID, Node: node, Transport: transport, Endpoint: attachmentEndpoint(paths, attachmentID)}
-	if host != "" {
-		remoteAttachment := attachment
-		remoteAttachment.Endpoint = "ssh:" + node.Name + ":" + attachment.ID
-		if err := api.RemoteCall(ctx, host, "register_attachment", attachmentRequest{Workspace: workspace.ID, Attachment: remoteAttachment}, new(Attachment)); err != nil {
-			return 1, err
-		}
-	}
 	session, err := RenderAttachmentSession(workspace, transport, attachmentID)
 	if err != nil {
 		return 1, err
@@ -671,37 +673,42 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	if err != nil {
 		return 1, err
 	}
+	if host != "" {
+		remoteAttachment := attachment
+		remoteAttachment.Endpoint = "ssh:" + node.Name + ":" + attachment.ID
+		if err := api.RemoteCall(ctx, host, "register_attachment", attachmentRequest{Workspace: workspace.ID, Attachment: remoteAttachment}, new(Attachment)); err != nil {
+			return 1, err
+		}
+	}
 	attached, err := launchManagedKitty(ctx, paths, cfg, api, launchAttachmentOptions{Workspace: workspace, Attachment: attachment, Session: session})
 	if err != nil {
 		if host != "" {
-			_ = api.RemoteCall(context.Background(), host, "detach_attachment", attachmentRefRequest{Workspace: workspace.ID, Attachment: attachmentID}, nil)
+			err = joinWorkspaceAttachRollback(err, rollbackRemoteAttachment(api, host, workspace.ID, attachmentID))
 		}
 		return 1, err
 	}
-	workspace = attached
-	localAttachment := workspace.Attachments[attachmentID]
-	if host != "" {
-		workspace, err = readyRemoteAttachment(ctx, api, host, workspace, localAttachment)
-		if err != nil {
-			_ = closeAndDetachLocal(context.Background(), paths, api, workspace, localAttachment)
-			_ = api.RemoteCall(context.Background(), host, "detach_attachment", attachmentRefRequest{Workspace: workspace.ID, Attachment: attachmentID}, nil)
-			return 1, err
-		}
-		if move {
-			workspace, err = commitRemoteMove(ctx, api, host, workspace, workspace.Attachments[attachmentID])
-			if err != nil {
-				_ = closeAndDetachLocal(context.Background(), paths, api, workspace, workspace.Attachments[attachmentID])
-				_ = api.RemoteCall(context.Background(), host, "detach_attachment", attachmentRefRequest{Workspace: workspace.ID, Attachment: attachmentID}, nil)
-				return 1, err
-			}
-		}
-	} else if move && workspace.PrimaryAttachmentID != attachmentID {
-		workspace, err = commitLocalMove(ctx, api, workspace, localAttachment)
-		if err != nil {
-			_ = closeAndDetachLocal(context.Background(), paths, api, workspace, localAttachment)
-			return 1, err
-		}
+	if err := validateWorkspaceTransition(workspace, attached); err != nil {
+		return 1, joinWorkspaceAttachRollback(err,
+			rollbackLaunchedAttachment(liveWorkspaceAttachOperations{api: api}, host, workspace.ID, &attachment))
 	}
+	localAttachment := attached.Attachments[attachmentID]
+	if localAttachment == nil {
+		err := fmt.Errorf("launched workspace %s lost attachment %s", attached.ID, attachmentID)
+		return 1, joinWorkspaceAttachRollback(err,
+			rollbackLaunchedAttachment(liveWorkspaceAttachOperations{api: api}, host, attached.ID, &attachment))
+	}
+	finalized, err := finalizeLaunchedWorkspaceAttach(
+		ctx,
+		liveWorkspaceAttachOperations{api: api},
+		host,
+		move,
+		attached,
+		localAttachment,
+	)
+	if err != nil {
+		return 1, err
+	}
+	workspace = finalized
 	if err := focusAttachment(ctx, paths, workspace, workspace.Attachments[attachmentID], *paneRef); err != nil {
 		return 1, err
 	}
@@ -774,6 +781,186 @@ func localAttachmentCanFocus(attachment *Attachment, nodeID, paneID string) bool
 	return ok && view.Ready
 }
 
+const workspaceAttachRollbackTimeout = 15 * time.Second
+
+type workspaceAttachOperations interface {
+	readyRemote(context.Context, string, *Workspace, *Attachment) (*Workspace, error)
+	commitRemote(context.Context, string, *Workspace, *Attachment) (*Workspace, error)
+	commitLocal(context.Context, *Workspace, *Attachment) (*Workspace, error)
+	rollback(context.Context, string, string, *Attachment) error
+}
+
+type liveWorkspaceAttachOperations struct {
+	api API
+}
+
+func (o liveWorkspaceAttachOperations) readyRemote(ctx context.Context, host string, workspace *Workspace, attachment *Attachment) (*Workspace, error) {
+	return readyRemoteAttachment(ctx, o.api, host, workspace, attachment)
+}
+
+func (o liveWorkspaceAttachOperations) commitRemote(ctx context.Context, host string, workspace *Workspace, attachment *Attachment) (*Workspace, error) {
+	return commitRemoteMove(ctx, o.api, host, workspace, attachment)
+}
+
+func (o liveWorkspaceAttachOperations) commitLocal(ctx context.Context, workspace *Workspace, attachment *Attachment) (*Workspace, error) {
+	return commitLocalMove(ctx, o.api, workspace, attachment)
+}
+
+func (o liveWorkspaceAttachOperations) rollback(ctx context.Context, host, workspaceID string, attachment *Attachment) error {
+	if workspaceID == "" {
+		return fmt.Errorf("rollback workspace id is empty")
+	}
+	if attachment == nil {
+		return fmt.Errorf("rollback attachment does not exist")
+	}
+	steps := []workspaceAttachRollbackStep{
+		{
+			name: "detach local attachment state",
+			run: func(ctx context.Context) error {
+				_, err := o.api.DetachAttachment(ctx, workspaceID, attachment.ID)
+				return err
+			},
+		},
+		{
+			name: "close local Kitty view",
+			run: func(ctx context.Context) error {
+				return closeLocalWorkspaceView(ctx, workspaceID, attachment)
+			},
+		},
+	}
+	if host != "" {
+		steps = append(steps, workspaceAttachRollbackStep{
+			name: "detach origin attachment state",
+			run: func(ctx context.Context) error {
+				return o.api.RemoteCall(ctx, host, "detach_attachment", attachmentRefRequest{
+					Workspace: workspaceID, Attachment: attachment.ID,
+				}, nil)
+			},
+		})
+	}
+	return runWorkspaceAttachRollbackSteps(ctx, steps...)
+}
+
+type workspaceAttachRollbackStep struct {
+	name string
+	run  func(context.Context) error
+}
+
+func runWorkspaceAttachRollbackSteps(ctx context.Context, steps ...workspaceAttachRollbackStep) error {
+	var failures []error
+	for _, step := range steps {
+		if err := step.run(ctx); err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", step.name, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func validateWorkspaceTransition(current, next *Workspace) error {
+	if current == nil {
+		return fmt.Errorf("workspace transition started without a workspace")
+	}
+	if current.ID == "" {
+		return fmt.Errorf("workspace transition started without a workspace id")
+	}
+	if next == nil {
+		return fmt.Errorf("workspace transition for %s returned a nil workspace", current.ID)
+	}
+	if next.ID != current.ID {
+		return fmt.Errorf("workspace transition for %s returned workspace %s", current.ID, next.ID)
+	}
+	return nil
+}
+
+func finalizeLaunchedWorkspaceAttach(
+	ctx context.Context,
+	operations workspaceAttachOperations,
+	host string,
+	move bool,
+	workspace *Workspace,
+	attachment *Attachment,
+) (*Workspace, error) {
+	if workspace == nil {
+		return nil, fmt.Errorf("launched workspace does not exist")
+	}
+	if attachment == nil {
+		return nil, joinWorkspaceAttachRollback(
+			fmt.Errorf("launched workspace %s lost its local attachment", workspace.ID),
+			rollbackLaunchedAttachment(operations, host, workspace.ID, attachment),
+		)
+	}
+	workspaceID := workspace.ID
+	attachmentID := attachment.ID
+	fail := func(cause error) (*Workspace, error) {
+		return nil, joinWorkspaceAttachRollback(
+			cause,
+			rollbackLaunchedAttachment(operations, host, workspaceID, attachment),
+		)
+	}
+
+	if host != "" {
+		ready, err := operations.readyRemote(ctx, host, workspace, attachment)
+		if err != nil {
+			return fail(err)
+		}
+		if err := validateWorkspaceTransition(workspace, ready); err != nil {
+			return fail(err)
+		}
+		workspace = ready
+		if move {
+			destination := workspace.Attachments[attachmentID]
+			if destination == nil {
+				return fail(fmt.Errorf("workspace %s lost destination attachment %s before move", workspaceID, attachmentID))
+			}
+			moved, err := operations.commitRemote(ctx, host, workspace, destination)
+			if err != nil {
+				return fail(err)
+			}
+			if err := validateWorkspaceTransition(workspace, moved); err != nil {
+				return fail(err)
+			}
+			workspace = moved
+		}
+	} else if move && workspace.PrimaryAttachmentID != attachmentID {
+		moved, err := operations.commitLocal(ctx, workspace, attachment)
+		if err != nil {
+			return fail(err)
+		}
+		if err := validateWorkspaceTransition(workspace, moved); err != nil {
+			return fail(err)
+		}
+		workspace = moved
+	}
+	return workspace, nil
+}
+
+func rollbackLaunchedAttachment(operations workspaceAttachOperations, host, workspaceID string, attachment *Attachment) error {
+	ctx, cancel := context.WithTimeout(context.Background(), workspaceAttachRollbackTimeout)
+	defer cancel()
+	return operations.rollback(ctx, host, workspaceID, attachment)
+}
+
+func rollbackRemoteAttachment(api API, host, workspaceID, attachmentID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), workspaceAttachRollbackTimeout)
+	defer cancel()
+	if err := api.RemoteCall(ctx, host, "detach_attachment", attachmentRefRequest{
+		Workspace: workspaceID, Attachment: attachmentID,
+	}, nil); err != nil {
+		return fmt.Errorf("detach origin attachment state: %w", err)
+	}
+	return nil
+}
+
+func joinWorkspaceAttachRollback(cause, rollbackErr error) error {
+	if rollbackErr == nil {
+		return cause
+	}
+	if cause == nil {
+		return fmt.Errorf("workspace attach rollback failed: %w", rollbackErr)
+	}
+	return errors.Join(cause, fmt.Errorf("workspace attach rollback failed: %w", rollbackErr))
+}
+
 func readyRemoteAttachment(ctx context.Context, api API, host string, workspace *Workspace, attachment *Attachment) (*Workspace, error) {
 	if attachment == nil {
 		return nil, fmt.Errorf("local attachment disappeared before remote readiness")
@@ -797,12 +984,18 @@ func commitRemoteMove(ctx context.Context, api API, host string, workspace *Work
 		return nil, fmt.Errorf("destination attachment does not exist")
 	}
 	if attachment.AppliedRevision != workspace.Revision {
-		var err error
-		workspace, err = readyRemoteAttachment(ctx, api, host, workspace, attachment)
+		ready, err := readyRemoteAttachment(ctx, api, host, workspace, attachment)
 		if err != nil {
 			return nil, err
 		}
+		if err := validateWorkspaceTransition(workspace, ready); err != nil {
+			return nil, err
+		}
+		workspace = ready
 		attachment = workspace.Attachments[attachment.ID]
+		if attachment == nil {
+			return nil, fmt.Errorf("workspace %s lost destination attachment before move", workspace.ID)
+		}
 	}
 	var result moveCommitResponse
 	if err := api.RemoteCall(ctx, host, "commit_move", moveCommitRequest{
@@ -865,7 +1058,7 @@ func runWorkspaceDetach(args []string, paths Paths, stdout, stderr io.Writer) (i
 				continue
 			}
 		}
-		if err := closeAndDetachLocal(ctx, paths, api, workspace, attachment); err != nil && firstErr == nil {
+		if err := closeAndDetachLocal(ctx, api, workspace.ID, attachment); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -939,28 +1132,40 @@ func runWorkspaceKill(args []string, paths Paths, stdout, stderr io.Writer) (int
 	return 0, nil
 }
 
-func closeAndDetachLocal(ctx context.Context, paths Paths, api API, workspace *Workspace, attachment *Attachment) error {
+func closeAndDetachLocal(ctx context.Context, api API, workspaceID string, attachment *Attachment) error {
+	if workspaceID == "" {
+		return fmt.Errorf("workspace id is required")
+	}
 	if attachment == nil {
 		return fmt.Errorf("local attachment does not exist")
 	}
-	if _, err := api.DetachAttachment(ctx, workspace.ID, attachment.ID); err != nil {
+	if _, err := api.DetachAttachment(ctx, workspaceID, attachment.ID); err != nil {
 		return err
 	}
-	var closeErr error
-	if attachment != nil && strings.HasPrefix(attachment.Endpoint, "unix:") {
-		cfg, err := LoadConfig()
-		if err != nil {
-			return err
-		}
-		kitty := KittyClient{Runner: ExecRunner{}, Command: cfg.Kitty.KittenCommand}
-		callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		closeErr = kitty.CloseWorkspace(callCtx, attachment.Endpoint, workspace.ID)
-		cancel()
-	}
-	if closeErr != nil {
-		return &kittyCloseError{err: closeErr}
+	if err := closeLocalWorkspaceView(ctx, workspaceID, attachment); err != nil {
+		return &kittyCloseError{err: err}
 	}
 	return nil
+}
+
+func closeLocalWorkspaceView(ctx context.Context, workspaceID string, attachment *Attachment) error {
+	if workspaceID == "" {
+		return fmt.Errorf("workspace id is required")
+	}
+	if attachment == nil {
+		return fmt.Errorf("local attachment does not exist")
+	}
+	if !strings.HasPrefix(attachment.Endpoint, "unix:") {
+		return nil
+	}
+	cfg, err := LoadConfig()
+	if err != nil {
+		return err
+	}
+	kitty := KittyClient{Runner: ExecRunner{}, Command: cfg.Kitty.KittenCommand}
+	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	return kitty.CloseWorkspace(callCtx, attachment.Endpoint, workspaceID)
 }
 
 type kittyCloseError struct{ err error }
