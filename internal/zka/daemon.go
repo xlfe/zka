@@ -1090,6 +1090,14 @@ func (d *Daemon) registerAttachment(workspaceRef string, attachment Attachment) 
 		return nil, err
 	}
 	now := time.Now().UTC()
+	// Panes that have never started a backend re-arm their startup grace at
+	// every registration: a dormant workspace's panes may be arbitrarily old,
+	// and the reaper's grace clock is the pane's last mutation.
+	for _, pane := range workspace.Panes {
+		if !pane.BackendCreated && !pane.BackendDead {
+			pane.UpdatedAt = now
+		}
+	}
 	if existing := workspace.Attachments[attachment.ID]; existing != nil {
 		existing.Endpoint = attachment.Endpoint
 		existing.PID = attachment.PID

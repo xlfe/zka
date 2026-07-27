@@ -19,6 +19,26 @@ func requireWorkspaceMutable(workspace *Workspace) error {
 	return nil
 }
 
+// workspaceCold reports that no pane has ever started (or lost) a zmx backend
+// and none is retiring or proposed. For such a workspace the absence of zmx
+// sessions carries no information: nothing was ever supposed to exist yet. A
+// proposed pane disqualifies coldness because only a live endpoint allocates
+// one, and its admission lifecycle must keep running.
+func workspaceCold(workspace *Workspace) bool {
+	for _, pane := range workspace.Panes {
+		if pane.BackendCreated || pane.BackendStart || pane.BackendDead || pane.Retiring() || pane.Proposed() {
+			return false
+		}
+	}
+	return true
+}
+
+// workspaceAttachable mirrors the attach gate: a view can be rebuilt from the
+// desired topology or replayed from a captured manifest.
+func workspaceAttachable(workspace *Workspace) bool {
+	return len(workspace.Topology.Roots) != 0 || strings.TrimSpace(workspace.Manifest.Session) != ""
+}
+
 func (d *Daemon) renameWorkspace(req renameWorkspaceRequest) (*Workspace, error) {
 	name := strings.TrimSpace(req.Name)
 	if err := validateName(name); err != nil {
@@ -541,6 +561,13 @@ func (d *Daemon) reconcileBackends(ctx context.Context, workspaceRef string) (ba
 	now := time.Now().UTC()
 	for _, workspace := range workspaces {
 		if workspace.DeletionPending {
+			continue
+		}
+		if workspaceCold(workspace) && workspaceAttachable(workspace) {
+			// A never-started workspace that can still be attached is waiting
+			// for its first view, possibly from another machine. It is exempt
+			// from dead-marking and reclamation until a backend starts; a
+			// created-but-never-attachable leftover still ages out below.
 			continue
 		}
 		pending, live, established, removalPending := false, false, false, false

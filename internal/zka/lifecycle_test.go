@@ -220,6 +220,142 @@ func TestBackendReconcileDeletesExpiredUnstartedWorkspace(t *testing.T) {
 	}
 }
 
+// seedAttachableManifest gives a workspace the minimal state that makes it
+// attachable without a live capture, the shape a headless genesis produces.
+func seedAttachableManifest(t *testing.T, d *Daemon, workspaceID string) {
+	t.Helper()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.state.Workspaces[workspaceID].Manifest.Session = "launch\n"
+	if err := d.store.Save(d.state); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func backdatePanes(t *testing.T, d *Daemon, workspaceID string, moment time.Time) {
+	t.Helper()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, pane := range d.state.Workspaces[workspaceID].Panes {
+		pane.CreatedAt = moment
+		pane.UpdatedAt = moment
+	}
+	if err := d.store.Save(d.state); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBackendReconcileKeepsColdAttachableWorkspace(t *testing.T) {
+	runner := newLifecycleRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 2)
+	seedAttachableManifest(t, d, workspace.ID)
+	backdatePanes(t, d, workspace.ID, time.Now().UTC().Add(-2*backendStartupGrace))
+	result, err := d.reconcileBackends(context.Background(), workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Marked) != 0 || len(result.Deleted) != 0 {
+		t.Fatalf("cold attachable workspace was reconciled: %#v", result)
+	}
+	if _, err := d.getWorkspace(workspace.ID); err != nil {
+		t.Fatalf("cold attachable workspace was deleted: %v", err)
+	}
+}
+
+func TestBackendReconcileKeepsColdAttachableWorkspaceAcrossRestart(t *testing.T) {
+	paths := testPaths(t.TempDir())
+	runner := newLifecycleRunner()
+	first, err := newTestDaemonAtPaths(t, paths, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, first, 1)
+	seedAttachableManifest(t, first, workspace.ID)
+	backdatePanes(t, first, workspace.ID, time.Now().UTC().Add(-2*backendStartupGrace))
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := newTestDaemonAtPaths(t, paths, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := restarted.reconcileBackends(context.Background(), workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Marked) != 0 || len(result.Deleted) != 0 {
+		t.Fatalf("restart reaped a cold attachable workspace: %#v", result)
+	}
+}
+
+func TestBackendReconcileKeepsColdWorkspaceAfterFailedAttach(t *testing.T) {
+	runner := newLifecycleRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	seedAttachableManifest(t, d, workspace.ID)
+	// An attach registered its attachment, then Kitty failed before any pane
+	// prepared a backend. Coldness, not the attachment map, must decide.
+	if _, err := d.registerAttachment(workspace.ID, Attachment{
+		ID: "failed", Node: d.state.Node, Transport: Transport{Kind: "local"}, Endpoint: "unix:/failed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	backdatePanes(t, d, workspace.ID, time.Now().UTC().Add(-2*backendStartupGrace))
+	result, err := d.reconcileBackends(context.Background(), workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Marked) != 0 || len(result.Deleted) != 0 {
+		t.Fatalf("failed attach exposed the workspace to the reaper: %#v", result)
+	}
+	if _, err := d.getWorkspace(workspace.ID); err != nil {
+		t.Fatalf("workspace was deleted after a failed attach: %v", err)
+	}
+}
+
+func TestRegisterAttachmentRearmsBackendStartupGrace(t *testing.T) {
+	runner := newLifecycleRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 2)
+	panes := workspace.SortedPanes()
+	if _, err := d.applyEvent(context.Background(), Event{
+		WorkspaceID: workspace.ID, PaneID: panes[0].ID, Kind: "process_started", Source: "test", PID: 42,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner.setSession(panes[0].Backend.Ref, true)
+	// Pane 1 never started and is long past its grace; the workspace is warm,
+	// so only the registration re-arm keeps the pane from being marked dead
+	// while an attach is still spawning its windows.
+	past := time.Now().UTC().Add(-2 * backendStartupGrace)
+	d.mu.Lock()
+	stored := d.state.Workspaces[workspace.ID].Panes[panes[1].ID]
+	stored.CreatedAt, stored.UpdatedAt = past, past
+	d.mu.Unlock()
+	if _, err := d.registerAttachment(workspace.ID, Attachment{
+		ID: "attach", Node: d.state.Node, Transport: Transport{Kind: "local"}, Endpoint: "unix:/attach",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := d.reconcileBackends(context.Background(), workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Marked) != 0 || len(result.Deleted) != 0 {
+		t.Fatalf("re-armed pane was reconciled anyway: %#v", result)
+	}
+}
+
 func readyWorkspaceAttachment(t *testing.T, d *Daemon, workspace *Workspace, id string) (*Workspace, *Attachment) {
 	t.Helper()
 	attachment, err := d.registerAttachment(workspace.ID, Attachment{
