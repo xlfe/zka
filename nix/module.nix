@@ -101,12 +101,21 @@ let
       "zmx"
     else
       "${cfg.zmx.package}/bin/zmx";
+  ntfyCommand =
+    if cfg.notifications.ntfyPackage == null then
+      cfg.notifications.ntfyCommand
+    else
+      "${cfg.notifications.ntfyPackage}/bin/${cfg.notifications.ntfyCommand}";
   runtimeConfig = json.generate "zka-config.json" {
+    headless = cfg.headless;
     attention.states = cfg.attention.states;
     shell.command = cfg.shell.command;
     kitty = {
-      command = "${cfg.kitty.package}/bin/kitty";
-      kitten_command = "${cfg.kitty.package}/bin/kitten";
+      # A headless origin never executes the view layer, and LoadConfig
+      # rejects empty command strings, so the bare names stand in and keep
+      # the Kitty closure off the machine entirely.
+      command = if cfg.headless then "kitty" else "${cfg.kitty.package}/bin/kitty";
+      kitten_command = if cfg.headless then "kitten" else "${cfg.kitty.package}/bin/kitten";
       watcher = toString cfg.kitty.watcher;
       extra_args = cfg.kitty.extraArgs;
     };
@@ -121,7 +130,7 @@ let
       desktop_enabled = cfg.notifications.desktopEnabled;
       ntfy_enabled = cfg.notifications.ntfyEnabled;
       ntfy_include_evidence = cfg.notifications.ntfyIncludeEvidence;
-      ntfy_command = cfg.notifications.ntfyCommand;
+      ntfy_command = ntfyCommand;
     };
     focus.sway_command =
       if cfg.sway.package == null then "swaymsg" else "${cfg.sway.package}/bin/swaymsg";
@@ -133,22 +142,35 @@ let
   servicePath = [
     cfg.package
     cfg.shell.package
-    cfg.kitty.package
     cfg.ssh.package
   ]
+  ++ lib.optional (!cfg.headless) cfg.kitty.package
   ++ lib.optional (cfg.zmx.package != null) cfg.zmx.package
   ++ lib.optional (cfg.sway.package != null) cfg.sway.package
+  ++ lib.optional (cfg.notifications.ntfyPackage != null) cfg.notifications.ntfyPackage
   ++ cfg.extraPackages;
 in
 {
   options.services.zka = {
     enable = lib.mkEnableOption "zka Kitty workspace orchestration";
 
+    headless = lib.mkEnableOption ''
+      headless origin mode: this machine never hosts a Kitty view and runs
+      only zkad, zmx, sshd, and the agents inside its panes. Kitty leaves the
+      service path and closure, desktop notifications default off, doctor
+      skips the view-layer checks, and workspaces created here are attached
+      from other machines over SSH
+    '';
+
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-      defaultText = lib.literalExpression "self.packages.\${pkgs.stdenv.hostPlatform.system}.default";
-      description = "The zka package to run.";
+      default =
+        if cfg.headless then
+          self.packages.${pkgs.stdenv.hostPlatform.system}.zka-headless
+        else
+          self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      defaultText = lib.literalExpression ''self.packages.''${pkgs.stdenv.hostPlatform.system}.''${if config.services.zka.headless then "zka-headless" else "default"}'';
+      description = "The zka package to run. Headless origins default to the launcher-free zka-headless variant.";
     };
 
     shell = {
@@ -269,7 +291,33 @@ in
     notifications.ntfyCommand = lib.mkOption {
       type = lib.types.str;
       default = "ntfy-send";
-      description = "ntfy helper executable name or absolute path.";
+      description = "ntfy helper executable name, resolved on zkad's PATH unless ntfyPackage pins it.";
+    };
+
+    notifications.ntfyPackage = lib.mkOption {
+      type = lib.types.nullOr lib.types.package;
+      default = null;
+      description = ''
+        Package providing the ntfy helper named by notifications.ntfyCommand.
+        When set, the command is written into the runtime configuration as an
+        absolute path inside this package and the package joins zkad's PATH.
+        On a headless origin ntfy is the only notification channel that can
+        reach you, so leave this null there only if extraPackages already
+        supplies the helper.
+      '';
+    };
+
+    linger.users = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "felix" ];
+      description = ''
+        Users whose systemd user instance lingers (users.users.<name>.linger)
+        so zkad and /run/user/UID survive SSH logout. Without lingering on a
+        headless origin, agent hooks silently no-op and notifications stop
+        the moment the last SSH session closes. Listed users must be defined
+        elsewhere in the configuration.
+      '';
     };
 
     codex = {
@@ -300,7 +348,19 @@ in
           assertion = !cfg.codex.enableManagedHooks || lib.all (path: !(lib.hasAttrByPath path cfg.codex.extraRequirements)) reservedRequirementPaths;
           message = "services.zka.codex.extraRequirements must not override zka-managed hook keys";
         }
+        {
+          assertion = cfg.notifications.ntfyPackage == null || !lib.hasPrefix "/" cfg.notifications.ntfyCommand;
+          message = "services.zka.notifications.ntfyCommand must be a bare name when ntfyPackage is set";
+        }
       ];
+
+      warnings =
+        lib.optional (cfg.headless && cfg.notifications.ntfyEnabled && cfg.notifications.ntfyPackage == null)
+          "services.zka: headless origin with ntfy enabled but no notifications.ntfyPackage; unless extraPackages supplies the helper, no notification channel will reach you"
+        ++ lib.optional (cfg.headless && cfg.linger.users == [ ])
+          "services.zka: headless origin without services.zka.linger.users; zkad stops with your last SSH session unless lingering is managed elsewhere";
+
+      users.users = lib.genAttrs cfg.linger.users (_: { linger = true; });
 
       environment.systemPackages = servicePath;
       environment.sessionVariables.ZKA_CONFIG = runtimeConfig;
@@ -320,6 +380,13 @@ in
         };
       };
     }
+
+    (lib.mkIf cfg.headless {
+      # The desktop channel needs a session bus and a local Kitty view;
+      # neither ever exists here. mkDefault keeps an explicit override
+      # possible.
+      services.zka.notifications.desktopEnabled = lib.mkDefault false;
+    })
 
     (lib.mkIf cfg.codex.enableManagedHooks {
       environment.etc."codex/requirements.toml".source = requirementsFile;

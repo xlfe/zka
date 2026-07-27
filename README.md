@@ -252,6 +252,8 @@ capture and origin-pushed reconciliation, with a 30-second liveness fallback.
 zka workspace list
 zka workspace inspect example-project
 zka workspace reconcile example-project
+zka workspace create api --template ./quad.kitty-session
+zka workspace create devbox.example:api --attach
 zka workspace attach example-project
 zka workspace move example-project
 zka workspace focus example-project --pane PANE_ID
@@ -264,6 +266,16 @@ zka workspace kill shell-work
 `attach` and `move` are idempotent: repeating either command reuses the
 deterministic machine/workspace attachment instead of creating duplicates.
 `kill` is immediate and non-interactive.
+
+`create` births a workspace without launching Kitty, locally or on a remote
+origin (`SSH_ALIAS:NAME`; `SSH_ALIAS:` lets the origin pick a name). The
+workspace comes out **dormant** — fully attachable, with no view anywhere and
+no processes started — and stays that way until something attaches; `list`
+shows the state as `dormant`. Pane directories default to the origin's home;
+an explicit `--cwd` must be absolute for a remote origin. With `--attach` the
+standard attach follows immediately and this machine becomes the primary.
+Creation is replay-safe over SSH: retrying after a dropped connection returns
+the workspace that was already born instead of creating a duplicate.
 
 Run `zka help`, `zka workspace help`, or a command with `--help` for the complete
 CLI surface.
@@ -298,12 +310,14 @@ origin and destination must run the same zka version, and `zkad` must be running
 on the origin.
 
 The graphical path is the same: choose **Remote workspace** in `zka launch`,
-enter the SSH alias, and select an origin workspace. From the destination, the
-CLI equivalents are:
+enter the SSH alias, and select an origin workspace — or pick **New workspace
+on \<host\>** to create one on the origin and attach it here in one step. From
+the destination, the CLI equivalents are:
 
 ```sh
 zka workspace list --origin devbox.example
 zka workspace inspect devbox.example:example-project
+zka workspace create devbox.example:api --attach
 zka workspace attach devbox.example:example-project
 zka workspace move devbox.example:example-project
 zka workspace rename devbox.example:example-project shell-work
@@ -522,6 +536,48 @@ ntfy payloads omit raw agent evidence by default and include only a state summar
 plus workspace metadata. Set `notifications.ntfyIncludeEvidence = true` to include
 assistant output or tool descriptions; those details may contain sensitive data.
 
+### Headless origin
+
+A machine can be an origin without ever hosting a view: a cloud server runs
+only `zkad`, zmx, sshd, and the agents inside its panes, while every Kitty
+that displays its workspaces lives on your GUI machines.
+
+```nix
+services.zka = {
+  enable = true;
+  headless = true;
+  linger.users = [ "felix" ];
+  zmx.package = zmx.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  notifications.ntfyPackage = inputs.ntfy-send.packages.${pkgs.system}.default;
+};
+```
+
+`headless = true` swaps in the launcher-free `zka-headless` package (no
+Gio/Wayland/Vulkan closure), drops Kitty from the machine entirely, defaults
+desktop notifications off, and makes `zka doctor` and `zka workspace
+reconcile` headless-aware. Everything that matters on an origin stays: zmx,
+OpenSSH, the agent hooks, and ntfy.
+
+Two settings are load-bearing on a server:
+
+- **`linger.users`** keeps the systemd user instance — and with it `zkad` and
+  `/run/user/UID` — alive after the last SSH session closes. Without it,
+  agent hooks silently no-op and notifications stop between logins.
+- **`notifications.ntfyPackage`** puts the ntfy helper on `zkad`'s PATH as an
+  absolute store path. With no session bus and no local Kitty view, ntfy is
+  the only channel that can reach you while nothing is attached; desktop
+  notifications for this origin's panes fire on whichever machine holds an
+  open mirror.
+
+The daily flow: from a GUI machine, `zka launch` → **Remote workspace** →
+**New workspace on \<host\>** (or `zka workspace create host:name --attach`).
+The workspace is born dormant on the origin, your local Kitty attaches as
+primary, and the panes' zmx sessions start on the origin. Close the laptop —
+agents keep running; confirming Kitty's quit dialog on a remote view only
+detaches it. Come back from anywhere with `zka workspace attach host:name` or
+`zka attention focus-next`. The origin and every machine that attaches to it
+must run the same zka version.
+
 ## Advanced SSH setup
 
 <details>
@@ -716,7 +772,9 @@ mixed-version compatible; upgrade and restart zka on both SSH peers together.
 
 `zka doctor` checks the enabled Codex and Claude Code executables and their
 managed hook files. An integration disabled in the NixOS module is reported as
-disabled instead of failed.
+disabled instead of failed. On a headless origin the view-layer checks
+(`kitty`, `kitten`, `swaymsg`, `kitty-watcher`) report `skipped on a headless
+origin`; zmx, ssh, ntfy-send, and the agent checks stay real.
 
 ## Boundaries
 

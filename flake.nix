@@ -73,6 +73,35 @@
               install -Dm0444 kitty/watcher.py "$out/share/zka/kitty-watcher.py"
             '';
           };
+
+          # The view layer never runs on a headless origin, so this variant
+          # drops cmd/zka-launch and with it the whole Gio/Wayland/Vulkan
+          # closure. The daemon and CLI are pure Go, so CGO is off entirely.
+          zka-headless = pkgs.buildGoModule {
+            pname = "zka-headless";
+            version = "0.7.0";
+            src = ./.;
+            vendorHash = "sha256-beIm25whY72wrzIyiHd8YzcsRQd+NDYx14aK+ODhjFg=";
+            subPackages = [ "cmd/zka" ];
+            env.CGO_ENABLED = 0;
+            ldflags = [ "-s" "-w" ];
+
+            # The full package's check already runs the whole suite; this one
+            # proves the CGO-free build passes its own packages (the launcher
+            # package would need the Gio C libraries this variant exists to
+            # avoid).
+            checkPhase = ''
+              runHook preCheck
+              go test ./cmd/zka ./internal/zka
+              runHook postCheck
+            '';
+
+            postInstall = ''
+              mkdir -p "$out/libexec/zka/hooks"
+              ln "$out/bin/zka" "$out/libexec/zka/hooks/zka"
+              install -Dm0444 kitty/watcher.py "$out/share/zka/kitty-watcher.py"
+            '';
+          };
           default = zka;
         }
       );
@@ -112,12 +141,35 @@
               }
             ];
           };
+          headless = nixpkgs.lib.nixosSystem {
+            modules = [
+              self.nixosModules.default
+              {
+                nixpkgs.hostPlatform = system;
+                system.stateVersion = "26.05";
+                users.users.agents = {
+                  isNormalUser = true;
+                  group = "users";
+                };
+                services.zka = {
+                  enable = true;
+                  headless = true;
+                  linger.users = [ "agents" ];
+                  # A stand-in for the operator's ntfy helper: what matters is
+                  # that an absolute store path reaches the runtime config and
+                  # the package lands on zkad's PATH.
+                  notifications.ntfyPackage = pkgs.writeShellScriptBin "ntfy-send" "";
+                };
+              }
+            ];
+          };
           service = evaluated.config.systemd.user.services.zkad;
           requirements = evaluated.config.environment.etc."codex/requirements.toml".source;
           claudeSettings = evaluated.config.environment.etc."claude-code/managed-settings.d/50-zka.json".source;
           disabledRuntimeConfig = disabledHooks.config.systemd.user.services.zkad.environment.ZKA_CONFIG;
           disabledCodexPresent = builtins.hasAttr "codex/requirements.toml" disabledHooks.config.environment.etc;
           disabledClaudePresent = builtins.hasAttr "claude-code/managed-settings.d/50-zka.json" disabledHooks.config.environment.etc;
+          headlessService = headless.config.systemd.user.services.zkad;
         in
         {
           package = self.packages.${system}.zka;
@@ -151,9 +203,36 @@
             grep -q 'StopFailure' "$claudeSettings"
             grep -q '"codex_managed_hooks": *false' "$disabledRuntimeConfig"
             grep -q '"claude_managed_hooks": *false' "$disabledRuntimeConfig"
+            grep -q '"headless": *false' "$runtimeConfig"
             test "$disabledCodexPresent" = ""
             test "$disabledClaudePresent" = ""
             test -x ${self.packages.${system}.zka}/bin/zka-launch
+            touch "$out"
+          '';
+          headless-module = pkgs.runCommand "zka-headless-module-check" {
+            headlessRuntimeConfig = headlessService.environment.ZKA_CONFIG;
+            headlessPath = toString headlessService.path;
+            headlessExecStart = headlessService.serviceConfig.ExecStart;
+            headlessLinger = toString headless.config.users.users.agents.linger;
+          } ''
+            grep -q '"headless": *true' "$headlessRuntimeConfig"
+            grep -q '"command": *"kitty"' "$headlessRuntimeConfig"
+            grep -q '"kitten_command": *"kitten"' "$headlessRuntimeConfig"
+            grep -q '"desktop_enabled": *false' "$headlessRuntimeConfig"
+            grep -qE '"ntfy_command": *"/nix/store/[^"]*/bin/ntfy-send"' "$headlessRuntimeConfig"
+            if echo "$headlessPath" | grep -q -- '-kitty-'; then
+              echo "headless servicePath still carries the Kitty closure" >&2
+              exit 1
+            fi
+            echo "$headlessExecStart" | grep -q 'zka-headless'
+            test "$headlessLinger" = "1"
+            touch "$out"
+          '';
+          headless-package = pkgs.runCommand "zka-headless-package-check" { } ''
+            test -x ${self.packages.${system}.zka-headless}/bin/zka
+            test ! -e ${self.packages.${system}.zka-headless}/bin/zka-launch
+            test -x ${self.packages.${system}.zka-headless}/libexec/zka/hooks/zka
+            test -f ${self.packages.${system}.zka-headless}/share/zka/kitty-watcher.py
             touch "$out"
           '';
         }

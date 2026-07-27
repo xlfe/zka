@@ -23,6 +23,16 @@ type DesktopNotifier interface {
 	Shutdown()
 }
 
+// noopDesktopNotifier serves a headless origin: there is no session bus to
+// dial, and pretending otherwise would only produce backoff noise. Notify
+// still errors so a hypothetical delivery attempt is recorded honestly.
+type noopDesktopNotifier struct{}
+
+func (noopDesktopNotifier) Notify(context.Context, DesktopNotification) error { return errNoSessionBus }
+func (noopDesktopNotifier) Withdraw(context.Context, string, string)          {}
+func (noopDesktopNotifier) Probe(context.Context) (string, error)             { return "", errNoSessionBus }
+func (noopDesktopNotifier) Shutdown()                                         {}
+
 // DesktopNotification is one pane's notification. It carries pane identity
 // rather than Kitty identity: the action fires arbitrarily later, so the
 // attachment and view must be re-resolved from live state, never captured.

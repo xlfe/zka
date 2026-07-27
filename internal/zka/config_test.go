@@ -123,3 +123,33 @@ func TestSSHAgentInfoExpandsUIDAndHintsOnlyForAuthentication(t *testing.T) {
 		t.Fatalf("agent selected through ssh options = %#v", optionAgent)
 	}
 }
+
+func TestHeadlessConfigDefaultsFileAndEnvOverride(t *testing.T) {
+	t.Setenv("ZKA_CONFIG", "")
+	t.Setenv("ZKA_HEADLESS", "")
+	cfg, err := LoadConfig()
+	if err != nil || cfg.Headless {
+		t.Fatalf("default headless = %v, %v", cfg.Headless, err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"headless":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", path)
+	cfg, err = LoadConfig()
+	if err != nil || !cfg.Headless {
+		t.Fatalf("file headless = %v, %v", cfg.Headless, err)
+	}
+	// The bare-name view-layer commands stay valid under headless.
+	if cfg.Kitty.Command != "kitty" || cfg.Focus.SwayCommand != "swaymsg" {
+		t.Fatalf("headless clobbered view-layer commands: %#v", cfg)
+	}
+	if err := os.WriteFile(path, []byte(`{"headless":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_HEADLESS", "1")
+	cfg, err = LoadConfig()
+	if err != nil || !cfg.Headless {
+		t.Fatalf("ZKA_HEADLESS override = %v, %v", cfg.Headless, err)
+	}
+}

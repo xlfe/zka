@@ -416,3 +416,29 @@ func TestWorkspaceRenameAndKillCLI(t *testing.T) {
 		t.Fatal("killed workspace remained visible")
 	}
 }
+
+func TestWorkspaceReconcileHeadlessReconcilesBackends(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+	workspace := createTestWorkspace(t, d, 1)
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"headless":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", path)
+	var stdout, stderr bytes.Buffer
+	code, err := runWorkspace([]string{"reconcile", workspace.ID}, d.paths, &stdout, &stderr)
+	if code != 0 || err != nil {
+		t.Fatalf("headless reconcile: code=%d err=%v", code, err)
+	}
+	if !strings.Contains(stdout.String(), "backends reconciled (headless origin") {
+		t.Fatalf("headless reconcile output = %q", stdout.String())
+	}
+	// An explicit attachment id keeps the normal path and its honest error.
+	if code, err := runWorkspace([]string{"reconcile", workspace.ID, "--attachment", "missing"}, d.paths, &stdout, &stderr); code != 1 || err == nil {
+		t.Fatalf("explicit attachment: code=%d err=%v", code, err)
+	}
+}

@@ -77,3 +77,26 @@ func TestManagedHookDoctorCheck(t *testing.T) {
 		t.Fatalf("disabled check = %#v", check)
 	}
 }
+
+func TestDoctorHeadlessSkipsViewLayerChecks(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"headless":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", path)
+	var stdout, stderr bytes.Buffer
+	if _, err := runDoctor(nil, d.paths, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	out := stdout.String()
+	// kitty, kitten, swaymsg, and kitty-watcher are skipped by configuration;
+	// zmx/ssh/ntfy-send and the agent checks must still be real lookups.
+	if got := bytes.Count(stdout.Bytes(), []byte("skipped on a headless origin")); got != 4 {
+		t.Fatalf("skip count = %d in:\n%s", got, out)
+	}
+}

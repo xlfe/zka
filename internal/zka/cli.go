@@ -449,6 +449,19 @@ func runWorkspaceReconcile(args []string, paths Paths, stdout, stderr io.Writer)
 	if err != nil {
 		return 1, err
 	}
+	cfg, err := LoadConfig()
+	if err != nil {
+		return 1, err
+	}
+	if cfg.Headless && *attachmentID == "" && workspace.RemoteHost == "" {
+		// No Kitty can ever run here, so there is no view to recapture — but
+		// the backend census is still meaningful.
+		if _, err := api.ReconcileBackends(ctx, workspace.ID); err != nil {
+			return 1, err
+		}
+		fmt.Fprintf(stdout, "%s\tbackends reconciled (headless origin: no local Kitty attachments)\n", workspace.ID)
+		return 0, nil
+	}
 	workspace, err = api.ReconcileTopology(ctx, workspace.ID, *attachmentID)
 	if err != nil {
 		return 1, err

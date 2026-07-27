@@ -12,6 +12,12 @@ import (
 )
 
 type Config struct {
+	// Headless marks a machine that never hosts a Kitty view: an origin that
+	// runs only zkad, zmx, sshd, and the agents inside its panes. The
+	// view-layer commands below stay configured as bare names — the daemon
+	// never executes them, since every daemon→Kitty call is gated on a
+	// local-node attachment — and doctor skips probing them.
+	Headless  bool `json:"headless"`
 	Attention struct {
 		States []AgentState `json:"states"`
 	} `json:"attention"`
@@ -238,6 +244,11 @@ func applyConfigEnvironment(cfg *Config) {
 	}
 	if value := os.Getenv("ZKA_SWAY_COMMAND"); value != "" {
 		cfg.Focus.SwayCommand = value
+	}
+	if value := os.Getenv("ZKA_HEADLESS"); value != "" {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			cfg.Headless = parsed
+		}
 	}
 }
 

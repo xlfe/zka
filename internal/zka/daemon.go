@@ -164,7 +164,13 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 	// Constructor injection rather than a setter: d exists by this point, so
 	// there is no window in which the notifier can receive a button press
 	// without a handler to route it to.
-	d.desktop = newDBusNotifier(logger, d.handleDesktopAction)
+	if cfg.Headless {
+		// No session bus will ever exist here; a no-op notifier keeps the
+		// D-Bus dial-and-backoff loop out of the journal entirely.
+		d.desktop = noopDesktopNotifier{}
+	} else {
+		d.desktop = newDBusNotifier(logger, d.handleDesktopAction)
+	}
 	d.remotes = NewRemoteManager(d)
 	d.agentRelays = newAgentRelayManager(paths.AgentDir, d.sshAgent.EffectiveSocket)
 	return d, nil

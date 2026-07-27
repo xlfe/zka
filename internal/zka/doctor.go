@@ -59,15 +59,29 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 	if cfg.Integrations.ClaudeManagedHooks {
 		commands = append(commands, struct{ name, command string }{"claude", "claude"})
 	}
+	// The view layer is skipped by configuration, not probing: a probe cannot
+	// distinguish "no kitty because headless" from "no kitty because broken".
+	// zmx, ssh, ntfy-send, and the agents stay checked — a headless origin is
+	// exactly where they matter most, and ntfy is its only user-reaching
+	// channel.
+	headlessSkipped := map[string]bool{"kitty": true, "kitten": true, "swaymsg": true}
 	for _, item := range commands {
+		if cfg.Headless && headlessSkipped[item.name] {
+			checks = append(checks, doctorCheck{Name: item.name, OK: true, Detail: "skipped on a headless origin"})
+			continue
+		}
 		path, lookupErr := exec.LookPath(item.command)
 		checks = append(checks, doctorCheck{Name: item.name, OK: lookupErr == nil, Detail: doctorDetail(lookupErr, path)})
 	}
-	watcherExists, watcherErr := configExists(cfg.Kitty.Watcher)
-	if watcherErr == nil && !watcherExists {
-		watcherErr = fmt.Errorf("not found")
+	if cfg.Headless {
+		checks = append(checks, doctorCheck{Name: "kitty-watcher", OK: true, Detail: "skipped on a headless origin"})
+	} else {
+		watcherExists, watcherErr := configExists(cfg.Kitty.Watcher)
+		if watcherErr == nil && !watcherExists {
+			watcherErr = fmt.Errorf("not found")
+		}
+		checks = append(checks, doctorCheck{Name: "kitty-watcher", OK: watcherErr == nil, Detail: doctorDetail(watcherErr, cfg.Kitty.Watcher)})
 	}
-	checks = append(checks, doctorCheck{Name: "kitty-watcher", OK: watcherErr == nil, Detail: doctorDetail(watcherErr, cfg.Kitty.Watcher)})
 	checks = append(checks,
 		managedHookDoctorCheck("codex-hooks", "/etc/codex/requirements.toml", "hook codex", cfg.Integrations.CodexManagedHooks),
 		managedHookDoctorCheck("claude-hooks", "/etc/claude-code/managed-settings.d/50-zka.json", "hook claude", cfg.Integrations.ClaudeManagedHooks),
