@@ -1157,16 +1157,9 @@ func runWorkspaceDetach(args []string, paths Paths, stdout, stderr io.Writer) (i
 		return 0, nil
 	}
 	var firstErr error
+	operations := liveWorkspaceDetachOperations{api: api}
 	for _, attachment := range attachments {
-		if workspace.RemoteHost != "" {
-			if err := api.RemoteCall(ctx, workspace.RemoteHost, "detach_attachment", attachmentRefRequest{Workspace: workspace.ID, Attachment: attachment.ID}, nil); err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				continue
-			}
-		}
-		if err := closeAndDetachLocal(ctx, api, workspace.ID, attachment); err != nil && firstErr == nil {
+		if err := detachWorkspaceAttachment(ctx, operations, workspace.RemoteHost, workspace.ID, attachment); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -1175,6 +1168,45 @@ func runWorkspaceDetach(args []string, paths Paths, stdout, stderr io.Writer) (i
 	}
 	fmt.Fprintln(stdout, workspace.Name)
 	return 0, nil
+}
+
+type workspaceDetachOperations interface {
+	detachLocal(context.Context, string, *Attachment) error
+	detachRemote(context.Context, string, string, *Attachment) error
+}
+
+type liveWorkspaceDetachOperations struct {
+	api API
+}
+
+func (o liveWorkspaceDetachOperations) detachLocal(ctx context.Context, workspaceID string, attachment *Attachment) error {
+	return closeAndDetachLocal(ctx, o.api, workspaceID, attachment)
+}
+
+func (o liveWorkspaceDetachOperations) detachRemote(ctx context.Context, host, workspaceID string, attachment *Attachment) error {
+	if host == "" {
+		return nil
+	}
+	return o.api.RemoteCall(ctx, host, "detach_attachment", attachmentRefRequest{
+		Workspace: workspaceID, Attachment: attachment.ID,
+	}, nil)
+}
+
+func detachWorkspaceAttachment(
+	ctx context.Context,
+	operations workspaceDetachOperations,
+	host, workspaceID string,
+	attachment *Attachment,
+) error {
+	localErr := operations.detachLocal(ctx, workspaceID, attachment)
+	if localErr != nil {
+		var closeErr *kittyCloseError
+		if !errors.As(localErr, &closeErr) {
+			return localErr
+		}
+	}
+	remoteErr := operations.detachRemote(ctx, host, workspaceID, attachment)
+	return errors.Join(localErr, remoteErr)
 }
 
 func runWorkspaceRename(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
