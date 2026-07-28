@@ -3,6 +3,8 @@ package zka
 import (
 	"context"
 	"errors"
+	"net"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -21,12 +23,34 @@ func TestFocusSwayWindowUsesKittyProcessID(t *testing.T) {
 
 func TestFocusSwayWindowSkipsNonSwaySession(t *testing.T) {
 	t.Setenv("SWAYSOCK", "")
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	runner := &fakeRunner{}
 	if err := focusSwayWindow(context.Background(), runner, "swaymsg", 635439); err != nil {
 		t.Fatal(err)
 	}
 	if got := runner.Calls(); len(got) != 0 {
 		t.Fatalf("calls = %#v", got)
+	}
+}
+
+func TestFocusSwayWindowDiscoversSocketCreatedAfterDaemonStart(t *testing.T) {
+	t.Setenv("SWAYSOCK", "")
+	runtimeDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	socket := filepath.Join(runtimeDir, "sway-ipc.1000.42.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	runner := &fakeRunner{}
+	if err := focusSwayWindow(context.Background(), runner, "swaymsg", 635439); err != nil {
+		t.Fatal(err)
+	}
+	want := []runnerCall{{Name: "swaymsg", Args: []string{"[pid=635439] focus"}}}
+	if got := runner.Calls(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("calls = %#v, want %#v", got, want)
 	}
 }
 
