@@ -42,6 +42,7 @@ const (
 	resultRemote
 	resultLaunch
 	resultDetach
+	resultAgent
 )
 
 type asyncResult struct {
@@ -75,20 +76,21 @@ type ui struct {
 	operationKind   resultKind
 	results         chan asyncResult
 
-	screen       screen
-	local        []*zka.Workspace
-	remote       []*zka.Workspace
-	remoteHosts  []string
-	remoteHost   string
-	localNodeID  string
-	selectOnLoad string
-	selected     int
-	localLoading bool
-	localError   string
-	busy         bool
-	status       string
-	errorMessage string
-	focusPending *widget.Editor
+	screen          screen
+	local           []*zka.Workspace
+	remote          []*zka.Workspace
+	remoteHosts     []string
+	remoteHost      string
+	localNodeID     string
+	selectOnLoad    string
+	selected        int
+	agentForwarding bool
+	localLoading    bool
+	localError      string
+	busy            bool
+	status          string
+	errorMessage    string
+	focusPending    *widget.Editor
 
 	newButton        widget.Clickable
 	remoteButton     widget.Clickable
@@ -99,6 +101,7 @@ type ui struct {
 	selectables      map[string]*widget.Selectable
 	localList        widget.List
 	remoteList       widget.List
+	remoteAgent      widget.Bool
 	nameEditor       widget.Editor
 	hostEditor       widget.Editor
 	remoteNameEditor widget.Editor
@@ -163,13 +166,18 @@ func newUI(backend Backend) *ui {
 		ContrastBg: colors.accent,
 		ContrastFg: colors.background,
 	}
+	agentForwarding := false
+	if cfg, err := zka.LoadConfig(); err == nil {
+		agentForwarding = cfg.SSH.ForwardAgent
+	}
 	application := &ui{
-		backend:     backend,
-		theme:       theme,
-		colors:      colors,
-		results:     make(chan asyncResult, 8),
-		rows:        map[string]*widget.Clickable{},
-		selectables: map[string]*widget.Selectable{},
+		backend:         backend,
+		theme:           theme,
+		colors:          colors,
+		agentForwarding: agentForwarding,
+		results:         make(chan asyncResult, 8),
+		rows:            map[string]*widget.Clickable{},
+		selectables:     map[string]*widget.Selectable{},
 	}
 	application.localList.Axis = layout.Vertical
 	application.remoteList.Axis = layout.Vertical
@@ -240,6 +248,7 @@ func (ui *ui) loadRemote(host string) {
 	token := ui.operationToken
 	ui.remoteHost = host
 	ui.remote = nil
+	ui.remoteAgent.Value = false
 	ui.screen = screenRemoteList
 	ui.selected = 0
 	ui.busy = true
@@ -260,6 +269,11 @@ func (ui *ui) launch(args []string, status string) {
 
 func (ui *ui) detachWorkspace(workspace *zka.Workspace) {
 	ui.execute(resultDetach, workspace.ID, detachArgs(workspace), "Detaching "+workspace.Name+"…")
+}
+
+func (ui *ui) toggleWorkspaceAgent(workspace *zka.Workspace) {
+	args, action := workspaceAgentAction(workspace, ui.localNodeID)
+	ui.execute(resultAgent, workspace.ID, args, action+" "+workspace.Name+"…")
 }
 
 func (ui *ui) execute(kind resultKind, workspace string, args []string, status string) {
@@ -352,7 +366,7 @@ func (ui *ui) drainResults() {
 					continue
 				}
 				ui.window.Perform(system.ActionClose)
-			case resultDetach:
+			case resultDetach, resultAgent:
 				if result.token != ui.operationToken {
 					continue
 				}
@@ -386,6 +400,9 @@ func (ui *ui) handleKeys(gtx layout.Context) {
 	if ui.screen == screenHome {
 		filters = append(filters, key.Filter{Name: "D"}, key.Filter{Name: key.NameDeleteForward})
 	}
+	if ui.screen == screenHome || ui.screen == screenRemoteList {
+		filters = append(filters, key.Filter{Name: "A"})
+	}
 	for {
 		raw, ok := gtx.Event(filters...)
 		if !ok {
@@ -399,19 +416,63 @@ func (ui *ui) handleKeys(gtx layout.Context) {
 		case key.NameEscape:
 			ui.back()
 		case key.NameUpArrow:
-			if ui.selected > 0 {
-				ui.selected--
-			}
+			ui.moveSelection(-1)
 		case key.NameDownArrow:
-			if ui.selected+1 < ui.selectionCount() {
-				ui.selected++
-			}
+			ui.moveSelection(1)
 		case key.NameReturn, key.NameEnter:
 			ui.activateSelection()
 		case "D", key.NameDeleteForward:
 			ui.detachSelection()
+		case "A":
+			ui.toggleAgentSelection()
 		}
 	}
+}
+
+func (ui *ui) moveSelection(delta int) {
+	next := ui.selected + delta
+	if next < 0 || next >= ui.selectionCount() {
+		return
+	}
+	ui.selected = next
+	ui.scrollSelectionIntoView()
+}
+
+func (ui *ui) scrollSelectionIntoView() {
+	list, item, ok := ui.selectedListItem()
+	if !ok {
+		return
+	}
+	position := list.Position
+	if position.Count == 0 {
+		return
+	}
+	last := position.First + position.Count - 1
+	if item < position.First || item > last ||
+		(item == position.First && position.Offset > 0) ||
+		(item == last && position.OffsetLast < 0) {
+		list.ScrollTo(item)
+	}
+}
+
+func (ui *ui) selectedListItem() (*widget.List, int, bool) {
+	switch ui.screen {
+	case screenHome:
+		selection := ui.selected - 2
+		if selection < 0 {
+			return nil, 0, false
+		}
+		for index, item := range localWorkspaceItems(ui.local, ui.localNodeID) {
+			if item.workspace != nil && item.selection == selection {
+				return &ui.localList, index, true
+			}
+		}
+	case screenRemoteList:
+		if ui.selected > 0 {
+			return &ui.remoteList, ui.selected - 1, true
+		}
+	}
+	return nil, 0, false
 }
 
 func (ui *ui) handleEditorEvents(gtx layout.Context) {
@@ -467,6 +528,10 @@ func (ui *ui) handleClicks(gtx layout.Context) {
 		}
 		for _, workspace := range ui.local {
 			key := "home:" + workspace.RemoteHost + ":" + workspace.ID
+			if ui.workspaceAgentControlVisible(workspace) && ui.row("agent:"+key).Clicked(gtx) {
+				ui.toggleWorkspaceAgent(workspace)
+				return
+			}
 			if workspaceAttachedToNode(workspace, ui.localNodeID) && ui.row("detach:"+key).Clicked(gtx) {
 				ui.detachWorkspace(workspace)
 				return
@@ -503,7 +568,7 @@ func (ui *ui) handleClicks(gtx layout.Context) {
 		}
 		for _, workspace := range ui.remote {
 			if ui.row("remote:" + ui.remoteHost + ":" + workspace.ID).Clicked(gtx) {
-				ui.launch(attachArgs(ui.remoteHost, workspace), "Attaching to "+workspace.Name+"…")
+				ui.launch(remoteAttachArgs(ui.remoteHost, workspace, ui.remoteAgent.Value), "Attaching to "+workspace.Name+"…")
 				return
 			}
 		}
@@ -570,7 +635,80 @@ func (ui *ui) openRemoteCreate() {
 // createRemote births the workspace on the origin and attaches it here in one
 // subprocess; success closes the launcher exactly like a plain attach.
 func (ui *ui) createRemote() {
-	ui.launch(createRemoteArgs(ui.remoteHost, ui.remoteNameEditor.Text()), "Creating workspace on "+ui.remoteHost+"…")
+	ui.launch(remoteCreateArgs(ui.remoteHost, ui.remoteNameEditor.Text(), ui.remoteAgent.Value), "Creating workspace on "+ui.remoteHost+"…")
+}
+
+func remoteAttachArgs(host string, workspace *zka.Workspace, claimAgent bool) []string {
+	args := attachArgs(host, workspace)
+	if claimAgent {
+		args = append(args, "--claim-agent")
+	}
+	return args
+}
+
+func remoteCreateArgs(host, name string, claimAgent bool) []string {
+	args := createRemoteArgs(host, name)
+	if claimAgent {
+		args = append(args, "--claim-agent")
+	}
+	return args
+}
+
+func workspaceAgentClaimedByNode(workspace *zka.Workspace, nodeID string) bool {
+	if workspace == nil || workspace.AgentAttachmentID == "" || nodeID == "" {
+		return false
+	}
+	attachment := workspace.Attachments[workspace.AgentAttachmentID]
+	return attachment != nil && attachment.Node.ID == nodeID
+}
+
+func workspaceAgentAction(workspace *zka.Workspace, nodeID string) ([]string, string) {
+	ref := workspace.RemoteHost + ":" + workspace.ID
+	if workspaceAgentClaimedByNode(workspace, nodeID) {
+		return []string{"workspace", "agent", "release", ref}, "Releasing the SSH agent from"
+	}
+	return []string{"workspace", "agent", "claim", ref}, "Using this machine's SSH agent for"
+}
+
+func workspaceAgentButtonLabel(workspace *zka.Workspace, nodeID string) string {
+	if workspaceAgentClaimedByNode(workspace, nodeID) {
+		return "Release agent"
+	}
+	return "Use agent here"
+}
+
+func (ui *ui) workspaceAgentControlVisible(workspace *zka.Workspace) bool {
+	if workspace == nil || workspace.RemoteHost == "" {
+		return false
+	}
+	if workspaceAgentClaimedByNode(workspace, ui.localNodeID) {
+		return true
+	}
+	return ui.agentForwarding && workspaceAttachedToNode(workspace, ui.localNodeID)
+}
+
+func workspaceSSHAgentSummary(workspace *zka.Workspace, remoteHost, localNodeID string) string {
+	if workspace == nil || remoteHost == "" {
+		return ""
+	}
+	if workspace.AgentAttachmentID == "" {
+		return "SSH agent: origin"
+	}
+	attachment := workspace.Attachments[workspace.AgentAttachmentID]
+	if attachment == nil {
+		return "SSH agent: another attachment"
+	}
+	if localNodeID != "" && attachment.Node.ID == localNodeID {
+		return "SSH agent: this machine"
+	}
+	owner := strings.TrimSpace(attachment.Node.Name)
+	if owner == "" {
+		owner = shortID(attachment.Node.ID)
+	}
+	if owner == "" {
+		owner = "another machine"
+	}
+	return "SSH agent: " + owner
 }
 
 func (ui *ui) back() {
@@ -626,7 +764,7 @@ func (ui *ui) activateSelection() {
 		index := ui.selected - 1
 		if index >= 0 && index < len(ui.remote) {
 			workspace := ui.remote[index]
-			ui.launch(attachArgs(ui.remoteHost, workspace), "Attaching to "+workspace.Name+"…")
+			ui.launch(remoteAttachArgs(ui.remoteHost, workspace, ui.remoteAgent.Value), "Attaching to "+workspace.Name+"…")
 		}
 	}
 }
@@ -651,6 +789,29 @@ func (ui *ui) detachSelection() {
 	workspace := ui.local[index]
 	if workspaceAttachedToNode(workspace, ui.localNodeID) {
 		ui.detachWorkspace(workspace)
+	}
+}
+
+func (ui *ui) toggleAgentSelection() {
+	if ui.busy {
+		return
+	}
+	if ui.screen == screenRemoteList {
+		if ui.agentForwarding {
+			ui.remoteAgent.Value = !ui.remoteAgent.Value
+		}
+		return
+	}
+	if ui.screen != screenHome {
+		return
+	}
+	index := ui.selected - 2
+	if index < 0 || index >= len(ui.local) {
+		return
+	}
+	workspace := ui.local[index]
+	if ui.workspaceAgentControlVisible(workspace) {
+		ui.toggleWorkspaceAgent(workspace)
 	}
 }
 
@@ -746,7 +907,13 @@ func (ui *ui) layoutLocalList(gtx layout.Context) layout.Dimensions {
 			action = "Switch →"
 			detachButton = ui.row("detach:" + key)
 		}
-		return ui.workspaceRow(gtx, ui.row(key), detachButton, workspace, action, ui.selected == item.selection+2)
+		var agentButton *widget.Clickable
+		agentLabel := ""
+		if ui.workspaceAgentControlVisible(workspace) {
+			agentButton = ui.row("agent:" + key)
+			agentLabel = workspaceAgentButtonLabel(workspace, ui.localNodeID)
+		}
+		return ui.workspaceRow(gtx, ui.row(key), detachButton, agentButton, agentLabel, workspace, action, ui.selected == item.selection+2)
 	})
 }
 
@@ -836,8 +1003,12 @@ func (ui *ui) layoutRemoteList(gtx layout.Context) layout.Dimensions {
 			key := "remote-list:new:" + ui.remoteHost
 			return ui.actionRow(gtx, key, ui.row(key), "New workspace on "+ui.remoteHost, "Create it on the origin and attach it here", ui.selected == 0)
 		}
+		agentOption := func(gtx layout.Context) layout.Dimensions {
+			return ui.layoutRemoteAgentOption(gtx, "remote-list")
+		}
 		if len(ui.remote) == 0 {
 			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+				layout.Rigid(agentOption),
 				layout.Rigid(newRow),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return ui.message(gtx, "remote-list:empty", "No workspaces found on "+ui.remoteHost+".", false)
@@ -845,11 +1016,12 @@ func (ui *ui) layoutRemoteList(gtx layout.Context) layout.Dimensions {
 			)
 		}
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(agentOption),
 			layout.Rigid(newRow),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 				return material.List(ui.theme, &ui.remoteList).Layout(gtx, len(ui.remote), func(gtx layout.Context, index int) layout.Dimensions {
 					workspace := ui.remote[index]
-					return ui.workspaceRow(gtx, ui.row("remote:"+ui.remoteHost+":"+workspace.ID), nil, workspace, "Attach →", ui.selected == index+1)
+					return ui.workspaceRow(gtx, ui.row("remote:"+ui.remoteHost+":"+workspace.ID), nil, nil, "", workspace, "Attach →", ui.selected == index+1)
 				})
 			}),
 		)
@@ -869,10 +1041,35 @@ func (ui *ui) layoutRemoteCreate(gtx layout.Context) layout.Dimensions {
 					return ui.editor(gtx, &ui.remoteNameEditor, "e.g. api-server")
 				})
 			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return ui.layoutRemoteAgentOption(gtx, "remote-create")
+			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.operationMessage(gtx) }),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Top: 18}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					return ui.primary(gtx, &ui.primaryButton, "Create and attach")
+				})
+			}),
+		)
+	})
+}
+
+func (ui *ui) layoutRemoteAgentOption(gtx layout.Context, key string) layout.Dimensions {
+	return layout.Inset{Top: 12, Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		if !ui.agentForwarding {
+			ui.remoteAgent.Value = false
+			return ui.message(gtx, key+":agent-disabled", "SSH agent forwarding is disabled on this machine.", false)
+		}
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				style := material.CheckBox(ui.theme, &ui.remoteAgent, "Use this machine's SSH agent")
+				return style.Layout(gtx)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Left: 34}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					label := material.Caption(ui.theme, "SSH agent forwarding is enabled on this machine. Claim after attach, then release or move it later.")
+					label.Color = ui.colors.muted
+					return ui.selectableLabel(gtx, key+":agent-help", label)
 				})
 			}),
 		)
@@ -928,19 +1125,44 @@ func (ui *ui) workspaceSectionHeader(gtx layout.Context, label string) layout.Di
 	})
 }
 
-func (ui *ui) workspaceRow(gtx layout.Context, button, detachButton *widget.Clickable, workspace *zka.Workspace, action string, selected bool) layout.Dimensions {
+func (ui *ui) workspaceRow(gtx layout.Context, button, detachButton, agentButton *widget.Clickable, agentLabel string, workspace *zka.Workspace, action string, selected bool) layout.Dimensions {
 	return layout.Inset{Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 				key := "workspace:" + workspace.RemoteHost + ":" + workspace.ID
-				return ui.actionCard(gtx, key, button, workspace.Name, workspaceSummary(workspace), action, selected)
+				remoteHost := workspace.RemoteHost
+				if remoteHost == "" && ui.screen == screenRemoteList {
+					remoteHost = ui.remoteHost
+				}
+				summary := workspaceSummary(workspace)
+				if agent := workspaceSSHAgentSummary(workspace, remoteHost, ui.localNodeID); agent != "" {
+					summary += "  ·  " + agent
+				}
+				return ui.actionCard(gtx, key, button, workspace.Name, summary, action, selected)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				if detachButton == nil {
+				if detachButton == nil && agentButton == nil {
 					return layout.Dimensions{}
 				}
 				return layout.Inset{Left: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					return ui.detachButton(gtx, detachButton)
+					children := make([]layout.FlexChild, 0, 2)
+					if agentButton != nil {
+						children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return ui.agentButton(gtx, agentButton, agentLabel)
+						}))
+					}
+					if detachButton != nil {
+						children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							inset := layout.Inset{}
+							if agentButton != nil {
+								inset.Top = 6
+							}
+							return inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								return ui.detachButton(gtx, detachButton)
+							})
+						}))
+					}
+					return layout.Flex{Axis: layout.Vertical, Alignment: layout.End}.Layout(gtx, children...)
 				})
 			}),
 		)
@@ -1040,6 +1262,15 @@ func (ui *ui) detachButton(gtx layout.Context, button *widget.Clickable) layout.
 	return style.Layout(gtx)
 }
 
+func (ui *ui) agentButton(gtx layout.Context, button *widget.Clickable, label string) layout.Dimensions {
+	style := material.Button(ui.theme, button, label)
+	style.Background = ui.colors.surface
+	style.Color = ui.colors.accent
+	style.CornerRadius = 9
+	style.Inset = layout.Inset{Top: 10, Right: 12, Bottom: 10, Left: 12}
+	return style.Layout(gtx)
+}
+
 func (ui *ui) operationMessage(gtx layout.Context) layout.Dimensions {
 	if ui.errorMessage != "" {
 		return layout.Inset{Top: 14}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -1072,7 +1303,9 @@ func (ui *ui) centeredMessage(gtx layout.Context, message string) layout.Dimensi
 func (ui *ui) footer(gtx layout.Context) layout.Dimensions {
 	text := "↑↓ Navigate    Enter Select    Esc Back"
 	if ui.screen == screenHome {
-		text = "↑↓ Navigate    Enter Switch/Attach    D Detach    Esc Close"
+		text = "↑↓ Navigate    Enter Switch/Attach    A Agent    D Detach    Esc Close"
+	} else if ui.screen == screenRemoteList {
+		text = "↑↓ Navigate    Enter Select    A Toggle agent    Esc Back"
 	}
 	label := material.Caption(ui.theme, text)
 	label.Color = ui.colors.muted

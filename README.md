@@ -693,6 +693,18 @@ zka workspace agent claim devbox.example:example-project
 zka workspace agent status devbox.example:example-project
 ```
 
+To attach and claim in one command, use:
+
+```sh
+zka workspace attach devbox.example:example-project --claim-agent
+zka workspace create devbox.example:new-project --attach --claim-agent
+```
+
+The workspace launcher exposes the same choice when attaching or creating on a
+remote host. Known remote workspaces show whether their relay currently uses the
+origin, this machine, or another attachment, with controls to claim or release
+the agent without recreating the workspace.
+
 Return to the origin agent with:
 
 ```sh

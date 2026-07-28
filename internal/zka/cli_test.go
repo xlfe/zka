@@ -91,12 +91,24 @@ func TestWorkspaceCreateDispatchAndUsage(t *testing.T) {
 	if code != 2 || err == nil || !strings.Contains(err.Error(), "absolute path on devbox.example") {
 		t.Fatalf("relative remote cwd: code=%d err=%v", code, err)
 	}
+	code, err = runWorkspace([]string{"create", "devbox.example:api", "--claim-agent"}, Paths{}, &stdout, &stderr)
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "--claim-agent requires --attach") {
+		t.Fatalf("claim without attach: code=%d err=%v", code, err)
+	}
+	code, err = runWorkspace([]string{"create", "api", "--attach", "--claim-agent"}, Paths{}, &stdout, &stderr)
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "--claim-agent requires a remote workspace") {
+		t.Fatalf("local create claim: code=%d err=%v", code, err)
+	}
+	code, err = runWorkspace([]string{"attach", "api", "--claim-agent"}, Paths{}, &stdout, &stderr)
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "--claim-agent requires a remote workspace") {
+		t.Fatalf("local attach claim: code=%d err=%v", code, err)
+	}
 	stdout.Reset()
 	if code, err := runWorkspace([]string{"help"}, Paths{}, &stdout, &stderr); code != 0 || err != nil {
 		t.Fatalf("help: code=%d err=%v", code, err)
 	}
-	if !strings.Contains(stdout.String(), "\n  create ") {
-		t.Fatalf("workspace usage does not advertise create: %q", stdout.String())
+	if !strings.Contains(stdout.String(), "\n  create ") || !strings.Contains(stdout.String(), "--claim-agent") {
+		t.Fatalf("workspace usage does not advertise create and agent claiming: %q", stdout.String())
 	}
 }
 

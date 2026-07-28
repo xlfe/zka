@@ -328,8 +328,8 @@ func printWorkspaceUsage(w io.Writer) {
   list [--origin SSH_ALIAS] [--json]
   inspect [SSH_ALIAS:]REF [--json]
   reconcile [SSH_ALIAS:]REF [--attachment ID]
-  create [SSH_ALIAS:]NAME [--template FILE] [--cwd DIR] [--attach]
-  attach [SSH_ALIAS:]REF [--pane PANE]
+  create [SSH_ALIAS:]NAME [--template FILE] [--cwd DIR] [--attach] [--claim-agent]
+  attach [SSH_ALIAS:]REF [--pane PANE] [--claim-agent]
   move [SSH_ALIAS:]REF [--pane PANE]
   detach REF
   rename [SSH_ALIAS:]REF NAME
@@ -350,6 +350,7 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 	cwd := fs.String("cwd", "", "default pane working directory on the origin")
 	templatePath := fs.String("template", "", "topology-only Kitty session template")
 	attach := fs.Bool("attach", false, "attach the workspace here after creating it")
+	claimAgent := fs.Bool("claim-agent", false, "use this machine's SSH agent after attaching")
 	if err := parseInterspersed(fs, args); err != nil {
 		return 2, err
 	}
@@ -359,6 +360,12 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 	host, name := splitWorkspaceRef(fs.Arg(0))
 	if host == "" && strings.TrimSpace(name) == "" {
 		return 2, fmt.Errorf("workspace create requires a name (append SSH_ALIAS: for an automatic remote name)")
+	}
+	if *claimAgent && !*attach {
+		return 2, fmt.Errorf("--claim-agent requires --attach")
+	}
+	if *claimAgent && host == "" {
+		return 2, fmt.Errorf("--claim-agent requires a remote workspace")
 	}
 	if *cwd != "" && !filepath.IsAbs(*cwd) {
 		if host != "" {
@@ -426,9 +433,17 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 	if host != "" {
 		ref = host + ":" + workspace.ID
 	}
-	code, err := runWorkspaceAttach([]string{ref}, paths, false, stdout, stderr)
+	attachArgs := []string{ref}
+	if *claimAgent {
+		attachArgs = append(attachArgs, "--claim-agent")
+	}
+	code, err := runWorkspaceAttach(attachArgs, paths, false, stdout, stderr)
 	if err != nil {
-		return code, fmt.Errorf("workspace %s created but not attached; retry with: zka workspace attach %s: %w", workspace.Name, ref, err)
+		retry := "zka workspace attach " + ref
+		if *claimAgent {
+			retry += " --claim-agent"
+		}
+		return code, fmt.Errorf("workspace %s created but its attach sequence did not complete; retry with: %s: %w", workspace.Name, retry, err)
 	}
 	return code, nil
 }
@@ -653,6 +668,7 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	}
 	fs := newFlagSet(name, stderr)
 	paneRef := fs.String("pane", "", "pane to focus after attaching")
+	claimAgent := fs.Bool("claim-agent", false, "use this machine's SSH agent after attaching")
 	if err := parseInterspersed(fs, args); err != nil {
 		return 2, err
 	}
@@ -663,6 +679,9 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	defer cancel()
 	api := NewAPI(paths)
 	host, ref := splitWorkspaceRef(fs.Arg(0))
+	if *claimAgent && host == "" {
+		return 2, fmt.Errorf("--claim-agent requires a remote workspace")
+	}
 	var workspace *Workspace
 	var err error
 	if host == "" {
@@ -742,6 +761,11 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 		if err := focusAttachment(ctx, paths, workspace, existing, *paneRef); err != nil {
 			return 1, err
 		}
+		if *claimAgent {
+			if err := claimAttachedWorkspaceAgent(api, host, workspace, existing.ID); err != nil {
+				return 1, err
+			}
+		}
 		fmt.Fprintf(stdout, "%s\t%s\n", workspace.ID, workspace.Name)
 		return 0, nil
 	}
@@ -820,8 +844,25 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	if err := focusAttachment(ctx, paths, workspace, workspace.Attachments[attachmentID], *paneRef); err != nil {
 		return 1, err
 	}
+	if *claimAgent {
+		if err := claimAttachedWorkspaceAgent(api, host, workspace, attachmentID); err != nil {
+			return 1, err
+		}
+	}
 	fmt.Fprintf(stdout, "%s\t%s\n", workspace.ID, workspace.Name)
 	return 0, nil
+}
+
+func claimAttachedWorkspaceAgent(api API, host string, workspace *Workspace, attachmentID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var status workspaceAgentStatus
+	if err := api.RemoteCall(ctx, host, "workspace_agent_claim", workspaceAgentRequest{
+		Workspace: workspace.ID, Attachment: attachmentID,
+	}, &status); err != nil {
+		return fmt.Errorf("workspace %s attached but its SSH agent was not claimed: %w", workspace.Name, err)
+	}
+	return nil
 }
 
 func attachmentUsable(attachment *Attachment) bool {
