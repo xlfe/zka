@@ -703,7 +703,13 @@ zka workspace create devbox.example:new-project --attach --claim-agent
 The workspace launcher exposes the same choice when attaching or creating on a
 remote host. Known remote workspaces show whether their relay currently uses the
 origin, this machine, or another attachment, with controls to claim or release
-the agent without recreating the workspace.
+the agent without recreating the workspace. A previously connected, detached
+workspace offers **Attach + use SSH agent** so reattaching and moving the claim
+are one explicit action.
+
+The same action appears on the origin when a workspace is still using an SSH
+agent from another attachment. It returns the relay to the origin agent before
+opening the local view; plain **Attach** preserves the existing claim.
 
 Return to the origin agent with:
 

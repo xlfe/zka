@@ -1,13 +1,26 @@
 package launcher
 
 import (
+	"context"
 	"reflect"
 	"testing"
+	"time"
 
+	"gioui.org/app"
 	"gioui.org/layout"
 
 	"github.com/xlfe/zka/internal/zka"
 )
+
+type recordingLauncherBackend struct {
+	unavailableBackend
+	executed chan []string
+}
+
+func (b *recordingLauncherBackend) Execute(_ context.Context, args []string) error {
+	b.executed <- append([]string(nil), args...)
+	return nil
+}
 
 func TestRemoteListSelectionIncludesCreateRow(t *testing.T) {
 	ui := newUI(nil)
@@ -95,6 +108,99 @@ func TestRemoteWorkspaceAgentOwnershipAndActions(t *testing.T) {
 	if args, status := workspaceAgentAction(workspace, "local-node"); !reflect.DeepEqual(args,
 		[]string{"workspace", "agent", "claim", "devbox.example:0123456789abcdef"}) || status != "Using this machine's SSH agent for" {
 		t.Fatalf("claim action = %#v, %q", args, status)
+	}
+}
+
+func TestDetachedRemoteWorkspaceCanAttachAndClaimAgentInOneAction(t *testing.T) {
+	const localNode = "local-node"
+	workspace := &zka.Workspace{
+		ID: "0123456789abcdef", Name: "api", RemoteHost: "devbox.example",
+		AgentAttachmentID: "other",
+		Attachments: map[string]*zka.Attachment{
+			"local": {
+				ID: "local", Node: zka.Host{ID: localNode, Name: "laptop"},
+				Endpoint: "unix:/local/detached.sock", Status: zka.AttachmentDetached,
+			},
+			"other": {ID: "other", Node: zka.Host{ID: "other-node", Name: "desktop"}},
+		},
+	}
+	backend := &recordingLauncherBackend{executed: make(chan []string, 1)}
+	ui := newUI(backend)
+	ui.ctx = context.Background()
+	ui.window = new(app.Window)
+	ui.screen = screenHome
+	ui.localNodeID = localNode
+	ui.local = []*zka.Workspace{workspace}
+	ui.selected = 2
+	ui.agentForwarding = true
+
+	if !ui.workspaceAgentControlVisible(workspace) {
+		t.Fatal("detached remote workspace did not offer an SSH agent action")
+	}
+	if got, want := workspaceAgentButtonLabel(workspace, localNode), "Attach + use SSH agent"; got != want {
+		t.Fatalf("agent button label = %q, want %q", got, want)
+	}
+
+	ui.toggleAgentSelection()
+
+	select {
+	case got := <-backend.executed:
+		want := []string{"workspace", "attach", "devbox.example:0123456789abcdef", "--claim-agent"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("agent action args = %#v, want %#v", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("detached workspace agent action did not execute")
+	}
+}
+
+func TestOriginWorkspaceCanAttachAndReturnAgentInOneAction(t *testing.T) {
+	const originNode = "origin-node"
+	workspace := &zka.Workspace{
+		ID: "0123456789abcdef", Name: "api",
+		AgentAttachmentID: "machine-a",
+		Attachments: map[string]*zka.Attachment{
+			"origin": {
+				ID: "origin", Node: zka.Host{ID: originNode, Name: "devbox"},
+				Endpoint: "unix:/devbox/detached.sock", Status: zka.AttachmentDetached,
+			},
+			"machine-a": {ID: "machine-a", Node: zka.Host{ID: "machine-a-node", Name: "machine-a"}},
+		},
+	}
+	backend := &recordingLauncherBackend{executed: make(chan []string, 2)}
+	ui := newUI(backend)
+	ui.ctx = context.Background()
+	ui.window = new(app.Window)
+	ui.screen = screenHome
+	ui.localNodeID = originNode
+	ui.local = []*zka.Workspace{workspace}
+	ui.selected = 2
+	ui.agentForwarding = true
+
+	if got, want := workspaceSSHAgentSummary(workspace, "", originNode), "SSH agent: machine-a"; got != want {
+		t.Fatalf("origin summary = %q, want %q", got, want)
+	}
+	if !ui.workspaceAgentControlVisible(workspace) {
+		t.Fatal("origin workspace did not offer an SSH agent action for a remote claim")
+	}
+	if got, want := workspaceAgentButtonLabel(workspace, originNode), "Attach + use SSH agent"; got != want {
+		t.Fatalf("origin agent button label = %q, want %q", got, want)
+	}
+
+	ui.toggleAgentSelection()
+
+	for index, want := range [][]string{
+		{"workspace", "agent", "release", "0123456789abcdef"},
+		{"workspace", "attach", "0123456789abcdef"},
+	} {
+		select {
+		case got := <-backend.executed:
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("origin action %d args = %#v, want %#v", index, got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("origin action %d did not execute", index)
+		}
 	}
 }
 

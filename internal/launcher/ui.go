@@ -267,16 +267,52 @@ func (ui *ui) launch(args []string, status string) {
 	ui.execute(resultLaunch, "", args, status)
 }
 
+func (ui *ui) launchAll(commands [][]string, status string) {
+	ui.executeAll(resultLaunch, "", commands, status)
+}
+
 func (ui *ui) detachWorkspace(workspace *zka.Workspace) {
 	ui.execute(resultDetach, workspace.ID, detachArgs(workspace), "Detaching "+workspace.Name+"…")
 }
 
 func (ui *ui) toggleWorkspaceAgent(workspace *zka.Workspace) {
+	if workspace.RemoteHost == "" {
+		if workspace.AgentAttachmentID == "" {
+			return
+		}
+		releaseArgs, _ := workspaceAgentAction(workspace, ui.localNodeID)
+		if !workspaceAttachedToNode(workspace, ui.localNodeID) {
+			ui.launchAll(
+				[][]string{releaseArgs, attachArgs("", workspace)},
+				"Attaching to "+workspace.Name+" and using this machine's SSH agent…",
+			)
+			return
+		}
+		ui.execute(
+			resultAgent,
+			workspace.ID,
+			releaseArgs,
+			"Using this machine's SSH agent for "+workspace.Name+"…",
+		)
+		return
+	}
+	if !workspaceAttachedToNode(workspace, ui.localNodeID) &&
+		!workspaceAgentClaimedByNode(workspace, ui.localNodeID) {
+		ui.launch(
+			remoteAttachArgs(workspace.RemoteHost, workspace, true),
+			"Attaching to "+workspace.Name+" and using this machine's SSH agent…",
+		)
+		return
+	}
 	args, action := workspaceAgentAction(workspace, ui.localNodeID)
 	ui.execute(resultAgent, workspace.ID, args, action+" "+workspace.Name+"…")
 }
 
 func (ui *ui) execute(kind resultKind, workspace string, args []string, status string) {
+	ui.executeAll(kind, workspace, [][]string{args}, status)
+}
+
+func (ui *ui) executeAll(kind resultKind, workspace string, commands [][]string, status string) {
 	if ui.busy {
 		return
 	}
@@ -290,7 +326,12 @@ func (ui *ui) execute(kind resultKind, workspace string, args []string, status s
 	ctx, cancel := context.WithTimeout(ui.ctx, 60*time.Second)
 	ui.operationCancel = cancel
 	go func() {
-		err := ui.backend.Execute(ctx, args)
+		var err error
+		for _, args := range commands {
+			if err = ui.backend.Execute(ctx, args); err != nil {
+				break
+			}
+		}
 		ui.deliver(asyncResult{kind: kind, token: token, workspace: workspace, err: err})
 	}()
 }
@@ -663,7 +704,13 @@ func workspaceAgentClaimedByNode(workspace *zka.Workspace, nodeID string) bool {
 }
 
 func workspaceAgentAction(workspace *zka.Workspace, nodeID string) ([]string, string) {
-	ref := workspace.RemoteHost + ":" + workspace.ID
+	ref := workspace.ID
+	if workspace.RemoteHost != "" {
+		ref = workspace.RemoteHost + ":" + ref
+	}
+	if workspace.RemoteHost == "" {
+		return []string{"workspace", "agent", "release", ref}, "Using this machine's SSH agent for"
+	}
 	if workspaceAgentClaimedByNode(workspace, nodeID) {
 		return []string{"workspace", "agent", "release", ref}, "Releasing the SSH agent from"
 	}
@@ -672,26 +719,35 @@ func workspaceAgentAction(workspace *zka.Workspace, nodeID string) ([]string, st
 
 func workspaceAgentButtonLabel(workspace *zka.Workspace, nodeID string) string {
 	if workspaceAgentClaimedByNode(workspace, nodeID) {
-		return "Release agent"
+		return "Release SSH agent"
 	}
-	return "Use agent here"
+	if !workspaceAttachedToNode(workspace, nodeID) {
+		return "Attach + use SSH agent"
+	}
+	return "Use SSH agent here"
 }
 
 func (ui *ui) workspaceAgentControlVisible(workspace *zka.Workspace) bool {
-	if workspace == nil || workspace.RemoteHost == "" {
+	if workspace == nil {
 		return false
+	}
+	if workspace.RemoteHost == "" {
+		return workspace.AgentAttachmentID != ""
 	}
 	if workspaceAgentClaimedByNode(workspace, ui.localNodeID) {
 		return true
 	}
-	return ui.agentForwarding && workspaceAttachedToNode(workspace, ui.localNodeID)
+	return ui.agentForwarding && workspaceKnownToNode(workspace, ui.localNodeID)
 }
 
 func workspaceSSHAgentSummary(workspace *zka.Workspace, remoteHost, localNodeID string) string {
-	if workspace == nil || remoteHost == "" {
+	if workspace == nil {
 		return ""
 	}
 	if workspace.AgentAttachmentID == "" {
+		if remoteHost == "" {
+			return ""
+		}
 		return "SSH agent: origin"
 	}
 	attachment := workspace.Attachments[workspace.AgentAttachmentID]
@@ -1303,9 +1359,9 @@ func (ui *ui) centeredMessage(gtx layout.Context, message string) layout.Dimensi
 func (ui *ui) footer(gtx layout.Context) layout.Dimensions {
 	text := "↑↓ Navigate    Enter Select    Esc Back"
 	if ui.screen == screenHome {
-		text = "↑↓ Navigate    Enter Switch/Attach    A Agent    D Detach    Esc Close"
+		text = "↑↓ Navigate    Enter Switch/Attach    A SSH agent    D Detach    Esc Close"
 	} else if ui.screen == screenRemoteList {
-		text = "↑↓ Navigate    Enter Select    A Toggle agent    Esc Back"
+		text = "↑↓ Navigate    Enter Select    A Toggle SSH agent    Esc Back"
 	}
 	label := material.Caption(ui.theme, text)
 	label.Color = ui.colors.muted
