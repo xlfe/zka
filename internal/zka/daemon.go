@@ -591,6 +591,8 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		return d.state.Node, nil
 	case "ssh_agent":
 		return d.sshAgent, nil
+	case "sway_ipc":
+		return probeSwayIPC(ctx, d.runner, d.config.Focus.SwayCommand)
 	case "create_workspace":
 		var req createWorkspaceRequest
 		if err := decodePayload(raw, &req); err != nil {

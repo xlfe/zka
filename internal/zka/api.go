@@ -33,6 +33,12 @@ func (a API) SSHAgent(ctx context.Context) (sshAgentInfo, error) {
 	return out, err
 }
 
+func (a API) SwayIPC(ctx context.Context) (swaySocketInfo, error) {
+	var out swaySocketInfo
+	err := a.client.Call(ctx, "sway_ipc", nil, &out)
+	return out, err
+}
+
 func (a API) CreateWorkspace(ctx context.Context, req createWorkspaceRequest) (*Workspace, error) {
 	var out Workspace
 	err := a.client.Call(ctx, "create_workspace", req, &out)

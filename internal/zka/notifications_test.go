@@ -72,7 +72,7 @@ func TestDesktopActionFocusesPaneAndMarksSeen(t *testing.T) {
 				strings.Contains(joined, "var:zka_pane="+pane.ID) {
 				focused = true
 			}
-			if call.Name == "swaymsg" && joined == "[pid=4242] focus" {
+			if call.Name == "swaymsg" && joined == "--socket /run/user/1234/sway-ipc.sock [pid=4242] focus" {
 				raised = true
 			}
 		}

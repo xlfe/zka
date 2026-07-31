@@ -3,6 +3,7 @@ package zka
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -78,6 +79,48 @@ func TestManagedHookDoctorCheck(t *testing.T) {
 	}
 }
 
+func TestSwayIPCDoctorCheck(t *testing.T) {
+	probeCalls := 0
+	probe := func(context.Context) (swaySocketInfo, error) {
+		probeCalls++
+		return swaySocketInfo{Path: "/run/user/1234/sway.sock", Source: "XDG_RUNTIME_DIR"}, nil
+	}
+
+	headless := swayIPCDoctorCheck(context.Background(), true, true, probe)
+	if !headless.OK || headless.Name != "sway-ipc" || !bytes.Contains([]byte(headless.Detail), []byte("headless")) {
+		t.Fatalf("headless check = %#v", headless)
+	}
+	disabled := swayIPCDoctorCheck(context.Background(), false, false, probe)
+	if !disabled.OK || !bytes.Contains([]byte(disabled.Detail), []byte("disabled")) {
+		t.Fatalf("disabled check = %#v", disabled)
+	}
+	if probeCalls != 0 {
+		t.Fatalf("probe calls for skipped checks = %d, want 0", probeCalls)
+	}
+
+	connected := swayIPCDoctorCheck(context.Background(), false, true, probe)
+	if !connected.OK || connected.Detail != "/run/user/1234/sway.sock via XDG_RUNTIME_DIR" {
+		t.Fatalf("connected check = %#v", connected)
+	}
+	if probeCalls != 1 {
+		t.Fatalf("probe calls = %d, want 1", probeCalls)
+	}
+
+	failed := swayIPCDoctorCheck(context.Background(), false, true, func(context.Context) (swaySocketInfo, error) {
+		return swaySocketInfo{}, errors.New("Unable to retrieve socket path")
+	})
+	if failed.OK || !bytes.Contains([]byte(failed.Detail), []byte("Unable to retrieve socket path")) {
+		t.Fatalf("failed check = %#v", failed)
+	}
+
+	oldDaemon := swayIPCDoctorCheck(context.Background(), false, true, func(context.Context) (swaySocketInfo, error) {
+		return swaySocketInfo{}, errors.New(`unknown operation "sway_ipc"`)
+	})
+	if oldDaemon.OK || !bytes.Contains([]byte(oldDaemon.Detail), []byte("restart zkad after upgrading")) {
+		t.Fatalf("old-daemon check = %#v", oldDaemon)
+	}
+}
+
 func TestDoctorHeadlessSkipsViewLayerChecks(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {
@@ -96,7 +139,7 @@ func TestDoctorHeadlessSkipsViewLayerChecks(t *testing.T) {
 	out := stdout.String()
 	// kitty, kitten, swaymsg, and kitty-watcher are skipped by configuration;
 	// zmx/ssh/ntfy-send and the agent checks must still be real lookups.
-	if got := bytes.Count(stdout.Bytes(), []byte("skipped on a headless origin")); got != 4 {
+	if got := bytes.Count(stdout.Bytes(), []byte("skipped on a headless origin")); got != 5 {
 		t.Fatalf("skip count = %d in:\n%s", got, out)
 	}
 }

@@ -73,6 +73,7 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		path, lookupErr := exec.LookPath(item.command)
 		checks = append(checks, doctorCheck{Name: item.name, OK: lookupErr == nil, Detail: doctorDetail(lookupErr, path)})
 	}
+	checks = append(checks, swayIPCDoctorCheck(ctx, cfg.Headless, cfg.Notifications.DesktopEnabled, api.SwayIPC))
 	if cfg.Headless {
 		checks = append(checks, doctorCheck{Name: "kitty-watcher", OK: true, Detail: "skipped on a headless origin"})
 	} else {
@@ -166,6 +167,31 @@ func desktopNotificationCheck(ctx context.Context, enabled bool, probe desktopNo
 		return doctorCheck{Name: name, Detail: err.Error()}
 	}
 	return doctorCheck{Name: name, OK: true, Detail: "delivered and withdrew a probe via " + server}
+}
+
+type swayIPCProbe func(context.Context) (swaySocketInfo, error)
+
+func swayIPCDoctorCheck(ctx context.Context, headless, desktopEnabled bool, probe swayIPCProbe) doctorCheck {
+	const name = "sway-ipc"
+	if headless {
+		return doctorCheck{Name: name, OK: true, Detail: "skipped on a headless origin"}
+	}
+	if !desktopEnabled {
+		return doctorCheck{Name: name, OK: true, Detail: "disabled with desktop notifications"}
+	}
+	socket, err := probe(ctx)
+	if err != nil {
+		detail := err.Error()
+		if strings.Contains(detail, "unknown operation") {
+			detail += " (restart zkad after upgrading)"
+		}
+		return doctorCheck{Name: name, Detail: detail}
+	}
+	return doctorCheck{
+		Name:   name,
+		OK:     true,
+		Detail: socket.Path + " via " + socket.Source,
+	}
 }
 
 // notificationDeliveryCheck turns the delivery ledger that only `zka workspace

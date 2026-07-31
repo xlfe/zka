@@ -792,7 +792,10 @@ mixed-version compatible; upgrade and restart zka on both SSH peers together.
 managed hook files. An integration disabled in the NixOS module is reported as
 disabled instead of failed. On a headless origin the view-layer checks
 (`kitty`, `kitten`, `swaymsg`, `kitty-watcher`) report `skipped on a headless
-origin`; zmx, ssh, ntfy-send, and the agent checks stay real.
+origin`; zmx, ssh, ntfy-send, and the agent checks stay real. The `sway-ipc`
+check runs inside zkad, resolves the same socket used by notification actions,
+and performs a read-only `get_version` request so a daemon started before Sway
+can be diagnosed without focusing a window.
 
 ## Boundaries
 
