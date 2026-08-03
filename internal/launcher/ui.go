@@ -33,6 +33,7 @@ const (
 	screenRemoteHost
 	screenRemoteList
 	screenRemoteCreate
+	screenForget
 )
 
 type resultKind uint8
@@ -43,6 +44,7 @@ const (
 	resultLaunch
 	resultDetach
 	resultAgent
+	resultForget
 )
 
 type asyncResult struct {
@@ -76,21 +78,23 @@ type ui struct {
 	operationKind   resultKind
 	results         chan asyncResult
 
-	screen          screen
-	local           []*zka.Workspace
-	remote          []*zka.Workspace
-	remoteHosts     []string
-	remoteHost      string
-	localNodeID     string
-	selectOnLoad    string
-	selected        int
-	agentForwarding bool
-	localLoading    bool
-	localError      string
-	busy            bool
-	status          string
-	errorMessage    string
-	focusPending    *widget.Editor
+	screen                screen
+	local                 []*zka.Workspace
+	remote                []*zka.Workspace
+	remoteHosts           []string
+	remoteHost            string
+	localNodeID           string
+	selectOnLoad          string
+	selected              int
+	agentForwarding       bool
+	localLoading          bool
+	localError            string
+	busy                  bool
+	status                string
+	errorMessage          string
+	focusPending          *widget.Editor
+	forgetWorkspace       *zka.Workspace
+	forgetReturnSelection int
 
 	newButton        widget.Clickable
 	remoteButton     widget.Clickable
@@ -275,6 +279,25 @@ func (ui *ui) detachWorkspace(workspace *zka.Workspace) {
 	ui.execute(resultDetach, workspace.ID, detachArgs(workspace), "Detaching "+workspace.Name+"…")
 }
 
+func (ui *ui) openForget(workspace *zka.Workspace) {
+	if ui.busy || !workspaceForgettable(workspace, ui.localNodeID) {
+		return
+	}
+	ui.forgetWorkspace = workspace
+	ui.forgetReturnSelection = ui.selected
+	ui.screen = screenForget
+	ui.status = ""
+	ui.errorMessage = ""
+}
+
+func (ui *ui) confirmForget() {
+	if ui.forgetWorkspace == nil {
+		return
+	}
+	workspace := ui.forgetWorkspace
+	ui.execute(resultForget, workspace.ID, forgetArgs(workspace), "Forgetting "+workspace.Name+" on this machine…")
+}
+
 func (ui *ui) toggleWorkspaceAgent(workspace *zka.Workspace) {
 	if workspace.RemoteHost == "" {
 		if workspace.AgentAttachmentID == "" {
@@ -421,6 +444,22 @@ func (ui *ui) drainResults() {
 				ui.errorMessage = ""
 				ui.selectOnLoad = result.workspace
 				ui.loadLocal()
+			case resultForget:
+				if result.token != ui.operationToken {
+					continue
+				}
+				ui.cancelOperation()
+				ui.busy = false
+				ui.status = ""
+				if result.err != nil {
+					ui.errorMessage = result.err.Error()
+					continue
+				}
+				ui.errorMessage = ""
+				ui.forgetWorkspace = nil
+				ui.screen = screenHome
+				ui.selected = ui.forgetReturnSelection
+				ui.loadLocal()
 			}
 		default:
 			return
@@ -430,16 +469,24 @@ func (ui *ui) drainResults() {
 
 func (ui *ui) handleKeys(gtx layout.Context) {
 	filters := []event.Filter{key.Filter{Name: key.NameEscape}}
-	if ui.screen == screenHome || ui.screen == screenRemoteList {
+	if ui.screen == screenHome || ui.screen == screenRemoteList || ui.screen == screenForget {
 		filters = append(filters,
-			key.Filter{Name: key.NameUpArrow},
-			key.Filter{Name: key.NameDownArrow},
 			key.Filter{Name: key.NameReturn},
 			key.Filter{Name: key.NameEnter},
 		)
 	}
+	if ui.screen == screenHome || ui.screen == screenRemoteList {
+		filters = append(filters,
+			key.Filter{Name: key.NameUpArrow},
+			key.Filter{Name: key.NameDownArrow},
+		)
+	}
 	if ui.screen == screenHome {
-		filters = append(filters, key.Filter{Name: "D"}, key.Filter{Name: key.NameDeleteForward})
+		filters = append(filters,
+			key.Filter{Name: "D"},
+			key.Filter{Name: "F"},
+			key.Filter{Name: key.NameDeleteForward},
+		)
 	}
 	if ui.screen == screenHome || ui.screen == screenRemoteList {
 		filters = append(filters, key.Filter{Name: "A"})
@@ -464,6 +511,8 @@ func (ui *ui) handleKeys(gtx layout.Context) {
 			ui.activateSelection()
 		case "D", key.NameDeleteForward:
 			ui.detachSelection()
+		case "F":
+			ui.forgetSelection()
 		case "A":
 			ui.toggleAgentSelection()
 		}
@@ -569,6 +618,10 @@ func (ui *ui) handleClicks(gtx layout.Context) {
 		}
 		for _, workspace := range ui.local {
 			key := "home:" + workspace.RemoteHost + ":" + workspace.ID
+			if workspaceForgettable(workspace, ui.localNodeID) && ui.row("forget:"+key).Clicked(gtx) {
+				ui.openForget(workspace)
+				return
+			}
 			if ui.workspaceAgentControlVisible(workspace) && ui.row("agent:"+key).Clicked(gtx) {
 				ui.toggleWorkspaceAgent(workspace)
 				return
@@ -616,6 +669,10 @@ func (ui *ui) handleClicks(gtx layout.Context) {
 	case screenRemoteCreate:
 		if ui.primaryButton.Clicked(gtx) {
 			ui.createRemote()
+		}
+	case screenForget:
+		if ui.primaryButton.Clicked(gtx) {
+			ui.confirmForget()
 		}
 	}
 }
@@ -768,7 +825,7 @@ func workspaceSSHAgentSummary(workspace *zka.Workspace, remoteHost, localNodeID 
 }
 
 func (ui *ui) back() {
-	if ui.busy && (ui.operationKind == resultLaunch || ui.operationKind == resultDetach) {
+	if ui.busy && (ui.operationKind == resultLaunch || ui.operationKind == resultDetach || ui.operationKind == resultForget) {
 		return
 	}
 	switch ui.screen {
@@ -786,6 +843,13 @@ func (ui *ui) back() {
 		ui.errorMessage = ""
 		ui.status = ""
 		ui.screen = screenRemoteList
+		ui.clampSelection()
+	case screenForget:
+		ui.errorMessage = ""
+		ui.status = ""
+		ui.forgetWorkspace = nil
+		ui.screen = screenHome
+		ui.selected = ui.forgetReturnSelection
 		ui.clampSelection()
 	default:
 		ui.errorMessage = ""
@@ -822,6 +886,8 @@ func (ui *ui) activateSelection() {
 			workspace := ui.remote[index]
 			ui.launch(remoteAttachArgs(ui.remoteHost, workspace, ui.remoteAgent.Value), "Attaching to "+workspace.Name+"…")
 		}
+	case screenForget:
+		ui.confirmForget()
 	}
 }
 
@@ -846,6 +912,17 @@ func (ui *ui) detachSelection() {
 	if workspaceAttachedToNode(workspace, ui.localNodeID) {
 		ui.detachWorkspace(workspace)
 	}
+}
+
+func (ui *ui) forgetSelection() {
+	if ui.busy || ui.screen != screenHome {
+		return
+	}
+	index := ui.selected - 2
+	if index < 0 || index >= len(ui.local) {
+		return
+	}
+	ui.openForget(ui.local[index])
 }
 
 func (ui *ui) toggleAgentSelection() {
@@ -904,6 +981,8 @@ func (ui *ui) layout(gtx layout.Context) layout.Dimensions {
 			return ui.layoutRemoteList(gtx)
 		case screenRemoteCreate:
 			return ui.layoutRemoteCreate(gtx)
+		case screenForget:
+			return ui.layoutForget(gtx)
 		default:
 			return ui.layoutHome(gtx)
 		}
@@ -969,7 +1048,11 @@ func (ui *ui) layoutLocalList(gtx layout.Context) layout.Dimensions {
 			agentButton = ui.row("agent:" + key)
 			agentLabel = workspaceAgentButtonLabel(workspace, ui.localNodeID)
 		}
-		return ui.workspaceRow(gtx, ui.row(key), detachButton, agentButton, agentLabel, workspace, action, ui.selected == item.selection+2)
+		var forgetButton *widget.Clickable
+		if workspaceForgettable(workspace, ui.localNodeID) {
+			forgetButton = ui.row("forget:" + key)
+		}
+		return ui.workspaceRow(gtx, ui.row(key), detachButton, agentButton, forgetButton, agentLabel, workspace, action, ui.selected == item.selection+2)
 	})
 }
 
@@ -1077,7 +1160,7 @@ func (ui *ui) layoutRemoteList(gtx layout.Context) layout.Dimensions {
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 				return material.List(ui.theme, &ui.remoteList).Layout(gtx, len(ui.remote), func(gtx layout.Context, index int) layout.Dimensions {
 					workspace := ui.remote[index]
-					return ui.workspaceRow(gtx, ui.row("remote:"+ui.remoteHost+":"+workspace.ID), nil, nil, "", workspace, "Attach →", ui.selected == index+1)
+					return ui.workspaceRow(gtx, ui.row("remote:"+ui.remoteHost+":"+workspace.ID), nil, nil, nil, "", workspace, "Attach →", ui.selected == index+1)
 				})
 			}),
 		)
@@ -1104,6 +1187,29 @@ func (ui *ui) layoutRemoteCreate(gtx layout.Context) layout.Dimensions {
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Top: 18}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					return ui.primary(gtx, &ui.primaryButton, "Create and attach")
+				})
+			}),
+		)
+	})
+}
+
+func (ui *ui) layoutForget(gtx layout.Context) layout.Dimensions {
+	workspace := ui.forgetWorkspace
+	if workspace == nil {
+		return ui.page(gtx, "Forget workspace", "The selected workspace is no longer available.", true, ui.operationMessage)
+	}
+	title := "Forget " + workspace.Name + "?"
+	subtitle := "Remove this machine's cached copy. The workspace and its processes on " + workspace.RemoteHost + " are untouched."
+	return ui.page(gtx, title, subtitle, true, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return ui.message(gtx, "forget:details",
+					"Generated Kitty sessions on this machine will be removed. SSH agent ownership on the origin will not change, and reconnecting may make this workspace appear again.", false)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.operationMessage(gtx) }),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Top: 18}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return ui.dangerButton(gtx, &ui.primaryButton, "Forget local copy")
 				})
 			}),
 		)
@@ -1181,7 +1287,7 @@ func (ui *ui) workspaceSectionHeader(gtx layout.Context, label string) layout.Di
 	})
 }
 
-func (ui *ui) workspaceRow(gtx layout.Context, button, detachButton, agentButton *widget.Clickable, agentLabel string, workspace *zka.Workspace, action string, selected bool) layout.Dimensions {
+func (ui *ui) workspaceRow(gtx layout.Context, button, detachButton, agentButton, forgetButton *widget.Clickable, agentLabel string, workspace *zka.Workspace, action string, selected bool) layout.Dimensions {
 	return layout.Inset{Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
@@ -1197,11 +1303,11 @@ func (ui *ui) workspaceRow(gtx layout.Context, button, detachButton, agentButton
 				return ui.actionCard(gtx, key, button, workspace.Name, summary, action, selected)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				if detachButton == nil && agentButton == nil {
+				if detachButton == nil && agentButton == nil && forgetButton == nil {
 					return layout.Dimensions{}
 				}
 				return layout.Inset{Left: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					children := make([]layout.FlexChild, 0, 2)
+					children := make([]layout.FlexChild, 0, 3)
 					if agentButton != nil {
 						children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 							return ui.agentButton(gtx, agentButton, agentLabel)
@@ -1215,6 +1321,17 @@ func (ui *ui) workspaceRow(gtx layout.Context, button, detachButton, agentButton
 							}
 							return inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 								return ui.detachButton(gtx, detachButton)
+							})
+						}))
+					}
+					if forgetButton != nil {
+						children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							inset := layout.Inset{}
+							if agentButton != nil || detachButton != nil {
+								inset.Top = 6
+							}
+							return inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								return ui.forgetButton(gtx, forgetButton)
 							})
 						}))
 					}
@@ -1300,6 +1417,15 @@ func (ui *ui) primary(gtx layout.Context, button *widget.Clickable, label string
 	return style.Layout(gtx)
 }
 
+func (ui *ui) dangerButton(gtx layout.Context, button *widget.Clickable, label string) layout.Dimensions {
+	style := material.Button(ui.theme, button, label)
+	style.Background = ui.colors.danger
+	style.Color = ui.colors.background
+	style.CornerRadius = 10
+	style.Inset = layout.Inset{Top: 12, Right: 18, Bottom: 12, Left: 18}
+	return style.Layout(gtx)
+}
+
 func (ui *ui) secondaryButton(gtx layout.Context, button *widget.Clickable, label string) layout.Dimensions {
 	style := material.Button(ui.theme, button, label)
 	style.Background = ui.colors.surface
@@ -1311,6 +1437,15 @@ func (ui *ui) secondaryButton(gtx layout.Context, button *widget.Clickable, labe
 
 func (ui *ui) detachButton(gtx layout.Context, button *widget.Clickable) layout.Dimensions {
 	style := material.Button(ui.theme, button, "Detach")
+	style.Background = ui.colors.surface
+	style.Color = ui.colors.danger
+	style.CornerRadius = 9
+	style.Inset = layout.Inset{Top: 10, Right: 12, Bottom: 10, Left: 12}
+	return style.Layout(gtx)
+}
+
+func (ui *ui) forgetButton(gtx layout.Context, button *widget.Clickable) layout.Dimensions {
+	style := material.Button(ui.theme, button, "Forget")
 	style.Background = ui.colors.surface
 	style.Color = ui.colors.danger
 	style.CornerRadius = 9
@@ -1359,7 +1494,7 @@ func (ui *ui) centeredMessage(gtx layout.Context, message string) layout.Dimensi
 func (ui *ui) footer(gtx layout.Context) layout.Dimensions {
 	text := "↑↓ Navigate    Enter Select    Esc Back"
 	if ui.screen == screenHome {
-		text = "↑↓ Navigate    Enter Switch/Attach    A SSH agent    D Detach    Esc Close"
+		text = "↑↓ Navigate    Enter Switch/Attach    A SSH agent    D Detach    F Forget    Esc Close"
 	} else if ui.screen == screenRemoteList {
 		text = "↑↓ Navigate    Enter Select    A Toggle SSH agent    Esc Back"
 	}

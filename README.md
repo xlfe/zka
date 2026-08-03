@@ -239,6 +239,7 @@ The difference between closing and detaching is intentional:
 | Confirm Kitty quit / tear down the whole view (remote workspace attached here) | Detach only this attachment; the origin's zmx sessions and other attachments survive. Kill explicitly with `zka workspace kill`. |
 | Kitty crash or lost control socket | Preserve the sessions and mark the attachment unhealthy. |
 | Kill a workspace | Persist cleanup intent, terminate its zmx sessions, and retry partial cleanup durably. |
+| Forget a detached remote workspace | Remove only this machine's cached metadata and generated Kitty sessions. The origin workspace and its processes survive and may reappear after a later reconnect. |
 | One backend dies | Restore a removable `zmx backend is dead` placeholder while other panes survive. |
 | Every backend dies | Close remaining managed views and reclaim the workspace. |
 
@@ -259,6 +260,7 @@ zka workspace move example-project
 zka workspace focus example-project --pane PANE_ID
 zka workspace seen example-project
 zka workspace detach example-project
+zka workspace forget devbox.example:example-project
 zka workspace rename example-project shell-work
 zka workspace kill shell-work
 ```
@@ -266,6 +268,13 @@ zka workspace kill shell-work
 `attach` and `move` are idempotent: repeating either command reuses the
 deterministic machine/workspace attachment instead of creating duplicates.
 `kill` is immediate and non-interactive.
+
+`forget` is the local-only cleanup for a cached remote workspace. Every local
+attachment must already be detached. An `SSH_ALIAS:` qualifier selects the
+matching entry in the local cache; the command does not open SSH, change SSH
+agent ownership, or stop anything on the origin. Reconnecting to that origin
+can discover and cache the workspace again. Use `kill` when you intend to
+destroy the authoritative workspace and its live processes.
 
 `create` births a workspace without launching Kitty, locally or on a remote
 origin (`SSH_ALIAS:NAME`; `SSH_ALIAS:` lets the origin pick a name). The
@@ -320,6 +329,7 @@ zka workspace inspect devbox.example:example-project
 zka workspace create devbox.example:api --attach
 zka workspace attach devbox.example:example-project
 zka workspace move devbox.example:example-project
+zka workspace forget devbox.example:example-project
 zka workspace rename devbox.example:example-project shell-work
 zka workspace kill devbox.example:shell-work
 ```

@@ -429,6 +429,78 @@ func TestWorkspaceRenameAndKillCLI(t *testing.T) {
 	}
 }
 
+func TestWorkspaceForgetCLIUsesOnlyTheLocalRemoteCache(t *testing.T) {
+	runner := quietRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &Workspace{
+		ID: remoteWorkspaceIDForTest, Name: "stale", Panes: map[string]*Pane{},
+		Attachments: map[string]*Attachment{"local": {
+			ID: "local", Endpoint: "unix:/kitty", Node: d.state.Node, Status: AttachmentDetached,
+		}},
+	}
+	if _, err := d.cacheRemoteWorkspace("devbox.example", remote); err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+
+	var stdout, stderr bytes.Buffer
+	code, err := runWorkspaceForget([]string{"devbox.example:" + remote.ID[:8]}, d.paths, &stdout, &stderr)
+	if err != nil || code != 0 || stdout.String() != remote.ID+"\tstale\tdevbox.example\n" {
+		t.Fatalf("qualified forget: code=%d err=%v stdout=%q stderr=%q", code, err, stdout.String(), stderr.String())
+	}
+	for _, call := range runner.Calls() {
+		if call.Name == "ssh" {
+			t.Fatalf("forget opened SSH: %#v", call)
+		}
+	}
+
+	if _, err := d.cacheRemoteWorkspace("devbox.example", remote); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code, err = runWorkspaceForget([]string{"stale"}, d.paths, &stdout, &stderr)
+	if err != nil || code != 0 || stdout.String() != remote.ID+"\tstale\tdevbox.example\n" {
+		t.Fatalf("unqualified forget: code=%d err=%v stdout=%q stderr=%q", code, err, stdout.String(), stderr.String())
+	}
+
+	local := createTestWorkspace(t, d, 1)
+	stdout.Reset()
+	stderr.Reset()
+	code, err = runWorkspaceForget([]string{local.ID}, d.paths, &stdout, &stderr)
+	if code != 1 || err == nil || !strings.Contains(err.Error(), "use workspace kill") {
+		t.Fatalf("local forget: code=%d err=%v stdout=%q stderr=%q", code, err, stdout.String(), stderr.String())
+	}
+}
+
+func TestWorkspaceForgetCLIValidatesCachedReference(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code, err := runWorkspaceForget(nil, Paths{}, &stdout, &stderr); code != 2 || err == nil {
+		t.Fatalf("missing ref: code=%d err=%v", code, err)
+	}
+	if code, err := runWorkspaceForget([]string{"devbox.example:"}, Paths{}, &stdout, &stderr); code != 2 || err == nil {
+		t.Fatalf("empty qualified ref: code=%d err=%v", code, err)
+	}
+
+	workspaces := []*Workspace{
+		{ID: remoteWorkspaceIDForTest, Name: "duplicate", RemoteHost: "devbox.example"},
+		{ID: secondRemoteWorkspaceIDForTest, Name: "duplicate", RemoteHost: "devbox.example"},
+		{ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Name: "duplicate", RemoteHost: "other.example"},
+	}
+	if got, err := resolveCachedWorkspaceFromCopies(workspaces, "devbox.example", remoteWorkspaceIDForTest); err != nil || got.ID != remoteWorkspaceIDForTest {
+		t.Fatalf("exact id resolution = %#v, %v", got, err)
+	}
+	if _, err := resolveCachedWorkspaceFromCopies(workspaces, "devbox.example", "duplicate"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous resolution error = %v", err)
+	}
+	if _, err := resolveCachedWorkspaceFromCopies(workspaces, "missing.example", "duplicate"); err == nil || !strings.Contains(err.Error(), "unknown cached workspace") {
+		t.Fatalf("wrong host resolution error = %v", err)
+	}
+}
+
 func TestWorkspaceReconcileHeadlessReconcilesBackends(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {

@@ -140,6 +140,14 @@ func detachArgs(workspace *zka.Workspace) []string {
 	return []string{"workspace", "detach", workspace.ID}
 }
 
+func forgetArgs(workspace *zka.Workspace) []string {
+	return []string{"workspace", "forget", workspace.RemoteHost + ":" + workspace.ID}
+}
+
+func workspaceForgettable(workspace *zka.Workspace, localNodeID string) bool {
+	return workspace != nil && workspace.RemoteHost != "" && !workspaceAttachedToNode(workspace, localNodeID)
+}
+
 func shortID(id string) string {
 	if len(id) <= 8 {
 		return id

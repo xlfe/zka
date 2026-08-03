@@ -385,6 +385,137 @@ func TestRemoteSnapshotEvictsMissingWorkspaceAndClosesLocalView(t *testing.T) {
 	})
 }
 
+func TestForgetDetachedRemoteWorkspaceCleansOnlyLocalState(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := "devbox.example"
+	remote := &Workspace{
+		ID: remoteWorkspaceIDForTest, Name: "stale", Origin: Host{ID: "origin", Name: host}, Revision: 4,
+		Panes: map[string]*Pane{"pane": {ID: "pane", Phase: PaneAdmitted}},
+		Attachments: map[string]*Attachment{"local": {
+			ID: "local", Endpoint: "unix:/kitty", Node: d.state.Node, Status: AttachmentDetached,
+		}},
+	}
+	sibling := &Workspace{
+		ID: secondRemoteWorkspaceIDForTest, Name: "keep", Origin: Host{ID: "origin", Name: host}, Revision: 2,
+		Panes: map[string]*Pane{}, Attachments: map[string]*Attachment{},
+	}
+	if _, err := d.cacheRemoteWorkspace(host, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.cacheRemoteWorkspace(host, sibling); err != nil {
+		t.Fatal(err)
+	}
+	sessionPath, err := d.store.WriteSession(remote.ID, "local", "launch\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.deleteWorkspace(remote.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.getWorkspace(remote.ID); err == nil {
+		t.Fatal("forgotten remote workspace remained in the local workspace list")
+	}
+	if _, err := d.getWorkspace(sibling.ID); err != nil {
+		t.Fatalf("sibling workspace was removed: %v", err)
+	}
+	d.mu.Lock()
+	cache := d.state.Remotes[host]
+	_, forgottenCached := cache.Workspaces[remote.ID]
+	_, siblingCached := cache.Workspaces[sibling.ID]
+	d.mu.Unlock()
+	if forgottenCached || !siblingCached {
+		t.Fatalf("remote cache after forget = %#v", cache.Workspaces)
+	}
+	if _, err := os.Stat(sessionPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("generated session still exists: %v", err)
+	}
+	if withdrawn := fakeDesktop(t, d).Withdrawn(); len(withdrawn) != 1 || withdrawn[0].Workspace != remote.ID || withdrawn[0].Pane != "pane" {
+		t.Fatalf("withdrawn notifications = %#v", withdrawn)
+	}
+
+	if err := d.deleteWorkspace(sibling.ID); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	_, hostCached := d.state.Remotes[host]
+	d.mu.Unlock()
+	if hostCached {
+		t.Fatal("empty remote host cache remained after forgetting its final workspace")
+	}
+	if _, err := d.cacheRemoteWorkspace(host, remote); err != nil {
+		t.Fatalf("forgotten workspace could not be rediscovered: %v", err)
+	}
+	if got, err := d.getWorkspace(remote.ID); err != nil || got.RemoteHost != host {
+		t.Fatalf("rediscovered workspace = %#v, %v", got, err)
+	}
+}
+
+func TestForgetRemoteWorkspaceRequiresEveryLocalAttachmentDetached(t *testing.T) {
+	for _, status := range []AttachmentStatus{AttachmentPreparing, AttachmentReady, AttachmentUnhealthy} {
+		t.Run(string(status), func(t *testing.T) {
+			d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+			if err != nil {
+				t.Fatal(err)
+			}
+			remote := &Workspace{
+				ID: remoteWorkspaceIDForTest, Name: "active", Panes: map[string]*Pane{},
+				Attachments: map[string]*Attachment{"local": {
+					ID: "local", Endpoint: "unix:/kitty", Node: d.state.Node, Status: status,
+				}},
+			}
+			if _, err := d.cacheRemoteWorkspace("devbox.example", remote); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.deleteWorkspace(remote.ID); err == nil || !strings.Contains(err.Error(), "detach it before forgetting") {
+				t.Fatalf("forget error = %v", err)
+			}
+			if _, err := d.getWorkspace(remote.ID); err != nil {
+				t.Fatalf("rejected workspace was removed: %v", err)
+			}
+			d.mu.Lock()
+			_, cached := d.state.Remotes["devbox.example"].Workspaces[remote.ID]
+			d.mu.Unlock()
+			if !cached {
+				t.Fatal("rejected workspace was removed from the remote cache")
+			}
+		})
+	}
+}
+
+func TestForgetRemoteWorkspaceRestoresStateWhenPersistenceFails(t *testing.T) {
+	root := t.TempDir()
+	d, err := newTestDaemon(t, root, quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &Workspace{
+		ID: remoteWorkspaceIDForTest, Name: "stale", Panes: map[string]*Pane{},
+		Attachments: map[string]*Attachment{"local": {
+			ID: "local", Endpoint: "unix:/kitty", Node: d.state.Node, Status: AttachmentDetached,
+		}},
+	}
+	if _, err := d.cacheRemoteWorkspace("devbox.example", remote); err != nil {
+		t.Fatal(err)
+	}
+	d.store.paths.StateFile = d.paths.StateDir
+	if err := d.deleteWorkspace(remote.ID); err == nil {
+		t.Fatal("forget succeeded despite an unwritable state target")
+	}
+	if _, err := d.getWorkspace(remote.ID); err != nil {
+		t.Fatalf("workspace was not restored after save failure: %v", err)
+	}
+	d.mu.Lock()
+	_, cached := d.state.Remotes["devbox.example"].Workspaces[remote.ID]
+	d.mu.Unlock()
+	if !cached {
+		t.Fatal("remote cache was not restored after save failure")
+	}
+}
+
 func TestRemoteCacheRejectsAuthoritativeLocalWorkspaceCollision(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {

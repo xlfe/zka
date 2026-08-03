@@ -75,6 +75,7 @@ func TestLocalWorkspaceItemsGroupAttachedBeforeDetached(t *testing.T) {
 
 func TestLauncherBuildsExistingCLICommandsWithoutAShell(t *testing.T) {
 	workspace := &zka.Workspace{ID: "0123456789abcdef", Name: "main"}
+	remoteWorkspace := &zka.Workspace{ID: workspace.ID, Name: workspace.Name, RemoteHost: "devbox.example"}
 	for _, test := range []struct {
 		name string
 		got  []string
@@ -87,10 +88,45 @@ func TestLauncherBuildsExistingCLICommandsWithoutAShell(t *testing.T) {
 		{name: "remote create", got: createRemoteArgs("devbox.example", " api "), want: []string{"workspace", "create", "devbox.example:api", "--attach"}},
 		{name: "remote create auto name", got: createRemoteArgs("devbox.example", "  "), want: []string{"workspace", "create", "devbox.example:", "--attach"}},
 		{name: "detach", got: detachArgs(workspace), want: []string{"workspace", "detach", workspace.ID}},
+		{name: "forget remote cache", got: forgetArgs(remoteWorkspace), want: []string{"workspace", "forget", "devbox.example:" + workspace.ID}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if !reflect.DeepEqual(test.got, test.want) {
 				t.Fatalf("args = %#v, want %#v", test.got, test.want)
+			}
+		})
+	}
+}
+
+func TestWorkspaceForgettableRequiresADetachedRemoteCopy(t *testing.T) {
+	const localNode = "local-node"
+	for _, test := range []struct {
+		name      string
+		workspace *zka.Workspace
+		want      bool
+	}{
+		{name: "nil", workspace: nil},
+		{name: "authoritative local", workspace: &zka.Workspace{ID: "local"}},
+		{name: "remote without a local attachment", workspace: &zka.Workspace{ID: "remote", RemoteHost: "devbox.example"}, want: true},
+		{name: "remote with detached local attachment", workspace: &zka.Workspace{
+			ID: "remote", RemoteHost: "devbox.example", Attachments: map[string]*zka.Attachment{"local": {
+				Node: zka.Host{ID: localNode}, Endpoint: "unix:/local.sock", Status: zka.AttachmentDetached,
+			}},
+		}, want: true},
+		{name: "remote with ready local attachment", workspace: &zka.Workspace{
+			ID: "remote", RemoteHost: "devbox.example", Attachments: map[string]*zka.Attachment{"local": {
+				Node: zka.Host{ID: localNode}, Endpoint: "unix:/local.sock", Status: zka.AttachmentReady,
+			}},
+		}},
+		{name: "remote with non-local attachment", workspace: &zka.Workspace{
+			ID: "remote", RemoteHost: "devbox.example", Attachments: map[string]*zka.Attachment{"other": {
+				Node: zka.Host{ID: "other-node"}, Endpoint: "unix:/other.sock", Status: zka.AttachmentReady,
+			}},
+		}, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := workspaceForgettable(test.workspace, localNode); got != test.want {
+				t.Fatalf("workspaceForgettable() = %t, want %t", got, test.want)
 			}
 		})
 	}

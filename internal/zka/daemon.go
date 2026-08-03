@@ -862,6 +862,9 @@ func (d *Daemon) deleteWorkspace(ref string) error {
 	if err != nil {
 		return err
 	}
+	if workspace.RemoteHost != "" {
+		return d.forgetRemoteWorkspaceLocked(workspace)
+	}
 	if len(workspace.Attachments) != 0 {
 		return fmt.Errorf("workspace %q has attachments and cannot be rollback-deleted", workspace.Name)
 	}
@@ -877,6 +880,54 @@ func (d *Daemon) deleteWorkspace(ref string) error {
 	}
 	d.agentRelays.remove(workspace.ID)
 	return d.store.RemoveWorkspaceSessions(workspace.ID)
+}
+
+// forgetRemoteWorkspaceLocked removes only this daemon's cached copy of a
+// remote workspace. The origin remains authoritative and is never contacted;
+// reconnecting to it may therefore cache the workspace again later.
+func (d *Daemon) forgetRemoteWorkspaceLocked(workspace *Workspace) error {
+	for _, attachment := range workspace.Attachments {
+		if attachment != nil && attachment.Node.ID == d.state.Node.ID &&
+			strings.HasPrefix(attachment.Endpoint, "unix:") && attachment.Status != AttachmentDetached {
+			return fmt.Errorf("workspace %q is attached on this machine; detach it before forgetting", workspace.Name)
+		}
+	}
+	if err := d.store.RemoveWorkspaceSessions(workspace.ID); err != nil {
+		return fmt.Errorf("remove generated sessions for workspace %q: %w", workspace.Name, err)
+	}
+
+	host := workspace.RemoteHost
+	cache, cachePresent := d.state.Remotes[host]
+	if cache == nil {
+		delete(d.state.Remotes, host)
+	} else {
+		updated := *cache
+		if cache.Workspaces != nil {
+			updated.Workspaces = make(map[string]*Workspace, len(cache.Workspaces))
+			for id, cached := range cache.Workspaces {
+				if id != workspace.ID {
+					updated.Workspaces[id] = cached
+				}
+			}
+		}
+		if len(updated.Workspaces) == 0 {
+			delete(d.state.Remotes, host)
+		} else {
+			d.state.Remotes[host] = &updated
+		}
+	}
+	delete(d.state.Workspaces, workspace.ID)
+	if err := d.store.Save(d.state); err != nil {
+		d.state.Workspaces[workspace.ID] = workspace
+		if cachePresent {
+			d.state.Remotes[host] = cache
+		} else {
+			delete(d.state.Remotes, host)
+		}
+		return err
+	}
+	d.closeDesktopNotifications(context.Background(), workspace, "")
+	return nil
 }
 
 func (d *Daemon) getWorkspace(ref string) (*Workspace, error) {

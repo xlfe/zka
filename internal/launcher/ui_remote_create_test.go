@@ -2,6 +2,7 @@ package launcher
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -14,12 +15,98 @@ import (
 
 type recordingLauncherBackend struct {
 	unavailableBackend
-	executed chan []string
+	executed   chan []string
+	executeErr error
 }
 
 func (b *recordingLauncherBackend) Execute(_ context.Context, args []string) error {
 	b.executed <- append([]string(nil), args...)
-	return nil
+	return b.executeErr
+}
+
+func TestForgetDetachedRemoteWorkspaceConfirmationFlow(t *testing.T) {
+	workspace := &zka.Workspace{ID: "0123456789abcdef", Name: "api", RemoteHost: "devbox.example"}
+	backend := &recordingLauncherBackend{executed: make(chan []string, 1)}
+	ui := newUI(backend)
+	ui.ctx = context.Background()
+	ui.window = new(app.Window)
+	ui.screen = screenHome
+	ui.local = []*zka.Workspace{workspace}
+	ui.selected = 2
+
+	ui.forgetSelection()
+	if ui.screen != screenForget || ui.forgetWorkspace != workspace {
+		t.Fatalf("forget action landed on screen %d with workspace %#v", ui.screen, ui.forgetWorkspace)
+	}
+	ui.back()
+	if ui.screen != screenHome || ui.forgetWorkspace != nil || ui.selected != 2 {
+		t.Fatalf("cancel returned screen=%d workspace=%#v selected=%d", ui.screen, ui.forgetWorkspace, ui.selected)
+	}
+
+	ui.forgetSelection()
+	ui.confirmForget()
+	if !ui.busy || ui.operationKind != resultForget {
+		t.Fatalf("confirm busy=%t operation=%d", ui.busy, ui.operationKind)
+	}
+	ui.back()
+	if ui.screen != screenForget {
+		t.Fatalf("back left the confirmation while forget was running: screen=%d", ui.screen)
+	}
+
+	select {
+	case got := <-backend.executed:
+		want := []string{"workspace", "forget", "devbox.example:0123456789abcdef"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("forget args = %#v, want %#v", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forget command did not execute")
+	}
+	select {
+	case result := <-ui.results:
+		ui.results <- result
+	case <-time.After(time.Second):
+		t.Fatal("forget command did not return a result")
+	}
+	ui.drainResults()
+	if ui.screen != screenHome || ui.forgetWorkspace != nil || ui.busy {
+		t.Fatalf("success left screen=%d workspace=%#v busy=%t", ui.screen, ui.forgetWorkspace, ui.busy)
+	}
+}
+
+func TestForgetDetachedRemoteWorkspaceFailureStaysOnConfirmation(t *testing.T) {
+	workspace := &zka.Workspace{ID: "0123456789abcdef", Name: "api", RemoteHost: "devbox.example"}
+	backend := &recordingLauncherBackend{
+		executed:   make(chan []string, 1),
+		executeErr: errors.New("workspace is still attached"),
+	}
+	ui := newUI(backend)
+	ui.ctx = context.Background()
+	ui.window = new(app.Window)
+	ui.screen = screenHome
+	ui.local = []*zka.Workspace{workspace}
+	ui.selected = 2
+	ui.forgetSelection()
+	ui.confirmForget()
+
+	select {
+	case <-backend.executed:
+	case <-time.After(time.Second):
+		t.Fatal("forget command did not execute")
+	}
+	select {
+	case result := <-ui.results:
+		ui.results <- result
+	case <-time.After(time.Second):
+		t.Fatal("forget command did not return a result")
+	}
+	ui.drainResults()
+	if ui.screen != screenForget || ui.forgetWorkspace != workspace || ui.busy {
+		t.Fatalf("failure left screen=%d workspace=%#v busy=%t", ui.screen, ui.forgetWorkspace, ui.busy)
+	}
+	if ui.errorMessage != "workspace is still attached" {
+		t.Fatalf("error = %q", ui.errorMessage)
+	}
 }
 
 func TestRemoteListSelectionIncludesCreateRow(t *testing.T) {

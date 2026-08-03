@@ -306,6 +306,8 @@ func runWorkspace(args []string, paths Paths, stdout, stderr io.Writer) (int, er
 		return runWorkspaceAttach(args[1:], paths, true, stdout, stderr)
 	case "detach":
 		return runWorkspaceDetach(args[1:], paths, stdout, stderr)
+	case "forget":
+		return runWorkspaceForget(args[1:], paths, stdout, stderr)
 	case "rename":
 		return runWorkspaceRename(args[1:], paths, stdout, stderr)
 	case "kill":
@@ -332,6 +334,7 @@ func printWorkspaceUsage(w io.Writer) {
   attach [SSH_ALIAS:]REF [--pane PANE] [--claim-agent]
   move [SSH_ALIAS:]REF [--pane PANE]
   detach REF
+  forget [SSH_ALIAS:]REF
   rename [SSH_ALIAS:]REF NAME
   kill [SSH_ALIAS:]REF
   focus REF [--pane PANE]
@@ -1248,6 +1251,70 @@ func detachWorkspaceAttachment(
 	}
 	remoteErr := operations.detachRemote(ctx, host, workspaceID, attachment)
 	return errors.Join(localErr, remoteErr)
+}
+
+func runWorkspaceForget(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("workspace forget", stderr)
+	if err := fs.Parse(args); err != nil {
+		return 2, err
+	}
+	if fs.NArg() != 1 {
+		return 2, fmt.Errorf("workspace forget requires one cached remote workspace reference")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	api := NewAPI(paths)
+	host, ref := splitWorkspaceRef(fs.Arg(0))
+	if ref == "" {
+		return 2, fmt.Errorf("workspace forget requires a workspace reference after the SSH host alias")
+	}
+	var workspace *Workspace
+	var err error
+	if host == "" {
+		workspace, err = api.Workspace(ctx, ref)
+	} else {
+		if err = validateSSHHost(host); err == nil {
+			var workspaces []*Workspace
+			workspaces, err = api.Workspaces(ctx)
+			if err == nil {
+				workspace, err = resolveCachedWorkspaceFromCopies(workspaces, host, ref)
+			}
+		}
+	}
+	if err != nil {
+		return 1, err
+	}
+	if workspace.RemoteHost == "" {
+		return 1, fmt.Errorf("workspace %q is authoritative on this host; use workspace kill to destroy it", workspace.Name)
+	}
+	if err := api.DeleteWorkspace(ctx, workspace.ID); err != nil {
+		return 1, err
+	}
+	fmt.Fprintf(stdout, "%s\t%s\t%s\n", workspace.ID, workspace.Name, workspace.RemoteHost)
+	return 0, nil
+}
+
+func resolveCachedWorkspaceFromCopies(workspaces []*Workspace, host, ref string) (*Workspace, error) {
+	var found *Workspace
+	for _, workspace := range workspaces {
+		if workspace == nil || workspace.RemoteHost != host {
+			continue
+		}
+		if workspace.ID == ref {
+			return workspace, nil
+		}
+		if workspace.Name != ref && !strings.HasPrefix(workspace.ID, ref) {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("cached workspace reference %q from %s is ambiguous", ref, host)
+		}
+		found = workspace
+	}
+	if found == nil {
+		return nil, fmt.Errorf("unknown cached workspace %q from %s", ref, host)
+	}
+	return found, nil
 }
 
 func runWorkspaceRename(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
