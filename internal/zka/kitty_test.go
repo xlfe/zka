@@ -20,6 +20,25 @@ func TestKittyFocusUsesStablePaneVariable(t *testing.T) {
 	}
 }
 
+func TestKittyPaneStateTitleRemainsChildControlled(t *testing.T) {
+	runner := &fakeRunner{}
+	kitty := KittyClient{Runner: runner, Command: "kitten-test"}
+	workspace := &Workspace{ID: "workspace"}
+	pane := &Pane{ID: "pane", Title: "shell", State: StateUnknown}
+	if err := kitty.SetPaneState(context.Background(), "unix:/kitty", RuntimeView{WindowID: 17}, workspace, pane); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := runner.Calls()
+	if len(calls) != 2 {
+		t.Fatalf("calls = %#v", calls)
+	}
+	joined := strings.Join(calls[1].Args, "|")
+	if !strings.Contains(joined, "set-window-title|--temporary|--match|id:17|--|[?] shell") {
+		t.Fatalf("pane title is not a temporary Kitty override: %#v", calls[1].Args)
+	}
+}
+
 func TestKittyCloseWorkspaceDoesNotWaitForFinalWindowResponse(t *testing.T) {
 	runner := &fakeRunner{handler: func(_ context.Context, _ string, args ...string) (string, string, error) {
 		if !strings.Contains(strings.Join(args, " "), "--no-response") {

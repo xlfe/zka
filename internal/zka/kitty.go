@@ -223,10 +223,11 @@ func (k KittyClient) SetPaneState(ctx context.Context, endpoint string, view Run
 		return err
 	}
 	title := strings.TrimSpace(stateMarker(pane.State) + " " + pane.Title)
-	// kitten expands ANSI-C escapes in the positional arguments of
-	// set-window-title, and refuses a positional that looks like an option, so
-	// the title is escaped and placed after "--".
-	_, err := k.rc(ctx, endpoint, "set-window-title", "--match", match, "--", ansiCEscape(title))
+	// Keep the title child-controlled. Without --temporary Kitty installs a
+	// permanent override, so a shell can no longer update it after chdir.
+	// kitten expands ANSI-C escapes in positional arguments and refuses one
+	// that looks like an option, so the title is escaped and placed after "--".
+	_, err := k.rc(ctx, endpoint, "set-window-title", "--temporary", "--match", match, "--", ansiCEscape(title))
 	return err
 }
 
