@@ -123,10 +123,54 @@ func TestNtfyEvidenceIsOptIn(t *testing.T) {
 			if strings.Contains(body, rawEvidence) != test.includeEvidence {
 				t.Fatalf("ntfy body evidence mismatch: %q", body)
 			}
-			if !test.includeEvidence && !strings.Contains(body, "State: error") {
+			if !test.includeEvidence && !strings.HasPrefix(body, "Agent stopped with an error.") {
 				t.Fatalf("redacted ntfy body lacks safe state summary: %q", body)
 			}
+			if test.includeEvidence && !strings.HasPrefix(body, rawEvidence) {
+				t.Fatalf("ntfy body did not put evidence first: %q", body)
+			}
+			if !strings.Contains(body, "Workspace: "+workspace.Name) || strings.Contains(body, workspace.ID) || strings.Contains(body, pane.ID) {
+				t.Fatalf("ntfy body does not use human workspace context: %q", body)
+			}
 		})
+	}
+}
+
+func TestNtfyPayloadLeadsWithHumanContextInsteadOfIdentifiers(t *testing.T) {
+	runner := quietRunner()
+	d, err := newTestDaemon(t, t.TempDir(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Notifications.NtfyIncludeEvidence = true
+	workspace := createTestWorkspace(t, d, 1)
+	workspace, pane := setPaneForNotificationWithDetail(t, d, workspace, StateBlocked, "turn-human",
+		"Review requested changes")
+	workspace.Name = "example-project"
+	workspace.Origin.Name = "devbox"
+	pane.Title = "review"
+	pane.Agent = "claude"
+
+	d.sendNtfy(context.Background(), workspace, pane)
+
+	call := firstCommand(runner.Calls(), "ntfy-send")
+	var title string
+	for index, arg := range call.Args {
+		if arg == "-T" && index+1 < len(call.Args) {
+			title = call.Args[index+1]
+			break
+		}
+	}
+	if title != "example-project needs input" {
+		t.Fatalf("ntfy title = %q", title)
+	}
+	body := call.Args[len(call.Args)-1]
+	want := "Review requested changes\n\nWorkspace: example-project · Pane: review · Origin: devbox"
+	if body != want {
+		t.Fatalf("ntfy body = %q, want %q", body, want)
+	}
+	if strings.Contains(body, workspace.ID) || strings.Contains(body, pane.ID) {
+		t.Fatalf("ntfy body exposed machine identifiers: %q", body)
 	}
 }
 

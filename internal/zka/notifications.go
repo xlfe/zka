@@ -3,7 +3,6 @@ package zka
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -55,32 +54,71 @@ func (p NotificationPolicy) enabled(channel string) bool {
 }
 
 func notificationTitle(workspace *Workspace, pane *Pane) string {
+	name := notificationWorkspaceName(workspace)
 	switch pane.State {
 	case StateBlocked:
-		return "zka: " + workspace.Name + " needs input"
+		return name + " needs input"
 	case StateError:
-		return "zka: " + workspace.Name + " failed"
+		return name + " failed"
 	case StateDone:
-		return "zka: " + workspace.Name + " finished"
+		return name + " finished"
 	default:
-		return "zka: " + workspace.Name
+		return name
 	}
 }
 
 func notificationBody(workspace *Workspace, pane *Pane, includeEvidence bool) string {
-	detail := "State: " + string(pane.State)
+	detail := notificationStateSummary(pane)
 	if includeEvidence {
-		detail = pane.Evidence.Detail
-		if detail == "" {
-			detail = pane.Evidence.Event
+		if evidence := strings.Join(strings.Fields(pane.Evidence.Detail), " "); evidence != "" {
+			detail = evidence
 		}
 	}
-	reference := workspace.ID
-	if workspace.RemoteHost != "" {
-		reference = workspace.RemoteHost + ":" + workspace.ID
+	context := []string{"Workspace: " + notificationWorkspaceName(workspace)}
+	if title := strings.TrimSpace(pane.Title); title != "" {
+		context = append(context, "Pane: "+title)
 	}
-	return fmt.Sprintf("%s\nOrigin: %s\nWorkspace: %s\nPane: %s\nOpen: zka workspace attach %s --pane %s",
-		detail, workspace.Origin.Name, workspace.ID, pane.ID, reference, pane.ID)
+	origin := strings.TrimSpace(workspace.Origin.Name)
+	if origin == "" {
+		origin = strings.TrimSpace(workspace.RemoteHost)
+	}
+	if origin != "" {
+		context = append(context, "Origin: "+origin)
+	}
+	return detail + "\n\n" + strings.Join(context, " · ")
+}
+
+func notificationWorkspaceName(workspace *Workspace) string {
+	if workspace == nil {
+		return "Workspace"
+	}
+	if name := strings.TrimSpace(workspace.Name); name != "" {
+		return name
+	}
+	if workspace.ID != "" {
+		return "Workspace " + shortID(workspace.ID)
+	}
+	return "Workspace"
+}
+
+func notificationStateSummary(pane *Pane) string {
+	agent := "Agent"
+	switch strings.ToLower(strings.TrimSpace(pane.Agent)) {
+	case "claude":
+		agent = "Claude"
+	case "codex":
+		agent = "Codex"
+	}
+	switch pane.State {
+	case StateBlocked:
+		return agent + " needs your input."
+	case StateError:
+		return agent + " stopped with an error."
+	case StateDone:
+		return agent + " finished."
+	default:
+		return agent + " status: " + string(pane.State) + "."
+	}
 }
 
 func (d *Daemon) afterTransition(ctx context.Context, before AgentState, workspace *Workspace, paneID string) {

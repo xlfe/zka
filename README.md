@@ -542,9 +542,12 @@ return without side effects outside a zka pane. Disable them with
 `ntfy-send` authentication remains in the helper's own configuration. zka never
 reads or transports its token.
 
-ntfy payloads omit raw agent evidence by default and include only a state summary
-plus workspace metadata. Set `notifications.ntfyIncludeEvidence = true` to include
-assistant output or tool descriptions; those details may contain sensitive data.
+ntfy titles begin with the workspace name and the message leads with a readable
+state summary, followed by the workspace, pane title, and origin names. Internal
+workspace and pane IDs are omitted. Set
+`notifications.ntfyIncludeEvidence = true` to put assistant output or tool
+descriptions first instead of the safe state summary; those details may contain
+sensitive data.
 
 ### Headless origin
 
