@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"math/rand"
+	"net/netip"
 	"os"
 	"os/exec"
 	"sort"
@@ -14,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/hashicorp/yamux"
 )
 
 type remoteEnvelope struct {
@@ -46,21 +51,87 @@ type paneReadinessResponse struct {
 	ClientReady  bool `json:"client_ready"`
 }
 
-type remoteAgentForwardingStatus struct {
-	Enabled         bool `json:"enabled"`
-	ForwardedSocket bool `json:"forwarded_socket"`
-	RelayVersion    int  `json:"relay_version"`
+type RemoteManager struct {
+	daemon           *Daemon
+	mu               sync.Mutex
+	clients          map[string]*remoteClient
+	terminalFailures map[string]credentialTransportView
+	closed           bool
 }
 
-type RemoteManager struct {
-	daemon  *Daemon
-	mu      sync.Mutex
-	clients map[string]*remoteClient
-	closed  bool
+func (m *RemoteManager) credentialTransportStatus() credentialTransportView {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	status := credentialTransportView{State: "idle"}
+	if len(m.clients) == 0 && len(m.terminalFailures) == 0 {
+		return status
+	}
+	for _, failure := range m.terminalFailures {
+		status = failure
+		break
+	}
+	for _, client := range m.clients {
+		client.mu.Lock()
+		candidate := credentialTransportView{State: "retrying", Attempts: client.retryAttempts, NextRetryAt: client.nextRetryAt}
+		if client.connected {
+			if client.credentialReady {
+				candidate.State = "ready"
+			} else {
+				candidate.State = "degraded"
+				candidate.LastError = client.credentialError
+			}
+		}
+		if client.terminal != nil {
+			candidate.State = "terminal"
+			candidate.LastError = client.terminal.Error()
+		} else if client.lastFailure != nil {
+			candidate.LastError = client.lastFailure.Error()
+		}
+		client.mu.Unlock()
+		if credentialTransportSeverity(candidate.State) > credentialTransportSeverity(status.State) {
+			status = candidate
+		}
+	}
+	return status
+}
+
+func (m *RemoteManager) credentialTransportStatusForHost(host string) credentialTransportView {
+	m.mu.Lock()
+	client := m.clients[host]
+	terminal := m.terminalFailures[host]
+	m.mu.Unlock()
+	if client == nil {
+		if terminal.State != "" {
+			return terminal
+		}
+		return credentialTransportView{State: "idle"}
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	status := credentialTransportView{State: "retrying", Attempts: client.retryAttempts, NextRetryAt: client.nextRetryAt}
+	if client.connected {
+		if client.credentialReady {
+			status.State = "ready"
+		} else {
+			status.State = "degraded"
+			status.LastError = client.credentialError
+		}
+	}
+	if client.terminal != nil {
+		status.State = "terminal"
+		status.LastError = client.terminal.Error()
+	} else if client.lastFailure != nil {
+		status.LastError = client.lastFailure.Error()
+	}
+	return status
+}
+
+func credentialTransportSeverity(state string) int {
+	return map[string]int{"idle": 0, "ready": 1, "retrying": 2, "degraded": 3, "terminal": 4}[state]
 }
 
 func NewRemoteManager(daemon *Daemon) *RemoteManager {
-	return &RemoteManager{daemon: daemon, clients: map[string]*remoteClient{}}
+	return &RemoteManager{daemon: daemon, clients: map[string]*remoteClient{}, terminalFailures: map[string]credentialTransportView{}}
 }
 
 func (m *RemoteManager) Close() {
@@ -88,6 +159,7 @@ func (m *RemoteManager) client(host string) (*remoteClient, error) {
 		m.mu.Unlock()
 		return client, nil
 	}
+	delete(m.terminalFailures, host)
 	client := newRemoteClient(m, host)
 	client.activeCalls = 1
 	m.clients[host] = client
@@ -126,10 +198,14 @@ func (m *RemoteManager) releaseClient(host string, client *remoteClient, callErr
 	m.mu.Lock()
 	client.mu.Lock()
 	client.activeCalls--
-	terminalFailure := client.terminal != nil && errors.Is(callErr, client.terminal)
+	terminalFailure := client.terminal != nil && callErr != nil &&
+		(errors.Is(callErr, client.terminal) || callErr.Error() == client.terminal.Error())
 	abandonInitial := client.activeCalls == 0 && !client.everConnected &&
 		(errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded))
 	if m.clients[host] == client && (terminalFailure || abandonInitial) {
+		if terminalFailure {
+			m.terminalFailures[host] = credentialTransportView{State: "terminal", LastError: client.terminal.Error()}
+		}
 		delete(m.clients, host)
 	}
 	client.mu.Unlock()
@@ -259,21 +335,26 @@ type remoteClient struct {
 	manager *RemoteManager
 	host    string
 
-	mu            sync.Mutex
-	writeMu       sync.Mutex
-	stdin         io.WriteCloser
-	encoder       *json.Encoder
-	process       *exec.Cmd
-	connected     bool
-	everConnected bool
-	activeCalls   int
-	terminal      error
-	lastFailure   error
-	stateCh       chan struct{}
-	pending       map[string]chan remoteEnvelope
-	sequence      atomic.Uint64
-	stopCh        chan struct{}
-	stopOnce      sync.Once
+	mu              sync.Mutex
+	writeMu         sync.Mutex
+	stdin           io.WriteCloser
+	encoder         *json.Encoder
+	session         *yamux.Session
+	process         *exec.Cmd
+	connected       bool
+	credentialReady bool
+	credentialError string
+	everConnected   bool
+	activeCalls     int
+	terminal        error
+	lastFailure     error
+	retryAttempts   int
+	nextRetryAt     time.Time
+	stateCh         chan struct{}
+	pending         map[string]chan remoteEnvelope
+	sequence        atomic.Uint64
+	stopCh          chan struct{}
+	stopOnce        sync.Once
 }
 
 func newRemoteClient(manager *RemoteManager, host string) *remoteClient {
@@ -308,25 +389,69 @@ func (c *remoteClient) supervise(ctx context.Context) {
 		}
 		cmd, stdin, stdout, stderr, err := c.startSSH(ctx)
 		if err != nil {
-			c.setTerminal(fmt.Errorf("start SSH control connection to %s: %w", c.host, err))
-			return
+			failure := fmt.Errorf("start SSH control connection to %s: %w", c.host, err)
+			if remoteStartTerminal(err) {
+				c.setTerminal(failure)
+				return
+			}
+			c.disconnected(failure)
+			if !c.waitToRetry(ctx, backoff) {
+				return
+			}
+			backoff = nextRemoteBackoff(backoff)
+			continue
+		}
+		session, err := yamux.Client(newStdioConn(stdout, stdin), remoteYamuxConfig())
+		if err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			failure := fmt.Errorf("start remote multiplexed session to %s: %w", c.host, err)
+			c.disconnected(failure)
+			if !c.waitToRetry(ctx, backoff) {
+				return
+			}
+			backoff = nextRemoteBackoff(backoff)
+			continue
+		}
+		control, err := session.Open()
+		if err != nil {
+			_ = session.Close()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			failure := fmt.Errorf("open remote control stream to %s: %w", c.host, err)
+			c.disconnected(failure)
+			if !c.waitToRetry(ctx, backoff) {
+				return
+			}
+			backoff = nextRemoteBackoff(backoff)
+			continue
 		}
 		c.mu.Lock()
-		c.process, c.stdin, c.encoder = cmd, stdin, json.NewEncoder(stdin)
+		c.process, c.stdin, c.session = cmd, control, session
+		c.encoder = json.NewEncoder(chunkedWriter{w: control})
 		c.mu.Unlock()
 		readerDone := make(chan struct{})
 		if !c.manager.daemon.startWorker(func(workerCtx context.Context) {
 			defer close(readerDone)
-			c.readLoop(workerCtx, stdout)
+			c.readLoop(workerCtx, control)
 		}) {
 			close(readerDone)
 		}
+		if !c.manager.daemon.startWorker(func(workerCtx context.Context) {
+			c.acceptCredentialStreams(workerCtx, session)
+		}) {
+			_ = session.Close()
+		}
 		waitErr := cmd.Wait()
+		_ = session.Close()
 		<-readerDone
 		c.mu.Lock()
 		wasConnected := c.connected
-		everConnected := c.everConnected
+		terminal := c.terminal
 		c.mu.Unlock()
+		if terminal != nil {
+			return
+		}
 		failure := sshConnectionError(c.host, waitErr, stderr.String())
 		c.disconnected(failure)
 		if wasConnected {
@@ -341,28 +466,71 @@ func (c *remoteClient) supervise(ctx context.Context) {
 		default:
 		}
 		c.manager.daemon.logger.Printf("%v", failure)
-		if sshExitCode(waitErr) != 255 {
+		if remoteSSHTerminal(waitErr, stderr.String()) {
 			c.setTerminal(failure)
 			return
 		}
-		if !everConnected {
-			c.setTerminal(failure)
+		if !c.waitToRetry(ctx, backoff) {
 			return
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-c.stopCh:
-			return
-		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
-		}
+		backoff = nextRemoteBackoff(backoff)
 	}
+}
+
+func (c *remoteClient) waitToRetry(ctx context.Context, backoff time.Duration) bool {
+	delay := remoteBackoffDelay(backoff)
+	c.mu.Lock()
+	c.retryAttempts++
+	c.nextRetryAt = time.Now().UTC().Add(delay)
+	c.signalStateLocked()
+	c.mu.Unlock()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-c.stopCh:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func nextRemoteBackoff(backoff time.Duration) time.Duration {
+	if backoff >= 30*time.Second {
+		return 30 * time.Second
+	}
+	backoff *= 2
+	if backoff > 30*time.Second {
+		return 30 * time.Second
+	}
+	return backoff
+}
+
+func remoteBackoffDelay(backoff time.Duration) time.Duration {
+	if backoff <= 0 {
+		backoff = 250 * time.Millisecond
+	}
+	half := backoff / 2
+	return half + time.Duration(rand.Int63n(int64(half)+1))
+}
+
+func remoteStartTerminal(err error) bool {
+	var execErr *exec.Error
+	return errors.As(err, &execErr) || errors.Is(err, fs.ErrNotExist)
+}
+
+func remoteSSHTerminal(waitErr error, stderr string) bool {
+	detail := strings.ToLower(stderr)
+	if sshExitCode(waitErr) == 127 || strings.Contains(detail, "zka: command not found") || strings.Contains(detail, "zka: not found") {
+		return true
+	}
+	return strings.Contains(detail, "permission denied") ||
+		strings.Contains(detail, "authentication failed") ||
+		strings.Contains(detail, "no supported authentication methods") ||
+		strings.Contains(detail, "host key verification failed") ||
+		strings.Contains(detail, "remote host identification has changed") ||
+		strings.Contains(detail, "no matching host key type")
 }
 
 func (c *remoteClient) startSSH(ctx context.Context) (*exec.Cmd, io.WriteCloser, io.ReadCloser, *boundedTailBuffer, error) {
@@ -393,13 +561,8 @@ func (c *remoteClient) readLoop(ctx context.Context, input io.Reader) {
 		if err != nil {
 			return
 		}
-		if message.Protocol != remoteProtocolName || message.Version != protocolVersion {
-			c.setTerminal(fmt.Errorf("remote %s uses incompatible protocol %q version %d (local requires %d; upgrade zka on both machines)", c.host, message.Protocol, message.Version, protocolVersion))
-			c.mu.Lock()
-			if c.process != nil && c.process.Process != nil {
-				_ = c.process.Process.Kill()
-			}
-			c.mu.Unlock()
+		if message.Protocol != remoteProtocolName || message.Version != remoteProtocolVersion {
+			c.setTerminal(fmt.Errorf("remote %s uses incompatible protocol %q version %d (local requires %d; upgrade zka on both machines)", c.host, message.Protocol, message.Version, remoteProtocolVersion))
 			return
 		}
 		if first {
@@ -408,16 +571,59 @@ func (c *remoteClient) readLoop(ctx context.Context, input io.Reader) {
 				c.setTerminal(fmt.Errorf("remote %s did not send a hello", c.host))
 				return
 			}
+			var serverHello remoteServerHello
+			if err := json.Unmarshal(message.Payload, &serverHello); err != nil || serverHello.Node.ID == "" {
+				c.setTerminal(fmt.Errorf("remote %s sent an invalid node identity", c.host))
+				return
+			}
+			if c.manager.daemon.config.credentialsEnabled() {
+				expected := c.manager.daemon.config.SSH.ExpectedNodeIDs[c.host]
+				if expected == "" {
+					c.setTerminal(fmt.Errorf("remote %s is not pinned in ssh.expected_node_ids", c.host))
+					return
+				}
+				if serverHello.Node.ID != expected {
+					c.setTerminal(fmt.Errorf("remote %s node id mismatch: got %s, expected %s", c.host, serverHello.Node.ID, expected))
+					return
+				}
+			}
+			payload, err := json.Marshal(remoteClientHello{Node: c.manager.daemon.state.Node})
+			if err != nil {
+				c.setTerminal(fmt.Errorf("encode remote client hello: %w", err))
+				return
+			}
+			c.writeMu.Lock()
+			err = c.encoder.Encode(remoteEnvelope{
+				Protocol: remoteProtocolName, Version: remoteProtocolVersion,
+				Type: "client_hello", Payload: payload,
+			})
+			c.writeMu.Unlock()
+			if err != nil {
+				return
+			}
 			c.mu.Lock()
 			c.connected = true
+			c.credentialReady = false
+			c.credentialError = "credential provider identity handshake is pending"
 			c.everConnected = true
 			c.terminal = nil
-			c.lastFailure = nil
+			c.retryAttempts = 0
+			c.nextRetryAt = time.Time{}
 			c.signalStateLocked()
 			c.mu.Unlock()
 			continue
 		}
 		switch message.Type {
+		case "client_hello_ack":
+			c.mu.Lock()
+			c.credentialReady = message.Error == ""
+			c.credentialError = message.Error
+			// A complete application handshake proves the replacement SSH
+			// connection is usable; until then preserve the prior failure so a
+			// caller deadline is not stripped of the reconnect cause.
+			c.lastFailure = nil
+			c.signalStateLocked()
+			c.mu.Unlock()
 		case "response":
 			c.mu.Lock()
 			waiter := c.pending[message.ID]
@@ -440,8 +646,10 @@ func (c *remoteClient) readLoop(ctx context.Context, input io.Reader) {
 func (c *remoteClient) disconnected(cause error) {
 	c.mu.Lock()
 	c.connected = false
+	c.credentialReady = false
+	c.credentialError = ""
 	c.lastFailure = cause
-	c.process, c.stdin, c.encoder = nil, nil, nil
+	c.process, c.stdin, c.encoder, c.session = nil, nil, nil, nil
 	for id, waiter := range c.pending {
 		delete(c.pending, id)
 		waiter <- remoteEnvelope{Error: errRemoteDisconnected.Error()}
@@ -450,13 +658,40 @@ func (c *remoteClient) disconnected(cause error) {
 	c.mu.Unlock()
 }
 
+func (c *remoteClient) acceptCredentialStreams(ctx context.Context, session *yamux.Session) {
+	for {
+		stream, err := session.AcceptStreamWithContext(ctx)
+		if err != nil {
+			return
+		}
+		if !c.manager.daemon.startWorker(func(workerCtx context.Context) {
+			defer stream.Close()
+			c.manager.daemon.handleCredentialStream(workerCtx, c.host, stream)
+		}) {
+			_ = stream.Close()
+			return
+		}
+	}
+}
+
 func (c *remoteClient) setTerminal(err error) {
 	c.mu.Lock()
+	var process *os.Process
+	if c.process != nil {
+		process = c.process.Process
+	}
 	c.terminal = err
 	c.lastFailure = err
 	c.connected = false
+	for id, waiter := range c.pending {
+		delete(c.pending, id)
+		waiter <- remoteEnvelope{Error: err.Error()}
+	}
 	c.signalStateLocked()
 	c.mu.Unlock()
+	if process != nil {
+		_ = process.Kill()
+	}
 }
 
 func (c *remoteClient) call(ctx context.Context, op string, payload json.RawMessage) (json.RawMessage, error) {
@@ -473,7 +708,7 @@ func (c *remoteClient) call(ctx context.Context, op string, payload json.RawMess
 			c.pending[id] = waiter
 			encoder := c.encoder
 			c.mu.Unlock()
-			message := remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "request", ID: id, Op: op, Payload: payload}
+			message := remoteEnvelope{Protocol: remoteProtocolName, Version: remoteProtocolVersion, Type: "request", ID: id, Op: op, Payload: payload}
 			c.writeMu.Lock()
 			err := encoder.Encode(message)
 			c.writeMu.Unlock()
@@ -596,11 +831,30 @@ func (w *remoteControlWriter) send(message remoteEnvelope) error {
 }
 
 func runRemoteControl(ctx context.Context, paths Paths, stdin io.Reader, stdout io.Writer) error {
-	writer := &remoteControlWriter{enc: json.NewEncoder(stdout)}
-	if err := writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "hello", Capabilities: []string{"workspace-snapshots", "events", "two-phase-move", "revocation", "workspace-lifecycle", "ssh-agent-relay-v1", "topology-replica-v1", "workspace-create"}}); err != nil {
+	return runRemoteControlSession(ctx, paths, stdin, stdout, nil, "")
+}
+
+func runRemoteControlSession(ctx context.Context, paths Paths, stdin io.Reader, stdout io.Writer, session *yamux.Session, sshConnection string) error {
+	api := NewAPI(paths)
+	node, err := api.Node(ctx)
+	if err != nil {
 		return err
 	}
-	api := NewAPI(paths)
+	helloPayload, err := json.Marshal(remoteServerHello{Node: node})
+	if err != nil {
+		return err
+	}
+	writer := &remoteControlWriter{enc: json.NewEncoder(chunkedWriter{w: stdout})}
+	if err := writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: remoteProtocolVersion, Type: "hello", Capabilities: []string{"workspace-snapshots", "events", "two-phase-move", "revocation", "workspace-lifecycle", "stream-mux-v1", "credential-bundles-v1", "topology-replica-v1", "workspace-create"}, Payload: helloPayload}); err != nil {
+		return err
+	}
+	var credentialTargets *credentialTargetSession
+	credentialIdentityErr := errors.New("credential provider identity handshake has not completed")
+	defer func() {
+		if credentialTargets != nil {
+			credentialTargets.close()
+		}
+	}()
 	watchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	watchDone := make(chan struct{})
@@ -621,9 +875,44 @@ func runRemoteControl(ctx context.Context, paths Paths, stdin io.Reader, stdout 
 			<-watchDone
 			return err
 		}
-		response := remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "response", ID: message.ID}
-		if message.Protocol != remoteProtocolName || message.Version != protocolVersion || message.Type != "request" {
+		if message.Type == "client_hello" {
+			if session == nil || credentialTargets != nil || message.Protocol != remoteProtocolName || message.Version != remoteProtocolVersion {
+				continue
+			}
+			var hello remoteClientHello
+			if json.Unmarshal(message.Payload, &hello) != nil || hello.Node.ID == "" {
+				continue
+			}
+			cfg, configErr := LoadConfig()
+			credentialIdentityErr = configErr
+			if credentialIdentityErr == nil && !cfg.credentialsEnabled() {
+				credentialIdentityErr = errors.New("credential bundles are not configured on the target")
+			}
+			if credentialIdentityErr == nil {
+				credentialIdentityErr = authenticateCredentialProvider(cfg, hello.Node, sshConnection)
+			}
+			if credentialIdentityErr == nil {
+				targets, targetErr := newCredentialTargetSession(ctx, paths, session, hello.Node)
+				if targetErr != nil {
+					credentialIdentityErr = targetErr
+				} else {
+					credentialTargets = targets
+				}
+			}
+			ack := remoteEnvelope{Protocol: remoteProtocolName, Version: remoteProtocolVersion, Type: "client_hello_ack"}
+			if credentialIdentityErr != nil {
+				ack.Error = credentialIdentityErr.Error()
+			}
+			if err := writer.send(ack); err != nil {
+				return err
+			}
+			continue
+		}
+		response := remoteEnvelope{Protocol: remoteProtocolName, Version: remoteProtocolVersion, Type: "response", ID: message.ID}
+		if message.Protocol != remoteProtocolName || message.Version != remoteProtocolVersion || message.Type != "request" {
 			response.Error = "incompatible remote request"
+		} else if message.Op == "credentials_claim" && credentialIdentityErr != nil {
+			response.Error = credentialIdentityErr.Error()
 		} else {
 			response.Payload, err = dispatchRemoteControl(ctx, api, message.Op, message.Payload)
 			if err != nil {
@@ -637,6 +926,43 @@ func runRemoteControl(ctx context.Context, paths Paths, stdin io.Reader, stdout 
 			return err
 		}
 	}
+}
+
+func authenticateCredentialProvider(cfg Config, claimed Host, sshConnection string) error {
+	providerName := ""
+	var provider CredentialProviderConfig
+	for name, configured := range cfg.Credentials.Providers {
+		if configured.NodeID == claimed.ID {
+			providerName, provider = name, configured
+			break
+		}
+	}
+	if providerName == "" {
+		return fmt.Errorf("credential provider node %s is not configured", claimed.ID)
+	}
+	// The node allowlist is mandatory. Source-address restrictions are an
+	// optional additional constraint for fixed hosts; omitting them permits a
+	// provider to roam without weakening the fail-closed unknown-node rule.
+	if len(provider.SSHSourceAddresses) == 0 {
+		return nil
+	}
+	// SSH_CONNECTION is populated by sshd for this authenticated session.
+	fields := strings.Fields(sshConnection)
+	if len(fields) != 4 {
+		return fmt.Errorf("SSH_CONNECTION is unavailable; cannot bind credential provider node %s to the SSH session", claimed.ID)
+	}
+	source, err := netip.ParseAddr(fields[0])
+	if err != nil {
+		return fmt.Errorf("invalid SSH client address %q", fields[0])
+	}
+	source = source.Unmap()
+	for _, configured := range provider.SSHSourceAddresses {
+		network, parseErr := parseCredentialSourceNetwork(configured)
+		if parseErr == nil && network.Contains(source) {
+			return nil
+		}
+	}
+	return fmt.Errorf("credential provider %q node %s is not allowed from SSH source address %s", providerName, claimed.ID, source)
 }
 
 func streamRemoteEvents(ctx context.Context, api API, writer *remoteControlWriter) {
@@ -661,7 +987,7 @@ func streamRemoteEvents(ctx context.Context, api API, writer *remoteControlWrite
 		if err == nil {
 			if first {
 				payload, _ := json.Marshal(workspaces)
-				if writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "event", Op: "snapshot", Payload: payload}) != nil {
+				if writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: remoteProtocolVersion, Type: "event", Op: "snapshot", Payload: payload}) != nil {
 					return
 				}
 				for _, workspace := range workspaces {
@@ -678,7 +1004,7 @@ func streamRemoteEvents(ctx context.Context, api API, writer *remoteControlWrite
 				}
 				seen[workspace.ID] = fingerprint
 				payload, _ := json.Marshal(workspace)
-				if writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "event", Op: "workspace", Payload: payload}) != nil {
+				if writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: remoteProtocolVersion, Type: "event", Op: "workspace", Payload: payload}) != nil {
 					return
 				}
 			}
@@ -688,7 +1014,7 @@ func streamRemoteEvents(ctx context.Context, api API, writer *remoteControlWrite
 				}
 				delete(seen, id)
 				payload, _ := json.Marshal(workspaceDeletionResponse{DeletedWorkspaceID: id})
-				if writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "event", Op: "deleted_workspace", Payload: payload}) != nil {
+				if writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: remoteProtocolVersion, Type: "event", Op: "deleted_workspace", Payload: payload}) != nil {
 					return
 				}
 			}
@@ -709,21 +1035,6 @@ func remoteWorkspaceFingerprint(workspace *Workspace) string {
 func dispatchRemoteControl(ctx context.Context, api API, op string, raw json.RawMessage) (json.RawMessage, error) {
 	var value any
 	switch op {
-	case "agent_forwarding":
-		cfg, err := LoadConfig()
-		if err != nil {
-			return nil, err
-		}
-		forwarded := false
-		if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
-			if conn, dialErr := dialAgentSocket(socket); dialErr == nil {
-				forwarded = true
-				_ = conn.Close()
-			}
-		}
-		value = remoteAgentForwardingStatus{
-			Enabled: cfg.SSH.ForwardAgent, ForwardedSocket: forwarded, RelayVersion: agentRelayVersion,
-		}
 	case "list":
 		workspaces, err := authoritativeWorkspaces(ctx, api)
 		value = workspaces
@@ -892,41 +1203,40 @@ func dispatchRemoteControl(ctx context.Context, api API, op string, raw json.Raw
 		if err != nil {
 			return nil, err
 		}
-	case "workspace_agent_claim":
-		var req workspaceAgentRequest
+	case "credentials_claim":
+		var req workspaceCredentialRequest
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
 		}
 		if err := requireAuthoritative(ctx, api, req.Workspace); err != nil {
 			return nil, err
 		}
-		status, err := api.ClaimWorkspaceAgent(ctx, req.Workspace, req.Attachment)
+		status, err := api.ClaimWorkspaceCredentials(ctx, req)
 		value = status
 		if err != nil {
 			return nil, err
 		}
-	case "workspace_agent_release":
-		var req workspaceAgentRequest
+	case "credentials_release":
+		var req workspaceCredentialRequest
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
 		}
 		if err := requireAuthoritative(ctx, api, req.Workspace); err != nil {
 			return nil, err
 		}
-		status, err := api.ReleaseWorkspaceAgent(ctx, req.Workspace)
+		status, err := api.ReleaseWorkspaceCredentials(ctx, req.Workspace)
 		value = status
 		if err != nil {
 			return nil, err
 		}
-	case "workspace_agent_status":
-		var req workspaceAgentRequest
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
+	case "credentials_status":
+		var req workspaceCredentialRequest
+		if len(raw) != 0 {
+			if err := json.Unmarshal(raw, &req); err != nil {
+				return nil, err
+			}
 		}
-		if err := requireAuthoritative(ctx, api, req.Workspace); err != nil {
-			return nil, err
-		}
-		status, err := api.WorkspaceAgentStatus(ctx, req.Workspace)
+		status, err := api.CredentialStatus(ctx, req.Workspace)
 		value = status
 		if err != nil {
 			return nil, err

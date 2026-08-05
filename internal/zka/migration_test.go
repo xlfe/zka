@@ -9,6 +9,33 @@ import (
 	"time"
 )
 
+func TestSchemaSixMigrationWritesRollbackBackup(t *testing.T) {
+	paths := testPaths(t.TempDir())
+	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := newStateData()
+	state.SchemaVersion = 6
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.StateFile, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := NewStore(paths).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SchemaVersion != stateSchemaVersion {
+		t.Fatalf("schema = %d, want %d", loaded.SchemaVersion, stateSchemaVersion)
+	}
+	backup, err := os.ReadFile(paths.StateFile + ".v6.backup")
+	if err != nil || string(backup) != string(encoded) {
+		t.Fatalf("v6 migration backup missing or wrong: %v", err)
+	}
+}
+
 // wedgedV5State reproduces the shape of the real outage: schema 5, a workspace
 // whose desired topology contains a fabricated "Recovered" tab with no
 // enabled_layouts and no layout_state, and an attachment stuck one generation

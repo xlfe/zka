@@ -133,43 +133,44 @@ func TestRemoteListSelectionIncludesCreateRow(t *testing.T) {
 	}
 }
 
-func TestRemoteAttachAndCreateCanClaimThisMachinesAgent(t *testing.T) {
+func TestRemoteAttachAndCreateCanClaimCredentialBundle(t *testing.T) {
 	workspace := &zka.Workspace{ID: "aaaa", Name: "api"}
-	if got, want := remoteAttachArgs("devbox.example", workspace, true),
-		[]string{"workspace", "attach", "devbox.example:aaaa", "--claim-agent"}; !reflect.DeepEqual(got, want) {
+	if got, want := remoteAttachArgs("devbox.example", workspace, true, "work"),
+		[]string{"workspace", "attach", "devbox.example:aaaa", "--claim-credentials", "--credential-bundle", "work"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("remote attach args = %#v, want %#v", got, want)
 	}
-	if got, want := remoteCreateArgs("devbox.example", " api ", true),
-		[]string{"workspace", "create", "devbox.example:api", "--attach", "--claim-agent"}; !reflect.DeepEqual(got, want) {
+	if got, want := remoteCreateArgs("devbox.example", " api ", true, "work"),
+		[]string{"workspace", "create", "devbox.example:api", "--attach", "--claim-credentials", "--credential-bundle", "work"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("remote create args = %#v, want %#v", got, want)
 	}
-	if got, want := remoteAttachArgs("devbox.example", workspace, false),
+	if got, want := remoteAttachArgs("devbox.example", workspace, false, ""),
 		[]string{"workspace", "attach", "devbox.example:aaaa"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("plain remote attach args = %#v, want %#v", got, want)
 	}
 }
 
-func TestRemoteListAgentShortcutTogglesExplicitClaimChoice(t *testing.T) {
+func TestRemoteListCredentialShortcutTogglesExplicitClaimChoice(t *testing.T) {
 	ui := newUI(nil)
 	ui.screen = screenRemoteList
-	ui.agentForwarding = true
+	ui.credentialsEnabled = true
+	ui.defaultBundle = "work"
 
-	ui.toggleAgentSelection()
-	if !ui.remoteAgent.Value {
-		t.Fatal("agent shortcut did not enable the remote claim choice")
+	ui.toggleCredentialSelection()
+	if !ui.remoteCredentials.Value {
+		t.Fatal("credential shortcut did not enable the remote claim choice")
 	}
-	ui.toggleAgentSelection()
-	if ui.remoteAgent.Value {
-		t.Fatal("agent shortcut did not disable the remote claim choice")
+	ui.toggleCredentialSelection()
+	if ui.remoteCredentials.Value {
+		t.Fatal("credential shortcut did not disable the remote claim choice")
 	}
-	ui.agentForwarding = false
-	ui.toggleAgentSelection()
-	if ui.remoteAgent.Value {
-		t.Fatal("agent shortcut enabled a locally disabled forwarding configuration")
+	ui.defaultBundle = ""
+	ui.toggleCredentialSelection()
+	if ui.remoteCredentials.Value {
+		t.Fatal("credential shortcut enabled without a default bundle")
 	}
 }
 
-func TestRemoteWorkspaceAgentOwnershipAndActions(t *testing.T) {
+func TestRemoteWorkspaceCredentialOwnershipAndActions(t *testing.T) {
 	workspace := &zka.Workspace{
 		ID: "0123456789abcdef", Name: "api", RemoteHost: "devbox.example",
 		Attachments: map[string]*zka.Attachment{
@@ -177,32 +178,33 @@ func TestRemoteWorkspaceAgentOwnershipAndActions(t *testing.T) {
 			"other": {ID: "other", Node: zka.Host{ID: "other-node", Name: "desktop"}},
 		},
 	}
-	if got, want := workspaceSSHAgentSummary(workspace, workspace.RemoteHost, "local-node"), "SSH agent: origin"; got != want {
+	if got, want := workspaceCredentialSummary(workspace, workspace.RemoteHost, "local-node"), "Credentials: unclaimed"; got != want {
 		t.Fatalf("origin summary = %q, want %q", got, want)
 	}
-	workspace.AgentAttachmentID = "local"
-	if got, want := workspaceSSHAgentSummary(workspace, workspace.RemoteHost, "local-node"), "SSH agent: this machine"; got != want {
+	workspace.CredentialClaim = &zka.CredentialClaim{Bundle: "work", OwnerAttachmentID: "local", OwnerNodeID: "local-node", Capabilities: map[string]zka.CredentialCapabilityStatus{"ssh-agent": {State: "ready", Available: true}}}
+	if got, want := workspaceCredentialSummary(workspace, workspace.RemoteHost, "local-node"), "Credentials: work (ssh-agent ready) · this machine"; got != want {
 		t.Fatalf("local summary = %q, want %q", got, want)
 	}
-	if args, status := workspaceAgentAction(workspace, "local-node"); !reflect.DeepEqual(args,
-		[]string{"workspace", "agent", "release", "devbox.example:0123456789abcdef"}) || status != "Releasing the SSH agent from" {
+	if args, status := workspaceCredentialAction(workspace, "local-node"); !reflect.DeepEqual(args,
+		[]string{"workspace", "credentials", "release", "devbox.example:0123456789abcdef"}) || status != "Releasing credentials from" {
 		t.Fatalf("release action = %#v, %q", args, status)
 	}
-	workspace.AgentAttachmentID = "other"
-	if got, want := workspaceSSHAgentSummary(workspace, workspace.RemoteHost, "local-node"), "SSH agent: desktop"; got != want {
+	workspace.CredentialClaim.OwnerAttachmentID = "other"
+	workspace.CredentialClaim.OwnerNodeID = "other-node"
+	if got, want := workspaceCredentialSummary(workspace, workspace.RemoteHost, "local-node"), "Credentials: work (ssh-agent ready) · desktop"; got != want {
 		t.Fatalf("other summary = %q, want %q", got, want)
 	}
-	if args, status := workspaceAgentAction(workspace, "local-node"); !reflect.DeepEqual(args,
-		[]string{"workspace", "agent", "claim", "devbox.example:0123456789abcdef"}) || status != "Using this machine's SSH agent for" {
+	if args, status := workspaceCredentialAction(workspace, "local-node"); !reflect.DeepEqual(args,
+		[]string{"workspace", "credentials", "claim", "devbox.example:0123456789abcdef"}) || status != "Claiming credentials for" {
 		t.Fatalf("claim action = %#v, %q", args, status)
 	}
 }
 
-func TestDetachedRemoteWorkspaceCanAttachAndClaimAgentInOneAction(t *testing.T) {
+func TestDetachedRemoteWorkspaceCanAttachAndClaimCredentialsInOneAction(t *testing.T) {
 	const localNode = "local-node"
 	workspace := &zka.Workspace{
 		ID: "0123456789abcdef", Name: "api", RemoteHost: "devbox.example",
-		AgentAttachmentID: "other",
+		CredentialClaim: &zka.CredentialClaim{Bundle: "work", OwnerAttachmentID: "other", OwnerNodeID: "other-node"},
 		Attachments: map[string]*zka.Attachment{
 			"local": {
 				ID: "local", Node: zka.Host{ID: localNode, Name: "laptop"},
@@ -219,33 +221,34 @@ func TestDetachedRemoteWorkspaceCanAttachAndClaimAgentInOneAction(t *testing.T) 
 	ui.localNodeID = localNode
 	ui.local = []*zka.Workspace{workspace}
 	ui.selected = 2
-	ui.agentForwarding = true
+	ui.credentialsEnabled = true
+	ui.defaultBundle = "work"
 
-	if !ui.workspaceAgentControlVisible(workspace) {
-		t.Fatal("detached remote workspace did not offer an SSH agent action")
+	if !ui.workspaceCredentialControlVisible(workspace) {
+		t.Fatal("detached remote workspace did not offer a credential action")
 	}
-	if got, want := workspaceAgentButtonLabel(workspace, localNode), "Attach + use SSH agent"; got != want {
-		t.Fatalf("agent button label = %q, want %q", got, want)
+	if got, want := workspaceCredentialButtonLabel(workspace, localNode), "Attach + claim credentials"; got != want {
+		t.Fatalf("credential button label = %q, want %q", got, want)
 	}
 
-	ui.toggleAgentSelection()
+	ui.toggleCredentialSelection()
 
 	select {
 	case got := <-backend.executed:
-		want := []string{"workspace", "attach", "devbox.example:0123456789abcdef", "--claim-agent"}
+		want := []string{"workspace", "attach", "devbox.example:0123456789abcdef", "--claim-credentials", "--credential-bundle", "work"}
 		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("agent action args = %#v, want %#v", got, want)
+			t.Fatalf("credential action args = %#v, want %#v", got, want)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("detached workspace agent action did not execute")
+		t.Fatal("detached workspace credential action did not execute")
 	}
 }
 
-func TestOriginWorkspaceCanAttachAndReturnAgentInOneAction(t *testing.T) {
+func TestOriginWorkspaceCanAttachAndReleaseCredentialsInOneAction(t *testing.T) {
 	const originNode = "origin-node"
 	workspace := &zka.Workspace{
 		ID: "0123456789abcdef", Name: "api",
-		AgentAttachmentID: "machine-a",
+		CredentialClaim: &zka.CredentialClaim{Bundle: "work", OwnerAttachmentID: "machine-a", OwnerNodeID: "machine-a-node", Capabilities: map[string]zka.CredentialCapabilityStatus{"openpgp": {State: "ready", Available: true}}},
 		Attachments: map[string]*zka.Attachment{
 			"origin": {
 				ID: "origin", Node: zka.Host{ID: originNode, Name: "devbox"},
@@ -262,22 +265,23 @@ func TestOriginWorkspaceCanAttachAndReturnAgentInOneAction(t *testing.T) {
 	ui.localNodeID = originNode
 	ui.local = []*zka.Workspace{workspace}
 	ui.selected = 2
-	ui.agentForwarding = true
+	ui.credentialsEnabled = true
+	ui.defaultBundle = "work"
 
-	if got, want := workspaceSSHAgentSummary(workspace, "", originNode), "SSH agent: machine-a"; got != want {
+	if got, want := workspaceCredentialSummary(workspace, "", originNode), "Credentials: work (openpgp ready) · machine-a"; got != want {
 		t.Fatalf("origin summary = %q, want %q", got, want)
 	}
-	if !ui.workspaceAgentControlVisible(workspace) {
-		t.Fatal("origin workspace did not offer an SSH agent action for a remote claim")
+	if !ui.workspaceCredentialControlVisible(workspace) {
+		t.Fatal("origin workspace did not offer a credential action for a remote claim")
 	}
-	if got, want := workspaceAgentButtonLabel(workspace, originNode), "Attach + use SSH agent"; got != want {
-		t.Fatalf("origin agent button label = %q, want %q", got, want)
+	if got, want := workspaceCredentialButtonLabel(workspace, originNode), "Attach + release credentials"; got != want {
+		t.Fatalf("origin credential button label = %q, want %q", got, want)
 	}
 
-	ui.toggleAgentSelection()
+	ui.toggleCredentialSelection()
 
 	for index, want := range [][]string{
-		{"workspace", "agent", "release", "0123456789abcdef"},
+		{"workspace", "credentials", "release", "0123456789abcdef"},
 		{"workspace", "attach", "0123456789abcdef"},
 	} {
 		select {

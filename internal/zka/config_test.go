@@ -77,26 +77,79 @@ func TestSSHIdentityAgentPrecedesOtherOptions(t *testing.T) {
 	}
 }
 
-func TestSSHForwardAgentIsOptInAndPrecedesOtherOptions(t *testing.T) {
-	t.Setenv("ZKA_CONFIG", "")
+func TestCredentialBundlesReplaceForwardAgentConfiguration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"ssh":{"forward_agent":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", path)
+	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("legacy forward_agent error = %v", err)
+	}
+	for _, options := range []string{
+		`["-A"]`,
+		`["-o","ForwardAgent=yes"]`,
+		`["-oForwardAgent=yes"]`,
+	} {
+		if err := os.WriteFile(path, []byte(`{"ssh":{"options":`+options+`}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "must not enable ForwardAgent") {
+			t.Fatalf("ForwardAgent options %s error = %v", options, err)
+		}
+	}
+	if err := os.WriteFile(path, []byte(`{"credentials":{"default_bundle":"work","bundles":{"work":{"ssh_agent":{"enable":true}}}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SSH.ForwardAgent || strings.Contains(strings.Join(cfg.SSH.Options, " "), "ForwardAgent") {
-		t.Fatalf("forwarding enabled by default: %#v", cfg.SSH)
+	if cfg.Credentials.DefaultBundle != "work" || !cfg.Credentials.Bundles["work"].SSHAgent.Enable || strings.Contains(strings.Join(cfg.SSH.Options, " "), "ForwardAgent") {
+		t.Fatalf("credentials config = %#v", cfg.Credentials)
 	}
+}
+
+func TestOpenPGPTargetBundleDoesNotRequireProviderFingerprints(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"ssh":{"forward_agent":true,"options":["-o","ForwardAgent=no","-o","BatchMode=yes"]}}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"credentials":{"bundles":{"work":{"openpgp":{"enable":true}}}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("ZKA_CONFIG", path)
-	cfg, err = LoadConfig()
+	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.SSH.ForwardAgent || !strings.HasPrefix(strings.Join(cfg.SSH.Options, " "), "-o ForwardAgent=yes ") {
-		t.Fatalf("forwarding options = %#v", cfg.SSH)
+	if !cfg.Credentials.Bundles["work"].OpenPGP.Enable || len(cfg.Credentials.Bundles["work"].OpenPGP.SigningKeys) != 0 {
+		t.Fatalf("target-only OpenPGP bundle = %#v", cfg.Credentials.Bundles["work"])
+	}
+}
+
+func TestCredentialProviderIdentityConfigIsValidated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	valid := `{"ssh":{"expected_node_ids":{"devbox":"0123456789abcdef0123456789abcdef"}},"credentials":{"providers":{"laptop":{"node_id":"fedcba9876543210fedcba9876543210","ssh_source_addresses":["192.0.2.10","2001:db8::/64"]},"roaming":{"node_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}`
+	if err := os.WriteFile(path, []byte(valid), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", path)
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SSH.ExpectedNodeIDs["devbox"] == "" || len(cfg.Credentials.Providers["laptop"].SSHSourceAddresses) != 2 ||
+		len(cfg.Credentials.Providers["roaming"].SSHSourceAddresses) != 0 {
+		t.Fatalf("identity config = %#v", cfg)
+	}
+	for _, invalid := range []string{
+		`{"ssh":{"expected_node_ids":{"devbox":"NOT-A-NODE"}}}`,
+		`{"credentials":{"providers":{"laptop":{"node_id":"fedcba9876543210fedcba9876543210","ssh_source_addresses":["not-an-address"]}}}}`,
+	} {
+		if err := os.WriteFile(path, []byte(invalid), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(); err == nil {
+			t.Fatalf("invalid identity config accepted: %s", invalid)
+		}
 	}
 }
 

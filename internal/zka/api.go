@@ -145,21 +145,35 @@ func (a API) SetAttachmentPaneReady(ctx context.Context, req attachmentPaneReady
 	return &out, err
 }
 
-func (a API) ClaimWorkspaceAgent(ctx context.Context, workspace, attachment string) (workspaceAgentStatus, error) {
-	var out workspaceAgentStatus
-	err := a.client.Call(ctx, "workspace_agent_claim", workspaceAgentRequest{Workspace: workspace, Attachment: attachment}, &out)
+func (a API) ClaimWorkspaceCredentials(ctx context.Context, req workspaceCredentialRequest) (workspaceCredentialStatus, error) {
+	var out workspaceCredentialStatus
+	err := a.client.Call(ctx, "credentials_claim", req, &out)
 	return out, err
 }
 
-func (a API) ReleaseWorkspaceAgent(ctx context.Context, workspace string) (workspaceAgentStatus, error) {
-	var out workspaceAgentStatus
-	err := a.client.Call(ctx, "workspace_agent_release", workspaceAgentRequest{Workspace: workspace}, &out)
+func (a API) ReleaseWorkspaceCredentials(ctx context.Context, workspace string) (workspaceCredentialStatus, error) {
+	var out workspaceCredentialStatus
+	err := a.client.Call(ctx, "credentials_release", workspaceCredentialRequest{Workspace: workspace}, &out)
 	return out, err
 }
 
-func (a API) WorkspaceAgentStatus(ctx context.Context, workspace string) (workspaceAgentStatus, error) {
-	var out workspaceAgentStatus
-	err := a.client.Call(ctx, "workspace_agent_status", workspaceAgentRequest{Workspace: workspace}, &out)
+func (a API) CredentialStatus(ctx context.Context, workspace string) (credentialStatusResponse, error) {
+	var out credentialStatusResponse
+	var payload any
+	if workspace != "" {
+		payload = workspaceCredentialRequest{Workspace: workspace}
+	}
+	err := a.client.Call(ctx, "credentials_status", payload, &out)
+	return out, err
+}
+
+func (a API) setCredentialTransport(ctx context.Context, req credentialTransportSessionRequest) error {
+	return a.client.Call(ctx, "credentials_transport_session", req, nil)
+}
+
+func (a API) credentialTargetSnapshot(ctx context.Context, provider Host) ([]*Workspace, error) {
+	var out []*Workspace
+	err := a.client.Call(ctx, "credentials_target_snapshot", credentialTransportSessionRequest{Provider: provider, State: "ready"}, &out)
 	return out, err
 }
 

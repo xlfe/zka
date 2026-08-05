@@ -14,16 +14,22 @@ import (
 
 func TestPaneCommandEnvironmentUsesStableAgentOnlyForNewBackends(t *testing.T) {
 	t.Setenv("SSH_AUTH_SOCK", "/tmp/ephemeral-agent.sock")
-	t.Setenv("ZKA_AGENT_RELAY_VERSION", "")
+	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "")
 	paths := testPaths(t.TempDir())
 	var cfg Config
-	cfg.SSH.ForwardAgent = true
+	var bundle CredentialBundleConfig
+	bundle.SSHAgent.Enable = true
+	bundle.OpenPGP.Enable = true
+	cfg.Credentials.Bundles = map[string]CredentialBundleConfig{"work": bundle}
 	created := paneCommandEnvironment(cfg, paths, "workspace", "pane", true)
 	if got := testEnvironmentValue(created, "SSH_AUTH_SOCK"); got != agentRelaySocketPath(paths.AgentDir, "workspace") {
 		t.Fatalf("created SSH_AUTH_SOCK = %q", got)
 	}
-	if got := testEnvironmentValue(created, "ZKA_AGENT_RELAY_VERSION"); got != "1" {
+	if got := testEnvironmentValue(created, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "2" {
 		t.Fatalf("relay version = %q", got)
+	}
+	if got, want := testEnvironmentValue(created, "GNUPGHOME"), filepath.Join(paths.StateDir, "credentials", "workspace", "gnupg"); got != want {
+		t.Fatalf("GNUPGHOME = %q, want %q", got, want)
 	}
 	attached := paneCommandEnvironment(cfg, paths, "workspace", "pane", false)
 	if got := testEnvironmentValue(attached, "SSH_AUTH_SOCK"); got != "/tmp/ephemeral-agent.sock" {
@@ -41,7 +47,7 @@ func testEnvironmentValue(environment []string, name string) string {
 	return ""
 }
 
-func TestWorkspaceAgentStatusCLIReportsDisabledByDefault(t *testing.T) {
+func TestWorkspaceCredentialsStatusCLIReportsUnclaimedByDefault(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -49,11 +55,11 @@ func TestWorkspaceAgentStatusCLIReportsDisabledByDefault(t *testing.T) {
 	workspace := createTestWorkspace(t, d, 1)
 	serveTestDaemon(t, d)
 	var output bytes.Buffer
-	code, err := runWorkspaceAgent([]string{"status", "--json", workspace.ID}, d.paths, &output, io.Discard)
+	code, err := runWorkspaceCredentials([]string{"status", "--json", workspace.ID}, d.paths, &output, io.Discard)
 	if err != nil || code != 0 {
 		t.Fatalf("status code = %d, err = %v", code, err)
 	}
-	if !strings.Contains(output.String(), `"state": "disabled"`) || !strings.Contains(output.String(), `"owner": "origin"`) {
+	if !strings.Contains(output.String(), `"state": "unclaimed"`) || !strings.Contains(output.String(), `"capabilities": {}`) {
 		t.Fatalf("status = %s", output.String())
 	}
 }
@@ -91,24 +97,24 @@ func TestWorkspaceCreateDispatchAndUsage(t *testing.T) {
 	if code != 2 || err == nil || !strings.Contains(err.Error(), "absolute path on devbox.example") {
 		t.Fatalf("relative remote cwd: code=%d err=%v", code, err)
 	}
-	code, err = runWorkspace([]string{"create", "devbox.example:api", "--claim-agent"}, Paths{}, &stdout, &stderr)
-	if code != 2 || err == nil || !strings.Contains(err.Error(), "--claim-agent requires --attach") {
+	code, err = runWorkspace([]string{"create", "devbox.example:api", "--claim-credentials"}, Paths{}, &stdout, &stderr)
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "--claim-credentials requires --attach") {
 		t.Fatalf("claim without attach: code=%d err=%v", code, err)
 	}
-	code, err = runWorkspace([]string{"create", "api", "--attach", "--claim-agent"}, Paths{}, &stdout, &stderr)
-	if code != 2 || err == nil || !strings.Contains(err.Error(), "--claim-agent requires a remote workspace") {
+	code, err = runWorkspace([]string{"create", "api", "--attach", "--claim-credentials"}, Paths{}, &stdout, &stderr)
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "--claim-credentials requires a remote workspace") {
 		t.Fatalf("local create claim: code=%d err=%v", code, err)
 	}
-	code, err = runWorkspace([]string{"attach", "api", "--claim-agent"}, Paths{}, &stdout, &stderr)
-	if code != 2 || err == nil || !strings.Contains(err.Error(), "--claim-agent requires a remote workspace") {
+	code, err = runWorkspace([]string{"attach", "api", "--claim-credentials"}, Paths{}, &stdout, &stderr)
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "--claim-credentials requires a remote workspace") {
 		t.Fatalf("local attach claim: code=%d err=%v", code, err)
 	}
 	stdout.Reset()
 	if code, err := runWorkspace([]string{"help"}, Paths{}, &stdout, &stderr); code != 0 || err != nil {
 		t.Fatalf("help: code=%d err=%v", code, err)
 	}
-	if !strings.Contains(stdout.String(), "\n  create ") || !strings.Contains(stdout.String(), "--claim-agent") {
-		t.Fatalf("workspace usage does not advertise create and agent claiming: %q", stdout.String())
+	if !strings.Contains(stdout.String(), "\n  create ") || !strings.Contains(stdout.String(), "--claim-credentials") {
+		t.Fatalf("workspace usage does not advertise create and credential claiming: %q", stdout.String())
 	}
 }
 

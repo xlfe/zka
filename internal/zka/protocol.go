@@ -66,7 +66,7 @@ func (c Client) Call(ctx context.Context, op string, payload, out any) error {
 			return fmt.Errorf("encode request: %w", err)
 		}
 	}
-	if err := json.NewEncoder(conn).Encode(request{Version: protocolVersion, Op: op, Payload: raw, DeadlineUnixNano: daemonDeadline.UnixNano()}); err != nil {
+	if err := json.NewEncoder(conn).Encode(request{Version: daemonProtocolVersion, Op: op, Payload: raw, DeadlineUnixNano: daemonDeadline.UnixNano()}); err != nil {
 		return fmt.Errorf("send request: %w", err)
 	}
 	var res response
@@ -77,8 +77,8 @@ func (c Client) Call(ctx context.Context, op string, payload, out any) error {
 		}
 		return fmt.Errorf("read response: %w", err)
 	}
-	if res.Version != protocolVersion {
-		return fmt.Errorf("unsupported daemon protocol %d (client requires %d; upgrade and restart zka on this machine)", res.Version, protocolVersion)
+	if res.Version != daemonProtocolVersion {
+		return fmt.Errorf("unsupported daemon protocol %d (client requires %d; upgrade and restart zka on this machine)", res.Version, daemonProtocolVersion)
 	}
 	if !res.OK {
 		return errors.New(res.Error)
@@ -108,7 +108,7 @@ func (c Client) WatchAttention(ctx context.Context, yield func(AttentionSnapshot
 	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopCancel()
 	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
-	if err := json.NewEncoder(conn).Encode(request{Version: protocolVersion, Op: "watch_attention"}); err != nil {
+	if err := json.NewEncoder(conn).Encode(request{Version: daemonProtocolVersion, Op: "watch_attention"}); err != nil {
 		return fmt.Errorf("send attention watch request: %w", err)
 	}
 	_ = conn.SetDeadline(time.Time{})
@@ -121,7 +121,7 @@ func (c Client) WatchAttention(ctx context.Context, yield func(AttentionSnapshot
 			}
 			return fmt.Errorf("read attention update: %w", err)
 		}
-		if res.Version != protocolVersion {
+		if res.Version != daemonProtocolVersion {
 			return fmt.Errorf("unsupported daemon protocol %d", res.Version)
 		}
 		if !res.OK {

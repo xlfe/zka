@@ -1,7 +1,7 @@
 # zka
 
-**Kitty-native workspaces that keep every terminal pane alive—locally, over
-SSH, and across reconnects.**
+**Kitty-native durable terminal workspaces, agent attention, and scoped remote
+credentials.**
 
 `zka` turns a complete Kitty workspace—OS windows, tabs, splits, titles, working
 directories, and focus—into one durable unit. Each pane runs in its own hidden
@@ -9,7 +9,10 @@ directories, and focus—into one durable unit. Each pane runs in its own hidden
 or coding agent inside it keeps running when the view goes away.
 
 When Codex or Claude Code needs input or finishes work, zka collects the exact
-panes that need you and takes you straight back to them.
+panes that need you and takes you straight back to them. When a remote workspace
+needs your local SSH agent or OpenPGP key, an explicit credential-bundle claim
+projects stable endpoints into the origin workspace while keeping private keys
+and provider socket paths on the provider.
 
 <p align="center">
   <img src="docs/images/workspace-launcher.png" width="49%" alt="zka workspace launcher showing an attached workspace">
@@ -21,21 +24,23 @@ panes that need you and takes you straight back to them.
 </p>
 
 > [!NOTE]
-> zka 0.7.0 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
+> zka 0.8.0 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
 > builds on Kitty, zmx, OpenSSH, systemd user services, and coding-agent hooks
 > instead of replacing them.
 
 [Quick start](#quick-start) · [Why zka](#why-zka) ·
 [Compare](#how-zka-compares) · [How it works](#how-it-works) ·
-[Remote workspaces](#remote-workspaces) · [Attention](#attention-and-notifications) ·
+[Remote workspaces](#remote-workspaces) · [Credentials](#credential-bundles) ·
+[Security](#security-model) · [Attention](#attention-and-notifications) ·
 [Configuration](#configuration)
 
 ## Why zka
 
 One long-running terminal is easy. Six coding agents across local and remote
 machines are not: live processes are coupled to disposable windows, the session
-you need is buried in a tab, and generic notifications do not tell you where to
-go.
+you need is buried in a tab, generic notifications do not tell you where to go,
+and a remote agent may need a local hardware-backed identity without receiving
+the private key.
 
 zka keeps the terminal workflow and adds the missing workspace layer:
 
@@ -46,14 +51,18 @@ zka keeps the terminal workflow and adds the missing workspace layer:
 | **Whole-workspace restore** | Recreate the logical topology, working directories, and focus around the same live zmx sessions. |
 | **Remote attach and move** | Open an origin workspace from another machine over normal OpenSSH, as a mirror or a primary handoff. |
 | **Agent attention** | See Codex and Claude Code panes that are blocked, failed, or done in one live queue; jump directly to the exact pane. |
+| **Credential bundles** | Explicitly claim and release stable SSH-agent and filtered OpenPGP capabilities for a remote workspace, across reconnects. |
+| **Headless origins** | Keep workspaces, hooks, notifications, and credential targets alive on a machine with no Kitty or graphical session. |
 | **Composable infrastructure** | Keep network reachability, authentication, terminal rendering, and PTY ownership in tools that already do them well. |
 
 zka is not a new terminal emulator or an outer multiplexer. It does not replay a
 foreground command and hope it resumes correctly. The process is already alive:
 
 ```text
-local view:   Kitty → zka → zmx → shell / editor / agent
-remote view:  Kitty → zka → OpenSSH → zmx on the origin → live process
+local view:    Kitty → zka → zmx → shell / editor / agent
+remote view:   Kitty → zka → OpenSSH → zmx on the origin → live process
+credential:    origin process → workspace socket → zka/yamux/OpenSSH
+                 → provider SSH agent or filtered gpg-agent → YubiKey
 ```
 
 ## How zka compares
@@ -82,23 +91,36 @@ processes remain alive independently behind it.
 
 This table compares product boundaries, not just whether a README can claim a
 feature. “Persistence” distinguishes a live PTY from reconstructing a layout or
-resuming an agent through its own session mechanism.
+resuming an agent through its own session mechanism. The credential column says
+what the product documents; an underlying shell or SSH setup can always add
+other credential plumbing independently.
 
-| Project | Primary surface | Persistence model | Remote model | Agent and workspace model |
+| Project | Surface and persistence | Remote model | Agent and workspace model | Documented credential model |
 | --- | --- | --- | --- | --- |
-| [tmux](https://github.com/tmux/tmux) | Terminal multiplexer | tmux server owns persistent PTYs | Run tmux on the remote host over SSH | General-purpose sessions, windows, and panes; no built-in agent awareness or worktrees |
-| [Zellij](https://github.com/zellij-org/zellij) | Batteries-included terminal workspace | Zellij server owns persistent PTYs | Run on the remote host; also offers a web client | General-purpose panes, layouts, collaboration, and plugins; no built-in coding-agent lifecycle |
-| [herdr](https://github.com/ogulcancelik/herdr) | Agent-aware multiplexer inside any terminal | Herdr server owns persistent PTYs; native agent-session restore covers full server restarts | Run remotely or use its SSH thin-client mode | Broad agent detection, attention state, direct attach, built-in worktrees, plugins, and orchestration API |
-| [cmux](https://github.com/manaflow-ai/cmux) | Native Ghostty-based macOS terminal | Restores layout/metadata; supported agents can resume from captured session IDs, but arbitrary processes are not checkpointed | Creates SSH workspaces from the macOS app | Agent notifications, browser surfaces, automation, and customizable worktree workflows |
-| [Superset](https://github.com/superset-sh/superset) | macOS desktop code editor | Persistent terminal sessions per workspace survive app restarts | Primarily local desktop workspaces | Worktree-isolated parallel agents, monitoring, diff review, editor, and PR workflow |
-| [Claude Squad](https://github.com/smtg-ai/claude-squad) | Terminal session manager | tmux provides process persistence | Runs wherever its tmux host runs | Multi-agent profiles, one worktree per task, previews, diff review, and checkout workflow |
-| [Vibe Kanban](https://github.com/BloopAI/vibe-kanban) | Kanban-style local web/desktop app | Manages agent execution inside task workspaces rather than acting as a general PTY multiplexer | Self-hosted/remote deployment model | Planning, worktree execution, browser preview, inline diff review, and PR flow; project is sunsetting |
-| **zka** | Native Kitty windows, tabs, and splits plus a small launcher/inbox | One zmx-owned live PTY per pane; topology is restored around the same processes | OpenSSH mirror attachments and transactional primary moves between configured machines | Arbitrary terminal programs, Codex and Claude Code lifecycle attention, no built-in task planner, diff review, or worktree isolation |
+| [tmux](https://github.com/tmux/tmux) | Multiplexer in any terminal; the tmux server owns live PTYs | Run tmux on the remote host over SSH | General sessions, windows, and panes; scriptable but not agent-semantic | [Inherits and refreshes](https://github.com/tmux/tmux/wiki/FAQ#how-do-i-use-ssh-agent1-with-tmux) environment such as `SSH_AUTH_SOCK`; forwarding policy belongs to SSH |
+| [Zellij](https://github.com/zellij-org/zellij) | Batteries-included multiplexer; the Zellij server owns live PTYs | Run remotely, or [attach from a browser or terminal](https://zellij.dev/documentation/web-client.html) over authenticated HTTPS | General panes, layouts, collaboration, plugins, and programmatic control | Uses the session host's environment; no product-level credential-claim model is documented |
+| [herdr](https://github.com/ogulcancelik/herdr) | Agent-aware multiplexer in any terminal; its server owns live PTYs | Run remotely or use its SSH thin client | Broad agent detection, direct attach, worktrees, plugins, and an orchestration API | Uses the session host's environment; no product-level credential-claim model is documented |
+| [cmux](https://github.com/manaflow-ai/cmux) | Native Ghostty-based macOS terminal; restores app topology, scrollback, and supported sessions | [Durable SSH workspaces](https://cmux.com/docs/ssh) reconnect to a remote relay/tmux session | Agent notifications, native subagent panes, browser surfaces, files, and automation | [`cmux ssh` forwards](https://cmux.com/docs/changelog) the local SSH agent into the remote workspace |
+| [Superset](https://github.com/superset-sh/superset) | macOS editor/CLI/MCP with persistent terminals per Git worktree | Primarily local desktop workspaces | Parallel agents, monitoring, diff review, editor, PR flow, and worktree isolation | Uses credentials available to the local workspace; no remote-forwarding model is documented |
+| [Claude Squad](https://github.com/smtg-ai/claude-squad) | Terminal manager using tmux for live process persistence | Runs wherever its tmux host runs | Multiple agent profiles, one worktree per task, preview, diff, and checkout workflow | Uses credentials available in its tmux host environment |
+| [Vibe Kanban](https://github.com/BloopAI/vibe-kanban) | Kanban web/desktop task runner rather than a general PTY multiplexer | Self-hosted deployment model | Planning, worktree execution, browser preview, diff review, and PR flow; [the project is sunsetting](https://www.vibekanban.com/blog/shutdown) | Uses credentials available to the task host; no workspace forwarding model is documented |
+| **zka** | Native Kitty windows, tabs, and splits; one zmx-owned live PTY per pane | OpenSSH mirrors, transactional primary moves, and reconnecting headless origins | Arbitrary terminal programs plus Codex/Claude lifecycle attention; no task planner, diff review, or worktree isolation | Explicit workspace claims for a selected whole SSH agent and fingerprint/keygrip-filtered OpenPGP signing or decryption |
 
-Comparison checked against each project's public documentation in July 2026.
-These tools overlap, but they optimize for different jobs: general multiplexing,
-agent orchestration, worktree-based delivery, or preserving a native terminal
-workspace as a durable cross-machine unit.
+Comparison checked against each project's primary public documentation in
+August 2026. These tools optimize for different jobs: general multiplexing,
+agent orchestration, worktree-based delivery, native terminal restoration, or
+controlled access from remote workspaces to provider-held credentials.
+
+Conventional [OpenSSH agent forwarding](https://man.openbsd.org/ssh_config#ForwardAgent)
+gives the remote host use of every key offered by the forwarded agent for the
+life of that connection. GnuPG's
+[`agent-extra-socket`](https://wiki.gnupg.org/AgentForwarding) similarly keeps
+private keys local and permits remote signing/decryption, but leaves public-key
+distribution, socket placement, reconnects, and ownership to the operator. zka
+does not make its SSH byte proxy key-selective. It adds an explicit durable
+workspace claim, stable reconnecting endpoints, a separate keygrip-enforcing
+OpenPGP filter, provider-side use notices, and credential-aware status/doctor
+checks.
 
 ## Quick start
 
@@ -184,6 +206,8 @@ the shell.
 4. Detach when you want the view gone but the work to continue.
 5. Open `zka attention show` when you want only the panes that need a decision.
 6. Attach the same workspace locally, or from another configured host over SSH.
+7. Claim a credential bundle only when that trusted remote workspace needs it,
+   then release the claim when the operation is complete.
 
 The launcher groups known workspaces into **Attached** and **Detached**. Selecting
 an attached workspace switches to its existing Sway window; selecting a detached
@@ -202,6 +226,10 @@ workspace "example-project" on devbox.example
 attachments
 ├── devbox.example → dedicated Kitty instance (primary)
 └── laptop.example → dedicated Kitty instance over SSH (mirror)
+
+optional credential claim owned by laptop.example
+├── origin SSH_AUTH_SOCK → yamux stream → provider's selected SSH agent
+└── origin GNUPGHOME   → yamux stream → provider's filtered gpg-agent
 ```
 
 | Term | Meaning |
@@ -209,15 +237,16 @@ attachments
 | **Workspace** | The durable unit: logical Kitty topology, panes, agent state, and attachment metadata. |
 | **Pane** | One stable zka pane ID backed by one zmx-owned PTY. |
 | **Origin** | The machine that owns the workspace state and zmx sessions. |
+| **Provider** | The attachment machine that owns the local agent or hardware token backing a claimed credential bundle. |
 | **Attachment** | A dedicated Kitty view of a workspace on one machine. |
 | **Primary** | The attachment that owns the interactive primary lease after a local start or successful move. |
 | **Mirror** | An additional fully interactive attachment created without revoking the primary. |
 
 Kitty remains the visible interface. zmx remains the only persistent PTY owner.
 OpenSSH provides authentication and transport. zka owns workspace identity,
-topology capture, restoration, remote coordination, lifecycle, and attention.
-There is no listening zka TCP service, PTY migration, or local zmx wrapped
-around an SSH connection.
+topology capture, restoration, remote coordination, lifecycle, attention, and
+credential claims. There is no listening zka TCP service, PTY migration, or
+local zmx wrapped around an SSH connection.
 
 The origin owns one canonical, generation-numbered topology. Tabs, splits,
 ordering, layouts, and tab titles changed in any ready attachment are committed
@@ -349,20 +378,236 @@ the new view and leaves the source untouched.
 
 ### Remote reliability
 
-The daemon keeps one supervised control connection per origin. Snapshot and
-state events travel over a versioned, one-MiB-limited JSON-lines protocol inside
-SSH; terminal traffic uses separate SSH channels that attach directly to zmx on
-the origin.
+The daemon keeps one supervised `ssh -T` control process per origin. Its stdio
+is a yamux session: a reserved stream carries the versioned,
+one-MiB-limited JSON-lines control protocol, and independent streams carry
+credential connections. Terminal traffic remains on separate SSH channels that
+attach directly to zmx on the origin.
 
-OpenSSH server-alive checks detect dead connections. After a completed protocol
-handshake, exit status 255 triggers exponential reconnect from 250 ms to 30
-seconds and attachment to the same zmx session. Status 255 before the first
-handshake is treated as an authentication or configuration failure. Mutating
-handoff requests are replay-safe if SSH drops after the origin acts but before
-the response arrives.
+OpenSSH server-alive checks detect dead connections. Transient startup,
+transport, and handshake failures retry with jittered exponential backoff capped
+at 30 seconds. Authentication or host-key rejection, a missing local `ssh` or
+remote `zka`, protocol incompatibility, and credential node-pin failures stop
+that supervisor with an explicit diagnostic. Pane channels reconnect
+independently and reattach to the same zmx sessions. Mutating handoff requests
+are replay-safe if SSH drops after the origin acts but before the response
+arrives.
 
 zka never restarts a missing foreground process. It reports the missing backend
 explicitly while preserving the rest of the workspace.
+
+## Credential bundles
+
+Credential bundles let an attachment machine act as a **provider** for a
+persistent workspace on another **origin**. A bundle names semantic
+capabilities; v0.8.0 implements two:
+
+- **SSH agent:** a byte proxy to the provider's selected agent. The claim is
+  workspace-scoped, but the protocol is intentionally not key-filtered: every
+  identity offered by that agent is available through the endpoint.
+- **OpenPGP:** signing and decryption through the provider's restricted
+  `gpg-agent` extra socket. Configured fingerprints are resolved to keygrips on
+  the provider and enforced by an Assuan-aware default-deny filter.
+
+This is a breaking replacement for the old workspace-agent relay. Remove
+`services.zka.ssh.forwardAgent` and any `ForwardAgent=yes` or `-A` option across
+the fleet; zka rejects them rather than running two credential paths.
+
+Define the bundle on both machines. Only the provider carries the authorized
+OpenPGP fingerprints:
+
+```nix
+# Shared by laptop (provider) and devbox (origin).
+services.zka.credentials = {
+  defaultBundle = "work"; # selection only; it does not claim automatically
+  bundles.work = {
+    sshAgent.enable = true;
+    openpgp.enable = true;
+  };
+};
+
+# laptop only: authorize the keys this provider may expose.
+services.zka.credentials.bundles.work.openpgp.signingKeys = [
+  "1111222233334444555566667777888899990000"
+];
+```
+
+Pin the two zka nodes before claiming credentials. `zka doctor` prints the
+local `node=` value. On `laptop`, bind the outbound SSH alias to `devbox`'s
+node; on `devbox`, allow `laptop`'s node ID to provide credentials:
+
+```nix
+# laptop
+services.zka.ssh.expectedNodeIDs.devbox =
+  "0123456789abcdef0123456789abcdef"; # devbox's node ID
+
+# devbox
+services.zka.credentials.providers.laptop = {
+  nodeID = "fedcba9876543210fedcba9876543210"; # laptop's node ID
+  # Optional for fixed hosts; omit this for roaming providers.
+  # sshSourceAddresses = [ "192.0.2.10" ]; # exact IPs or CIDRs
+};
+```
+
+`sshSourceAddresses` is empty by default so a VPN lease change, tethering, or
+travel does not require rebuilding the origin. When present it is an additional
+constraint derived from sshd's `SSH_CONNECTION`, not a replacement for the
+mandatory node-ID allowlist. Do not use a wildcard such as `0.0.0.0/0`: that is
+equivalent to omitting the address check, but misleadingly looks restrictive.
+
+On the provider, zka can opt in to configuring the globally shared user
+`gpg-agent`, its restricted extra socket, and graphical pinentry:
+
+```nix
+services.zka.credentials.gnupg = {
+  configureAgent = true;
+  pinentryPackage = pkgs.pinentry-gnome3;
+  operationTimeout = "45s";
+};
+```
+
+Leave `configureAgent = false` on the origin. If another module already owns a
+suitable provider agent, extra socket, and pinentry, leave it false there too.
+The setting is deliberately opt-in because the user agent is shared with every
+other smart-card consumer in that session.
+
+Attach, then claim the bundle explicitly:
+
+```sh
+zka workspace attach devbox:example-project
+zka workspace credentials claim --bundle work devbox:example-project
+zka workspace credentials status --json devbox:example-project
+```
+
+Or combine creation/attachment with the claim:
+
+```sh
+zka workspace attach devbox:example-project --claim-credentials --credential-bundle work
+zka workspace create devbox:new-project --attach --claim-credentials --credential-bundle work
+```
+
+`defaultBundle` only supplies the name when `--bundle` is omitted. A claim is
+workspace-wide and ends on explicit release, workspace deletion, or detaching
+its owner attachment:
+
+```sh
+zka workspace credentials release devbox:example-project
+```
+
+A transient control disconnect retains the durable claim but removes the
+origin endpoints and reports the capabilities as degraded. Reconnection
+re-resolves provider sockets and idempotently republishes authorized endpoints.
+Existing SSH panes keep their stable `SSH_AUTH_SOCK`; an existing pane without
+the managed `GNUPGHOME` must be recreated before OpenPGP is available, and
+credential status lists only those pane IDs. If the provider daemon restarts
+without an explicit `ssh.identityAgent`, SSH becomes degraded until the bundle
+is re-claimed rather than silently switching agents.
+
+Inside a pane with the managed `GNUPGHOME`, `gpg --list-keys` intentionally
+shows only the bundle's imported public keys and `gpg --list-secret-keys` shows
+no local secret keys. The normal keyring is unchanged; unset `GNUPGHOME` (or use
+an explicit `--homedir`) when you want to inspect it. This is isolation, not
+keyring data loss.
+
+For each OpenPGP private-key operation, the provider must have an interactive
+session, must not report a positive screen lock, and must successfully deliver a
+credential-use notice to the desktop service or mandatory `ntfy-send` fallback.
+That fallback is a security path and ignores `notifications.ntfyEnabled`; if
+neither channel accepts the notice, the operation fails closed. The operation
+then remains bounded by `operationTimeout`. See
+[Security model](#security-model) for what these checks do—and do not—authorize.
+
+Git reports the outer failure as `gpg failed to sign the data`; the useful clue
+is the Assuan error immediately above it:
+
+| gpg/Assuan symptom | What zka rejected | What to check |
+| --- | --- | --- |
+| `No Pinentry` | No interactive provider session, a positively locked screen, or failure to deliver the mandatory credential-use notice | Unlock/log in on the provider, then check desktop/ntfy delivery and `journalctl --user-unit zkad`; a broken ntfy fallback deliberately looks like this rather than bypassing the notice |
+| `Timeout` | Pinentry, card touch, decryption, or signing did not finish before `operationTimeout` | Provider pinentry, YubiKey touch policy, smart-card contention, and `credentials status --json` active operations |
+| `Forbidden` | The origin selected a keygrip outside the bundle or sent a command the OpenPGP filter does not allow | `user.signingKey`, configured fingerprints, `openpgp-keys` doctor output, and release/re-claim after bundle changes |
+
+For a fleet upgrade, install and restart the same zka version everywhere, run
+`zka doctor` on provider and origin to collect node IDs and validate bundle/key
+configuration, add the peer pins, then run `zka doctor --origin devbox` from the
+provider. Recreate only the panes named by credential status and verify the
+original hardware path:
+
+```sh
+git commit -S -m "update for release"
+git verify-commit HEAD
+```
+
+## Security model
+
+zka coordinates terminals and credentials for one Unix user across machines you
+administer. It is not a sandbox, privilege boundary between same-UID processes,
+or substitute for OpenSSH host/user authentication.
+
+### Trust boundaries and guarantees
+
+| Boundary | Enforced behavior | Residual authority or risk |
+| --- | --- | --- |
+| Network | zka opens no TCP listener. Remote control, topology, and credential streams travel inside authenticated, encrypted OpenSSH sessions; incompatible protocols fail closed. | SSH configuration, host keys, authorized client keys, and the remote Unix account remain part of the trusted computing base. |
+| Local user | Runtime/state directories are mode `0700`, files and Unix sockets are `0600`, and the systemd unit uses `UMask=0077` and `NoNewPrivileges=true`. | Any process already running as that Unix user can read user-owned state and can connect to a credential socket whose path it can reach. Per-workspace sockets are routing boundaries, not same-UID isolation. |
+| Workspace | Credential access requires an explicit durable claim owned by a ready attachment. Disconnect removes listeners; reconnect republishes only the current bundle/generation. | A claimed origin is trusted to request the granted operations. A compromised origin process is not confined to the visible pane that motivated the claim. |
+| Provider identity | The outbound alias is pinned to an expected target node ID, and the origin accepts credential listeners only from configured provider node IDs. Optional source CIDRs can narrow fixed-host deployments. | The provider node ID is asserted inside an authenticated SSH session but is not yet bound to the particular client public key. Another key authorized for the same account could assert a configured ID. Public-key binding through sshd authentication metadata remains future work. |
+
+### Credential authority
+
+Private keys and provider socket paths are never copied to or persisted on the
+origin. OpenPGP public keys are imported into a private per-workspace
+`GNUPGHOME`; each corresponding private keygrip is resolved and authorized on
+the provider.
+
+The SSH capability is deliberately a whole-agent byte proxy. An origin process
+that can reach the claimed endpoint can list and request use of every identity
+offered by the selected agent. zka adds stable claim/reconnect semantics but no
+SSH protocol filter, per-key allowlist, or provider-side zka notification. Any
+confirmation comes from the agent or hardware token itself.
+
+The OpenPGP capability has a narrower protocol boundary. Its filter:
+
+- allows only the Assuan commands needed for discovery, signing, and decryption;
+- filters `HAVEKEY` and `KEYINFO` to configured keygrips and rejects unknown
+  key selection;
+- blocks raw `scdaemon` passthrough and replaces remote key descriptions with
+  zka-generated context;
+- swallows remote display, terminal, locale, and pinentry-mode options so the
+  origin cannot choose or relabel the provider's prompt; and
+- bounds lines, responses, inquiries, and each private-key operation.
+
+Before signing or decryption, zka requires a session bus, fails immediately on
+a positively reported freedesktop/GNOME screensaver or logind lock, and requires
+the desktop notification service or mandatory ntfy fallback to accept a
+provider-side notice. This is a fail-closed security signal, not interactive
+approval: successful delivery does not prove that a human saw it, and an
+unknown lock API does not prove presence. Pinentry and a hardware-token touch,
+when the key is configured to require them, remain the final human authorization
+boundary. Software-backed configured keys are allowed with a loud status/doctor
+warning rather than rejected.
+
+Credential notices contain zka-owned provider, workspace, bundle, capability,
+operation, and fingerprint fields. Sending the mandatory fallback discloses
+that bounded metadata to the configured ntfy helper. Separately,
+`notifications.ntfyIncludeEvidence = true` can send raw agent evidence such as
+assistant output or tool descriptions; it is false by default because that text
+may contain source code, prompts, paths, or secrets.
+
+### Operating safely
+
+1. Use zka only between origins and provider accounts you trust, with normal
+   strict OpenSSH host-key verification and narrowly authorized client keys.
+2. Configure both node-ID pins, and add `sshSourceAddresses` only when its
+   roaming cost is acceptable; do not treat a wildcard CIDR as protection.
+3. Prefer a persistent explicit `ssh.identityAgent`, hardware-backed OpenPGP
+   keys, and touch/PIN policy appropriate to unattended remote workloads.
+4. Keep desktop notification delivery or the mandatory ntfy fallback working;
+   check it before relying on remote signing.
+5. Claim the smallest bundle only while needed, release it afterward, and never
+   combine zka bundles with OpenSSH `ForwardAgent`.
+6. Use `zka workspace credentials status --json`, `zka doctor --origin HOST`,
+   and `journalctl --user-unit zkad` to audit claims, key backing, transport,
+   active OpenPGP operations, and degraded paths.
 
 ## Attention and notifications
 
@@ -527,6 +772,10 @@ services.zka = {
 };
 ```
 
+Credential configuration is intentionally split between provider and origin;
+use the complete [Credential bundles](#credential-bundles) example rather than
+copying one machine's half to the other.
+
 When managed Codex hooks are enabled, the module owns
 `/etc/codex/requirements.toml`. Add other system requirements under
 `services.zka.codex.extraRequirements`; zka does not disable user or project
@@ -604,8 +853,9 @@ of the shell that opened the launcher. Prefer a persistent socket:
 services.zka.ssh.identityAgent = "/run/user/%i/ssh-agent.socket";
 ```
 
-OpenSSH expands `%i` to the numeric user ID. This socket is also the default
-agent inside new zka workspaces when managed forwarding is enabled.
+OpenSSH expands `%i` to the numeric user ID. This socket is also the
+provider-side source for bundles that enable the SSH-agent capability. The path
+stays on the provider and is never persisted or sent to the origin.
 
 > [!CAUTION]
 > `IdentityAgent` selects the agent socket, but `IdentitiesOnly=yes` separately
@@ -645,10 +895,10 @@ The default `BatchMode=yes` prevents password, host-key, and private-key
 passphrase prompts. Any required confirmation must be available independently;
 zka has no controlling terminal and does not relay prompts through the launcher.
 
-`zka doctor --origin HOST` compares the effective daemon and caller agent
-sockets, verifies them, lists SHA256 public-key fingerprints, and fails
-`ssh-agent-match` when their identities differ. `journalctl --user-unit zkad`
-contains the same bounded SSH diagnostic.
+`zka doctor --origin HOST` verifies bundle configuration, provider sockets,
+OpenPGP fingerprints/keygrips and card backing, workspace claims, and the
+multiplexed credential transport. `journalctl --user-unit zkad` contains the
+same bounded SSH connection diagnostics.
 
 </details>
 
@@ -675,76 +925,6 @@ destination's socket name short and unique.
 
 A connection failure interrupts all multiplexed channels together. zka's
 control and pane reconnect paths then reattach them to the same zmx sessions.
-
-</details>
-
-<details>
-<summary><strong>Forward an SSH agent into a persistent workspace</strong></summary>
-
-Enable managed forwarding on the origin and every destination that will display
-its workspaces:
-
-```nix
-services.zka.ssh.forwardAgent = true;
-```
-
-This enables `ForwardAgent=yes` for zka's SSH sessions and an origin-side relay
-at a stable per-workspace path under `$XDG_RUNTIME_DIR/zka/agents`. Adding
-`ForwardAgent=yes` only to `ssh.extraOptions` does not enable the relay.
-
-New zmx backends receive that stable relay as `SSH_AUTH_SOCK`. Temporary sockets
-from individual SSH connections are reported by pane heartbeats but never
-persisted or printed, so replacing a pane channel or ControlMaster does not
-change the shell's environment.
-
-The relay uses the origin `zkad` agent until a destination attachment explicitly
-claims the workspace:
-
-```sh
-zka workspace attach devbox.example:example-project
-zka workspace agent claim devbox.example:example-project
-zka workspace agent status devbox.example:example-project
-```
-
-To attach and claim in one command, use:
-
-```sh
-zka workspace attach devbox.example:example-project --claim-agent
-zka workspace create devbox.example:new-project --attach --claim-agent
-```
-
-The workspace launcher exposes the same choice when attaching or creating on a
-remote host. Known remote workspaces show whether their relay currently uses the
-origin, this machine, or another attachment, with controls to claim or release
-the agent without recreating the workspace. A previously connected, detached
-workspace offers **Attach + use SSH agent** so reattaching and moving the claim
-are one explicit action.
-
-The same action appears on the origin when a workspace is still using an SSH
-agent from another attachment. It returns the relay to the origin agent before
-opening the local view; plain **Attach** preserves the existing claim.
-
-Return to the origin agent with:
-
-```sh
-zka workspace agent release devbox.example:example-project
-```
-
-A claim is workspace-wide, persists across detach and daemon restart, and never
-follows focus silently. The destination agent is usable only while that
-attachment has a live pane SSH connection. After six seconds without a
-heartbeat, the relay closes active agent connections and fails closed rather
-than falling back to another agent.
-
-Backends created before forwarding was enabled do not have the stable socket.
-The claim command identifies those pane IDs; recreate those panes or the
-workspace. Use `zka doctor --origin devbox.example` to verify both ends.
-
-> [!CAUTION]
-> Agent forwarding does not copy private keys, but processes on a compromised
-> origin can request signatures while the connection is live. Use constrained
-> or confirmation-requiring keys, claim only trusted workspaces, and release a
-> claim when it is no longer needed.
 
 </details>
 
@@ -791,21 +971,46 @@ zka doctor --origin devbox.example
 journalctl --user-unit zkad
 ```
 
+The credential lines are intended to be read directly during rollout. A
+hardware-backed provider and a healthy claimed workspace look like this (IDs
+and keygrips are shortened here):
+
+```text
+ok    credentials-config work=ssh-agent+openpgp; default=work
+ok    daemon           /run/user/1000/zka/zkad.sock; node=0123456789abcdef0123456789abcdef
+ok    credentials-provider configured provider sockets are reachable
+ok    openpgp-keys     work=11112222…99990000/A1B2C3D4:card
+ok    credentials-claim example-project=work@fedcba98[openpgp:ready,ssh-agent:ready]
+ok    credentials-transport ready
+```
+
+`FAIL` makes `zka doctor` exit nonzero. `WARN` is deliberately conspicuous but
+does not fail the command; for example, a configured key ending in
+`:software` is usable but has no hardware-touch boundary:
+
+```text
+WARN  openpgp-keys     work=11112222…99990000/A1B2C3D4:software
+FAIL  credentials-provider openpgp: dial unix /run/user/1000/gnupg/S.gpg-agent.extra: connect: no such file or directory
+FAIL  credentials-transport degraded: provider control session is unavailable
+```
+
 `zka workspace inspect WORKSPACE` includes attachment health, pane/backend state,
 canonical topology generation/digest, convergence state, agent evidence, and
 retained notification failures. `zka workspace reconcile WORKSPACE` forces a
 complete local recapture and repair without restarting the pane backends.
 
-The 0.7.0 state migration creates a private `.v4.backup` beside the state file,
-assigns stable logical container IDs, and places any live pane omitted from the
-old manifest in a `Recovered <pane-id>` tab. Protocol 6 is intentionally not
-mixed-version compatible; upgrade and restart zka on both SSH peers together.
+The 0.8.0 migration writes a private `.v6.backup` beside the schema-7 state
+file. Both the local daemon protocol and remote protocol are version 11. There
+is no compatibility shim for the removed workspace-agent API or old remote
+transport: upgrade the CLI and daemon fleet together, then restart zkad on all
+SSH peers. To roll back, stop zkad, replace the schema-7 state file with its
+`.v6.backup`, install the prior binary on every peer, then restart zkad.
 
 `zka doctor` checks the enabled Codex and Claude Code executables and their
 managed hook files. An integration disabled in the NixOS module is reported as
 disabled instead of failed. On a headless origin the view-layer checks
 (`kitty`, `kitten`, `swaymsg`, `kitty-watcher`) report `skipped on a headless
-origin`; zmx, ssh, ntfy-send, and the agent checks stay real. The `sway-ipc`
+origin`; zmx, ssh, ntfy-send, and the credential checks stay real. The `sway-ipc`
 check runs inside zkad, resolves the same socket used by notification actions,
 and performs a read-only `get_version` request so a daemon started before Sway
 can be diagnosed without focusing a window.
@@ -823,6 +1028,10 @@ or agent task planning. Any terminal program can run in its panes, while the
 built-in attention integration currently targets Codex and Claude Code
 lifecycle hooks.
 
+Credential bundles are semantic adapters, not arbitrary socket forwarding.
+Version 0.8.0 implements the SSH-agent and filtered OpenPGP adapters only; PIVB,
+OSTUI, and other capability types remain future designs.
+
 Keep short-lived utility terminals on plain Kitty unless their processes should
 persist. Existing `new_window_with_cwd` and `new_tab_with_cwd` mappings continue
 to work: the managed instance uses Kitty's last OSC-7-reported directory before
@@ -830,10 +1039,11 @@ routing the new pane through zka.
 
 ## Project status
 
-Version 0.7.0 implements the complete workspace-centric path: local lifecycle,
-topology restoration, remote mirrors and two-phase moves, reconnect-safe SSH
-agent forwarding, Codex and Claude Code attention, Waybar streaming,
-desktop/ntfy notifications, and durable cleanup after partial failures.
+Version 0.8.0 combines three systems: durable Kitty-native workspaces, Codex and
+Claude Code attention routing, and reconnect-safe remote credential bundles for
+SSH agents and filtered OpenPGP. It also includes remote mirrors and two-phase
+moves, headless origins, Waybar streaming, desktop/ntfy notifications, and
+durable cleanup after partial failures.
 
 State schemas v1 and v2 are reset on the first v0.3-or-newer start because v3
 changed process ownership. The reset removes old zka state and generated Kitty

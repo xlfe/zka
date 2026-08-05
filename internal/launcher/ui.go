@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"sort"
 	"strings"
 	"time"
 
@@ -43,7 +44,7 @@ const (
 	resultRemote
 	resultLaunch
 	resultDetach
-	resultAgent
+	resultCredentials
 	resultForget
 )
 
@@ -86,7 +87,8 @@ type ui struct {
 	localNodeID           string
 	selectOnLoad          string
 	selected              int
-	agentForwarding       bool
+	credentialsEnabled    bool
+	defaultBundle         string
 	localLoading          bool
 	localError            string
 	busy                  bool
@@ -96,19 +98,19 @@ type ui struct {
 	forgetWorkspace       *zka.Workspace
 	forgetReturnSelection int
 
-	newButton        widget.Clickable
-	remoteButton     widget.Clickable
-	backButton       widget.Clickable
-	primaryButton    widget.Clickable
-	retryButton      widget.Clickable
-	rows             map[string]*widget.Clickable
-	selectables      map[string]*widget.Selectable
-	localList        widget.List
-	remoteList       widget.List
-	remoteAgent      widget.Bool
-	nameEditor       widget.Editor
-	hostEditor       widget.Editor
-	remoteNameEditor widget.Editor
+	newButton         widget.Clickable
+	remoteButton      widget.Clickable
+	backButton        widget.Clickable
+	primaryButton     widget.Clickable
+	retryButton       widget.Clickable
+	rows              map[string]*widget.Clickable
+	selectables       map[string]*widget.Selectable
+	localList         widget.List
+	remoteList        widget.List
+	remoteCredentials widget.Bool
+	nameEditor        widget.Editor
+	hostEditor        widget.Editor
+	remoteNameEditor  widget.Editor
 }
 
 func Run(w *app.Window, modes ...string) error {
@@ -170,18 +172,17 @@ func newUI(backend Backend) *ui {
 		ContrastBg: colors.accent,
 		ContrastFg: colors.background,
 	}
-	agentForwarding := false
+	credentialsEnabled := false
+	defaultBundle := ""
 	if cfg, err := zka.LoadConfig(); err == nil {
-		agentForwarding = cfg.SSH.ForwardAgent
+		credentialsEnabled = len(cfg.Credentials.Bundles) != 0
+		defaultBundle = cfg.Credentials.DefaultBundle
 	}
 	application := &ui{
-		backend:         backend,
-		theme:           theme,
-		colors:          colors,
-		agentForwarding: agentForwarding,
-		results:         make(chan asyncResult, 8),
-		rows:            map[string]*widget.Clickable{},
-		selectables:     map[string]*widget.Selectable{},
+		backend: backend, theme: theme, colors: colors,
+		credentialsEnabled: credentialsEnabled, defaultBundle: defaultBundle,
+		results: make(chan asyncResult, 8), rows: map[string]*widget.Clickable{},
+		selectables: map[string]*widget.Selectable{},
 	}
 	application.localList.Axis = layout.Vertical
 	application.remoteList.Axis = layout.Vertical
@@ -252,7 +253,7 @@ func (ui *ui) loadRemote(host string) {
 	token := ui.operationToken
 	ui.remoteHost = host
 	ui.remote = nil
-	ui.remoteAgent.Value = false
+	ui.remoteCredentials.Value = false
 	ui.screen = screenRemoteList
 	ui.selected = 0
 	ui.busy = true
@@ -298,37 +299,37 @@ func (ui *ui) confirmForget() {
 	ui.execute(resultForget, workspace.ID, forgetArgs(workspace), "Forgetting "+workspace.Name+" on this machine…")
 }
 
-func (ui *ui) toggleWorkspaceAgent(workspace *zka.Workspace) {
+func (ui *ui) toggleWorkspaceCredentials(workspace *zka.Workspace) {
 	if workspace.RemoteHost == "" {
-		if workspace.AgentAttachmentID == "" {
+		if workspace.CredentialClaim == nil {
 			return
 		}
-		releaseArgs, _ := workspaceAgentAction(workspace, ui.localNodeID)
+		releaseArgs, _ := workspaceCredentialAction(workspace, ui.localNodeID)
 		if !workspaceAttachedToNode(workspace, ui.localNodeID) {
 			ui.launchAll(
 				[][]string{releaseArgs, attachArgs("", workspace)},
-				"Attaching to "+workspace.Name+" and using this machine's SSH agent…",
+				"Releasing remote credentials and attaching to "+workspace.Name+"…",
 			)
 			return
 		}
 		ui.execute(
-			resultAgent,
+			resultCredentials,
 			workspace.ID,
 			releaseArgs,
-			"Using this machine's SSH agent for "+workspace.Name+"…",
+			"Releasing credentials from "+workspace.Name+"…",
 		)
 		return
 	}
 	if !workspaceAttachedToNode(workspace, ui.localNodeID) &&
-		!workspaceAgentClaimedByNode(workspace, ui.localNodeID) {
+		!workspaceCredentialsClaimedByNode(workspace, ui.localNodeID) {
 		ui.launch(
-			remoteAttachArgs(workspace.RemoteHost, workspace, true),
-			"Attaching to "+workspace.Name+" and using this machine's SSH agent…",
+			remoteAttachArgs(workspace.RemoteHost, workspace, true, ui.defaultBundle),
+			"Attaching to "+workspace.Name+" and claiming "+ui.defaultBundle+" credentials…",
 		)
 		return
 	}
-	args, action := workspaceAgentAction(workspace, ui.localNodeID)
-	ui.execute(resultAgent, workspace.ID, args, action+" "+workspace.Name+"…")
+	args, action := workspaceCredentialAction(workspace, ui.localNodeID)
+	ui.execute(resultCredentials, workspace.ID, args, action+" "+workspace.Name+"…")
 }
 
 func (ui *ui) execute(kind resultKind, workspace string, args []string, status string) {
@@ -430,7 +431,7 @@ func (ui *ui) drainResults() {
 					continue
 				}
 				ui.window.Perform(system.ActionClose)
-			case resultDetach, resultAgent:
+			case resultDetach, resultCredentials:
 				if result.token != ui.operationToken {
 					continue
 				}
@@ -514,7 +515,7 @@ func (ui *ui) handleKeys(gtx layout.Context) {
 		case "F":
 			ui.forgetSelection()
 		case "A":
-			ui.toggleAgentSelection()
+			ui.toggleCredentialSelection()
 		}
 	}
 }
@@ -622,8 +623,8 @@ func (ui *ui) handleClicks(gtx layout.Context) {
 				ui.openForget(workspace)
 				return
 			}
-			if ui.workspaceAgentControlVisible(workspace) && ui.row("agent:"+key).Clicked(gtx) {
-				ui.toggleWorkspaceAgent(workspace)
+			if ui.workspaceCredentialControlVisible(workspace) && ui.row("credentials:"+key).Clicked(gtx) {
+				ui.toggleWorkspaceCredentials(workspace)
 				return
 			}
 			if workspaceAttachedToNode(workspace, ui.localNodeID) && ui.row("detach:"+key).Clicked(gtx) {
@@ -662,7 +663,7 @@ func (ui *ui) handleClicks(gtx layout.Context) {
 		}
 		for _, workspace := range ui.remote {
 			if ui.row("remote:" + ui.remoteHost + ":" + workspace.ID).Clicked(gtx) {
-				ui.launch(remoteAttachArgs(ui.remoteHost, workspace, ui.remoteAgent.Value), "Attaching to "+workspace.Name+"…")
+				ui.launch(remoteAttachArgs(ui.remoteHost, workspace, ui.remoteCredentials.Value, ui.defaultBundle), "Attaching to "+workspace.Name+"…")
 				return
 			}
 		}
@@ -733,95 +734,114 @@ func (ui *ui) openRemoteCreate() {
 // createRemote births the workspace on the origin and attaches it here in one
 // subprocess; success closes the launcher exactly like a plain attach.
 func (ui *ui) createRemote() {
-	ui.launch(remoteCreateArgs(ui.remoteHost, ui.remoteNameEditor.Text(), ui.remoteAgent.Value), "Creating workspace on "+ui.remoteHost+"…")
+	ui.launch(remoteCreateArgs(ui.remoteHost, ui.remoteNameEditor.Text(), ui.remoteCredentials.Value, ui.defaultBundle), "Creating workspace on "+ui.remoteHost+"…")
 }
 
-func remoteAttachArgs(host string, workspace *zka.Workspace, claimAgent bool) []string {
+func remoteAttachArgs(host string, workspace *zka.Workspace, claimCredentials bool, bundle string) []string {
 	args := attachArgs(host, workspace)
-	if claimAgent {
-		args = append(args, "--claim-agent")
+	if claimCredentials {
+		args = append(args, "--claim-credentials")
+		if bundle != "" {
+			args = append(args, "--credential-bundle", bundle)
+		}
 	}
 	return args
 }
 
-func remoteCreateArgs(host, name string, claimAgent bool) []string {
+func remoteCreateArgs(host, name string, claimCredentials bool, bundle string) []string {
 	args := createRemoteArgs(host, name)
-	if claimAgent {
-		args = append(args, "--claim-agent")
+	if claimCredentials {
+		args = append(args, "--claim-credentials")
+		if bundle != "" {
+			args = append(args, "--credential-bundle", bundle)
+		}
 	}
 	return args
 }
 
-func workspaceAgentClaimedByNode(workspace *zka.Workspace, nodeID string) bool {
-	if workspace == nil || workspace.AgentAttachmentID == "" || nodeID == "" {
+func workspaceCredentialsClaimedByNode(workspace *zka.Workspace, nodeID string) bool {
+	if workspace == nil || workspace.CredentialClaim == nil || nodeID == "" {
 		return false
 	}
-	attachment := workspace.Attachments[workspace.AgentAttachmentID]
-	return attachment != nil && attachment.Node.ID == nodeID
+	return workspace.CredentialClaim.OwnerNodeID == nodeID
 }
 
-func workspaceAgentAction(workspace *zka.Workspace, nodeID string) ([]string, string) {
+func workspaceCredentialAction(workspace *zka.Workspace, nodeID string) ([]string, string) {
 	ref := workspace.ID
 	if workspace.RemoteHost != "" {
 		ref = workspace.RemoteHost + ":" + ref
 	}
 	if workspace.RemoteHost == "" {
-		return []string{"workspace", "agent", "release", ref}, "Using this machine's SSH agent for"
+		return []string{"workspace", "credentials", "release", ref}, "Releasing credentials from"
 	}
-	if workspaceAgentClaimedByNode(workspace, nodeID) {
-		return []string{"workspace", "agent", "release", ref}, "Releasing the SSH agent from"
+	if workspaceCredentialsClaimedByNode(workspace, nodeID) {
+		return []string{"workspace", "credentials", "release", ref}, "Releasing credentials from"
 	}
-	return []string{"workspace", "agent", "claim", ref}, "Using this machine's SSH agent for"
+	return []string{"workspace", "credentials", "claim", ref}, "Claiming credentials for"
 }
 
-func workspaceAgentButtonLabel(workspace *zka.Workspace, nodeID string) string {
-	if workspaceAgentClaimedByNode(workspace, nodeID) {
-		return "Release SSH agent"
+func workspaceCredentialButtonLabel(workspace *zka.Workspace, nodeID string) string {
+	if workspace.RemoteHost == "" && workspace.CredentialClaim != nil {
+		if !workspaceAttachedToNode(workspace, nodeID) {
+			return "Attach + release credentials"
+		}
+		return "Release credentials"
+	}
+	if workspaceCredentialsClaimedByNode(workspace, nodeID) {
+		return "Release credentials"
 	}
 	if !workspaceAttachedToNode(workspace, nodeID) {
-		return "Attach + use SSH agent"
+		return "Attach + claim credentials"
 	}
-	return "Use SSH agent here"
+	return "Claim credentials here"
 }
 
-func (ui *ui) workspaceAgentControlVisible(workspace *zka.Workspace) bool {
+func (ui *ui) workspaceCredentialControlVisible(workspace *zka.Workspace) bool {
 	if workspace == nil {
 		return false
 	}
 	if workspace.RemoteHost == "" {
-		return workspace.AgentAttachmentID != ""
+		return workspace.CredentialClaim != nil
 	}
-	if workspaceAgentClaimedByNode(workspace, ui.localNodeID) {
+	if workspaceCredentialsClaimedByNode(workspace, ui.localNodeID) {
 		return true
 	}
-	return ui.agentForwarding && workspaceKnownToNode(workspace, ui.localNodeID)
+	return ui.credentialsEnabled && ui.defaultBundle != "" && workspaceKnownToNode(workspace, ui.localNodeID)
 }
 
-func workspaceSSHAgentSummary(workspace *zka.Workspace, remoteHost, localNodeID string) string {
+func workspaceCredentialSummary(workspace *zka.Workspace, remoteHost, localNodeID string) string {
 	if workspace == nil {
 		return ""
 	}
-	if workspace.AgentAttachmentID == "" {
+	if workspace.CredentialClaim == nil {
 		if remoteHost == "" {
 			return ""
 		}
-		return "SSH agent: origin"
+		return "Credentials: unclaimed"
 	}
-	attachment := workspace.Attachments[workspace.AgentAttachmentID]
-	if attachment == nil {
-		return "SSH agent: another attachment"
+	claim := workspace.CredentialClaim
+	capabilities := make([]string, 0, len(claim.Capabilities))
+	for name, capability := range claim.Capabilities {
+		capabilities = append(capabilities, name+" "+capability.State)
 	}
-	if localNodeID != "" && attachment.Node.ID == localNodeID {
-		return "SSH agent: this machine"
-	}
-	owner := strings.TrimSpace(attachment.Node.Name)
-	if owner == "" {
-		owner = shortID(attachment.Node.ID)
+	sort.Strings(capabilities)
+	owner := "another machine"
+	if localNodeID != "" && claim.OwnerNodeID == localNodeID {
+		owner = "this machine"
+	} else if attachment := workspace.Attachments[claim.OwnerAttachmentID]; attachment != nil {
+		owner = strings.TrimSpace(attachment.Node.Name)
+		if owner == "" {
+			owner = shortID(claim.OwnerNodeID)
+		}
 	}
 	if owner == "" {
 		owner = "another machine"
 	}
-	return "SSH agent: " + owner
+	detail := claim.Bundle
+	if len(capabilities) != 0 {
+		detail += " (" + strings.Join(capabilities, ", ") + ")"
+	}
+	return "Credentials: " + detail + " · " + owner
 }
 
 func (ui *ui) back() {
@@ -884,7 +904,7 @@ func (ui *ui) activateSelection() {
 		index := ui.selected - 1
 		if index >= 0 && index < len(ui.remote) {
 			workspace := ui.remote[index]
-			ui.launch(remoteAttachArgs(ui.remoteHost, workspace, ui.remoteAgent.Value), "Attaching to "+workspace.Name+"…")
+			ui.launch(remoteAttachArgs(ui.remoteHost, workspace, ui.remoteCredentials.Value, ui.defaultBundle), "Attaching to "+workspace.Name+"…")
 		}
 	case screenForget:
 		ui.confirmForget()
@@ -925,13 +945,13 @@ func (ui *ui) forgetSelection() {
 	ui.openForget(ui.local[index])
 }
 
-func (ui *ui) toggleAgentSelection() {
+func (ui *ui) toggleCredentialSelection() {
 	if ui.busy {
 		return
 	}
 	if ui.screen == screenRemoteList {
-		if ui.agentForwarding {
-			ui.remoteAgent.Value = !ui.remoteAgent.Value
+		if ui.credentialsEnabled && ui.defaultBundle != "" {
+			ui.remoteCredentials.Value = !ui.remoteCredentials.Value
 		}
 		return
 	}
@@ -943,8 +963,8 @@ func (ui *ui) toggleAgentSelection() {
 		return
 	}
 	workspace := ui.local[index]
-	if ui.workspaceAgentControlVisible(workspace) {
-		ui.toggleWorkspaceAgent(workspace)
+	if ui.workspaceCredentialControlVisible(workspace) {
+		ui.toggleWorkspaceCredentials(workspace)
 	}
 }
 
@@ -1042,17 +1062,17 @@ func (ui *ui) layoutLocalList(gtx layout.Context) layout.Dimensions {
 			action = "Switch →"
 			detachButton = ui.row("detach:" + key)
 		}
-		var agentButton *widget.Clickable
-		agentLabel := ""
-		if ui.workspaceAgentControlVisible(workspace) {
-			agentButton = ui.row("agent:" + key)
-			agentLabel = workspaceAgentButtonLabel(workspace, ui.localNodeID)
+		var credentialButton *widget.Clickable
+		credentialLabel := ""
+		if ui.workspaceCredentialControlVisible(workspace) {
+			credentialButton = ui.row("credentials:" + key)
+			credentialLabel = workspaceCredentialButtonLabel(workspace, ui.localNodeID)
 		}
 		var forgetButton *widget.Clickable
 		if workspaceForgettable(workspace, ui.localNodeID) {
 			forgetButton = ui.row("forget:" + key)
 		}
-		return ui.workspaceRow(gtx, ui.row(key), detachButton, agentButton, forgetButton, agentLabel, workspace, action, ui.selected == item.selection+2)
+		return ui.workspaceRow(gtx, ui.row(key), detachButton, credentialButton, forgetButton, credentialLabel, workspace, action, ui.selected == item.selection+2)
 	})
 }
 
@@ -1142,12 +1162,12 @@ func (ui *ui) layoutRemoteList(gtx layout.Context) layout.Dimensions {
 			key := "remote-list:new:" + ui.remoteHost
 			return ui.actionRow(gtx, key, ui.row(key), "New workspace on "+ui.remoteHost, "Create it on the origin and attach it here", ui.selected == 0)
 		}
-		agentOption := func(gtx layout.Context) layout.Dimensions {
-			return ui.layoutRemoteAgentOption(gtx, "remote-list")
+		credentialOption := func(gtx layout.Context) layout.Dimensions {
+			return ui.layoutRemoteCredentialOption(gtx, "remote-list")
 		}
 		if len(ui.remote) == 0 {
 			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-				layout.Rigid(agentOption),
+				layout.Rigid(credentialOption),
 				layout.Rigid(newRow),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return ui.message(gtx, "remote-list:empty", "No workspaces found on "+ui.remoteHost+".", false)
@@ -1155,7 +1175,7 @@ func (ui *ui) layoutRemoteList(gtx layout.Context) layout.Dimensions {
 			)
 		}
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-			layout.Rigid(agentOption),
+			layout.Rigid(credentialOption),
 			layout.Rigid(newRow),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 				return material.List(ui.theme, &ui.remoteList).Layout(gtx, len(ui.remote), func(gtx layout.Context, index int) layout.Dimensions {
@@ -1181,7 +1201,7 @@ func (ui *ui) layoutRemoteCreate(gtx layout.Context) layout.Dimensions {
 				})
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return ui.layoutRemoteAgentOption(gtx, "remote-create")
+				return ui.layoutRemoteCredentialOption(gtx, "remote-create")
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.operationMessage(gtx) }),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -1204,7 +1224,7 @@ func (ui *ui) layoutForget(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return ui.message(gtx, "forget:details",
-					"Generated Kitty sessions on this machine will be removed. SSH agent ownership on the origin will not change, and reconnecting may make this workspace appear again.", false)
+					"Generated Kitty sessions on this machine will be removed. Credential ownership on the origin will not change, and reconnecting may make this workspace appear again.", false)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.operationMessage(gtx) }),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -1216,22 +1236,22 @@ func (ui *ui) layoutForget(gtx layout.Context) layout.Dimensions {
 	})
 }
 
-func (ui *ui) layoutRemoteAgentOption(gtx layout.Context, key string) layout.Dimensions {
+func (ui *ui) layoutRemoteCredentialOption(gtx layout.Context, key string) layout.Dimensions {
 	return layout.Inset{Top: 12, Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		if !ui.agentForwarding {
-			ui.remoteAgent.Value = false
-			return ui.message(gtx, key+":agent-disabled", "SSH agent forwarding is disabled on this machine.", false)
+		if !ui.credentialsEnabled || ui.defaultBundle == "" {
+			ui.remoteCredentials.Value = false
+			return ui.message(gtx, key+":credentials-disabled", "Set a default credential bundle to claim credentials while attaching.", false)
 		}
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				style := material.CheckBox(ui.theme, &ui.remoteAgent, "Use this machine's SSH agent")
+				style := material.CheckBox(ui.theme, &ui.remoteCredentials, "Claim "+ui.defaultBundle+" credentials from this machine")
 				return style.Layout(gtx)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Left: 34}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					label := material.Caption(ui.theme, "SSH agent forwarding is enabled on this machine. Claim after attach, then release or move it later.")
+					label := material.Caption(ui.theme, "The selected bundle is claimed after attach and remains claimed until release or owner detach.")
 					label.Color = ui.colors.muted
-					return ui.selectableLabel(gtx, key+":agent-help", label)
+					return ui.selectableLabel(gtx, key+":credentials-help", label)
 				})
 			}),
 		)
@@ -1287,7 +1307,7 @@ func (ui *ui) workspaceSectionHeader(gtx layout.Context, label string) layout.Di
 	})
 }
 
-func (ui *ui) workspaceRow(gtx layout.Context, button, detachButton, agentButton, forgetButton *widget.Clickable, agentLabel string, workspace *zka.Workspace, action string, selected bool) layout.Dimensions {
+func (ui *ui) workspaceRow(gtx layout.Context, button, detachButton, credentialButton, forgetButton *widget.Clickable, credentialLabel string, workspace *zka.Workspace, action string, selected bool) layout.Dimensions {
 	return layout.Inset{Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
@@ -1297,26 +1317,26 @@ func (ui *ui) workspaceRow(gtx layout.Context, button, detachButton, agentButton
 					remoteHost = ui.remoteHost
 				}
 				summary := workspaceSummary(workspace)
-				if agent := workspaceSSHAgentSummary(workspace, remoteHost, ui.localNodeID); agent != "" {
-					summary += "  ·  " + agent
+				if credentials := workspaceCredentialSummary(workspace, remoteHost, ui.localNodeID); credentials != "" {
+					summary += "  ·  " + credentials
 				}
 				return ui.actionCard(gtx, key, button, workspace.Name, summary, action, selected)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				if detachButton == nil && agentButton == nil && forgetButton == nil {
+				if detachButton == nil && credentialButton == nil && forgetButton == nil {
 					return layout.Dimensions{}
 				}
 				return layout.Inset{Left: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					children := make([]layout.FlexChild, 0, 3)
-					if agentButton != nil {
+					if credentialButton != nil {
 						children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return ui.agentButton(gtx, agentButton, agentLabel)
+							return ui.credentialButton(gtx, credentialButton, credentialLabel)
 						}))
 					}
 					if detachButton != nil {
 						children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 							inset := layout.Inset{}
-							if agentButton != nil {
+							if credentialButton != nil {
 								inset.Top = 6
 							}
 							return inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -1327,7 +1347,7 @@ func (ui *ui) workspaceRow(gtx layout.Context, button, detachButton, agentButton
 					if forgetButton != nil {
 						children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 							inset := layout.Inset{}
-							if agentButton != nil || detachButton != nil {
+							if credentialButton != nil || detachButton != nil {
 								inset.Top = 6
 							}
 							return inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -1453,7 +1473,7 @@ func (ui *ui) forgetButton(gtx layout.Context, button *widget.Clickable) layout.
 	return style.Layout(gtx)
 }
 
-func (ui *ui) agentButton(gtx layout.Context, button *widget.Clickable, label string) layout.Dimensions {
+func (ui *ui) credentialButton(gtx layout.Context, button *widget.Clickable, label string) layout.Dimensions {
 	style := material.Button(ui.theme, button, label)
 	style.Background = ui.colors.surface
 	style.Color = ui.colors.accent
@@ -1494,9 +1514,9 @@ func (ui *ui) centeredMessage(gtx layout.Context, message string) layout.Dimensi
 func (ui *ui) footer(gtx layout.Context) layout.Dimensions {
 	text := "↑↓ Navigate    Enter Select    Esc Back"
 	if ui.screen == screenHome {
-		text = "↑↓ Navigate    Enter Switch/Attach    A SSH agent    D Detach    F Forget    Esc Close"
+		text = "↑↓ Navigate    Enter Switch/Attach    A Credentials    D Detach    F Forget    Esc Close"
 	} else if ui.screen == screenRemoteList {
-		text = "↑↓ Navigate    Enter Select    A Toggle SSH agent    Esc Back"
+		text = "↑↓ Navigate    Enter Select    A Toggle credentials    Esc Back"
 	}
 	label := material.Caption(ui.theme, text)
 	label.Color = ui.colors.muted

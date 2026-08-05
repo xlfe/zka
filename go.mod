@@ -5,6 +5,7 @@ go 1.26
 require (
 	gioui.org v0.10.1
 	github.com/godbus/dbus/v5 v5.2.2
+	github.com/hashicorp/yamux v0.1.2
 )
 
 require (

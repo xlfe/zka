@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -34,11 +36,12 @@ type Config struct {
 		Command string `json:"command"`
 	} `json:"zmx"`
 	SSH struct {
-		Command       string   `json:"command"`
-		Options       []string `json:"options"`
-		IdentityAgent string   `json:"identity_agent"`
-		ForwardAgent  bool     `json:"forward_agent"`
+		Command         string            `json:"command"`
+		Options         []string          `json:"options"`
+		IdentityAgent   string            `json:"identity_agent"`
+		ExpectedNodeIDs map[string]string `json:"expected_node_ids"`
 	} `json:"ssh"`
+	Credentials   CredentialsConfig `json:"credentials"`
 	Notifications struct {
 		DesktopEnabled      bool   `json:"desktop_enabled"`
 		NtfyEnabled         bool   `json:"ntfy_enabled"`
@@ -57,6 +60,43 @@ type Config struct {
 	} `json:"integrations"`
 }
 
+type CredentialsConfig struct {
+	DefaultBundle string                              `json:"default_bundle"`
+	GnuPG         CredentialGnuPGConfig               `json:"gnupg"`
+	Bundles       map[string]CredentialBundleConfig   `json:"bundles"`
+	Providers     map[string]CredentialProviderConfig `json:"providers"`
+}
+
+type CredentialProviderConfig struct {
+	NodeID             string   `json:"node_id"`
+	SSHSourceAddresses []string `json:"ssh_source_addresses"`
+}
+
+type CredentialGnuPGConfig struct {
+	Command                string `json:"command"`
+	GPGConfCommand         string `json:"gpgconf_command"`
+	GPGConnectAgentCommand string `json:"gpg_connect_agent_command"`
+	ConfigureAgent         bool   `json:"configure_agent"`
+	OperationTimeout       string `json:"operation_timeout"`
+}
+
+type CredentialBundleConfig struct {
+	SSHAgent struct {
+		Enable bool `json:"enable"`
+	} `json:"ssh_agent"`
+	OpenPGP struct {
+		Enable      bool     `json:"enable"`
+		SigningKeys []string `json:"signing_keys"`
+	} `json:"openpgp"`
+}
+
+func (c Config) credentialBundle(name string) (CredentialBundleConfig, bool) {
+	bundle, ok := c.Credentials.Bundles[name]
+	return bundle, ok
+}
+
+func (c Config) credentialsEnabled() bool { return len(c.Credentials.Bundles) != 0 }
+
 func defaultConfig() Config {
 	var cfg Config
 	cfg.Shell.Command = []string{"fish"}
@@ -70,6 +110,13 @@ func defaultConfig() Config {
 		"-o", "ServerAliveCountMax=3",
 		"-o", "BatchMode=yes",
 	}
+	cfg.Credentials.GnuPG.Command = "gpg"
+	cfg.Credentials.GnuPG.GPGConfCommand = "gpgconf"
+	cfg.Credentials.GnuPG.GPGConnectAgentCommand = "gpg-connect-agent"
+	cfg.Credentials.GnuPG.OperationTimeout = "45s"
+	cfg.Credentials.Bundles = map[string]CredentialBundleConfig{}
+	cfg.Credentials.Providers = map[string]CredentialProviderConfig{}
+	cfg.SSH.ExpectedNodeIDs = map[string]string{}
 	cfg.Attention.States = []AgentState{StateBlocked, StateError, StateDone}
 	cfg.Notifications.DesktopEnabled = true
 	cfg.Notifications.NtfyEnabled = true
@@ -89,11 +136,22 @@ func LoadConfig() (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("read config %s: %w", path, err)
 		}
-		if err := json.Unmarshal(b, &cfg); err != nil {
+		decoder := json.NewDecoder(strings.NewReader(string(b)))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&cfg); err != nil {
 			return Config{}, fmt.Errorf("decode config %s: %w", path, err)
 		}
 	}
 	applyConfigEnvironment(&cfg)
+	if cfg.Credentials.Bundles == nil {
+		cfg.Credentials.Bundles = map[string]CredentialBundleConfig{}
+	}
+	if cfg.Credentials.Providers == nil {
+		cfg.Credentials.Providers = map[string]CredentialProviderConfig{}
+	}
+	if cfg.SSH.ExpectedNodeIDs == nil {
+		cfg.SSH.ExpectedNodeIDs = map[string]string{}
+	}
 	if len(cfg.Shell.Command) == 0 || cfg.Shell.Command[0] == "" {
 		return Config{}, fmt.Errorf("shell.command must contain an executable")
 	}
@@ -111,24 +169,133 @@ func LoadConfig() (Config, error) {
 		seenStates[state] = true
 	}
 	for label, command := range map[string]string{
-		"kitty.command":              cfg.Kitty.Command,
-		"kitty.kitten_command":       cfg.Kitty.KittenCommand,
-		"zmx.command":                cfg.ZMX.Command,
-		"ssh.command":                cfg.SSH.Command,
-		"notifications.ntfy_command": cfg.Notifications.NtfyCommand,
-		"focus.sway_command":         cfg.Focus.SwayCommand,
+		"kitty.command":                               cfg.Kitty.Command,
+		"kitty.kitten_command":                        cfg.Kitty.KittenCommand,
+		"zmx.command":                                 cfg.ZMX.Command,
+		"ssh.command":                                 cfg.SSH.Command,
+		"notifications.ntfy_command":                  cfg.Notifications.NtfyCommand,
+		"focus.sway_command":                          cfg.Focus.SwayCommand,
+		"credentials.gnupg.command":                   cfg.Credentials.GnuPG.Command,
+		"credentials.gnupg.gpgconf_command":           cfg.Credentials.GnuPG.GPGConfCommand,
+		"credentials.gnupg.gpg_connect_agent_command": cfg.Credentials.GnuPG.GPGConnectAgentCommand,
 	} {
 		if command == "" {
 			return Config{}, fmt.Errorf("%s must not be empty", label)
 		}
 	}
+	timeout, err := time.ParseDuration(cfg.Credentials.GnuPG.OperationTimeout)
+	if err != nil || timeout <= 0 {
+		return Config{}, fmt.Errorf("credentials.gnupg.operation_timeout must be a positive Go duration")
+	}
+	if sshForwardAgentEnabled(cfg.SSH.Options) {
+		return Config{}, fmt.Errorf("ssh.options must not enable ForwardAgent; use a credential bundle with ssh_agent enabled")
+	}
+	for host, nodeID := range cfg.SSH.ExpectedNodeIDs {
+		if err := validateSSHHost(host); err != nil {
+			return Config{}, fmt.Errorf("ssh.expected_node_ids host %q: %w", host, err)
+		}
+		if err := validateNodeID(nodeID); err != nil {
+			return Config{}, fmt.Errorf("ssh.expected_node_ids[%q]: %w", host, err)
+		}
+	}
+	providerNodeIDs := map[string]string{}
+	for name, provider := range cfg.Credentials.Providers {
+		if err := validateCredentialBundleName(name); err != nil {
+			return Config{}, fmt.Errorf("credential provider: %w", err)
+		}
+		if err := validateNodeID(provider.NodeID); err != nil {
+			return Config{}, fmt.Errorf("credential provider %q: %w", name, err)
+		}
+		if previous := providerNodeIDs[provider.NodeID]; previous != "" {
+			return Config{}, fmt.Errorf("credential providers %q and %q repeat node id %s", previous, name, provider.NodeID)
+		}
+		providerNodeIDs[provider.NodeID] = name
+		for index, source := range provider.SSHSourceAddresses {
+			if _, err := parseCredentialSourceNetwork(source); err != nil {
+				return Config{}, fmt.Errorf("credential provider %q ssh_source_addresses[%d]: %w", name, index, err)
+			}
+		}
+	}
+	for name, bundle := range cfg.Credentials.Bundles {
+		if err := validateCredentialBundleName(name); err != nil {
+			return Config{}, err
+		}
+		if !bundle.SSHAgent.Enable && !bundle.OpenPGP.Enable {
+			return Config{}, fmt.Errorf("credential bundle %q enables no capabilities", name)
+		}
+		seen := map[string]bool{}
+		for index, fingerprint := range bundle.OpenPGP.SigningKeys {
+			canonical, err := canonicalOpenPGPFingerprint(fingerprint)
+			if err != nil {
+				return Config{}, fmt.Errorf("credential bundle %q signing_keys[%d]: %w", name, index, err)
+			}
+			if seen[canonical] {
+				return Config{}, fmt.Errorf("credential bundle %q repeats signing fingerprint %s", name, canonical)
+			}
+			seen[canonical] = true
+			bundle.OpenPGP.SigningKeys[index] = canonical
+		}
+		cfg.Credentials.Bundles[name] = bundle
+	}
+	if cfg.Credentials.DefaultBundle != "" {
+		if _, ok := cfg.Credentials.Bundles[cfg.Credentials.DefaultBundle]; !ok {
+			return Config{}, fmt.Errorf("credentials.default_bundle %q is not defined", cfg.Credentials.DefaultBundle)
+		}
+	}
 	if cfg.SSH.IdentityAgent != "" {
 		cfg.SSH.Options = append([]string{"-o", "IdentityAgent=" + cfg.SSH.IdentityAgent}, cfg.SSH.Options...)
 	}
-	if cfg.SSH.ForwardAgent {
-		cfg.SSH.Options = append([]string{"-o", "ForwardAgent=yes"}, cfg.SSH.Options...)
-	}
 	return cfg, nil
+}
+
+func validateNodeID(id string) error {
+	if len(id) != 32 {
+		return fmt.Errorf("node id must be 32 lowercase hexadecimal characters")
+	}
+	for _, character := range id {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return fmt.Errorf("node id must be 32 lowercase hexadecimal characters")
+		}
+	}
+	return nil
+}
+
+func parseCredentialSourceNetwork(value string) (netip.Prefix, error) {
+	if address, err := netip.ParseAddr(value); err == nil {
+		address = address.Unmap()
+		return netip.PrefixFrom(address, address.BitLen()), nil
+	}
+	prefix, err := netip.ParsePrefix(value)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("must be an IP address or CIDR network")
+	}
+	return prefix.Masked(), nil
+}
+
+func validateCredentialBundleName(name string) error {
+	if name == "" || len(name) > 64 {
+		return fmt.Errorf("invalid credential bundle name %q", name)
+	}
+	for index, r := range name {
+		valid := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-'
+		if !valid || index == 0 && (r == '.' || r == '_' || r == '-') {
+			return fmt.Errorf("invalid credential bundle name %q", name)
+		}
+	}
+	return nil
+}
+
+func canonicalOpenPGPFingerprint(value string) (string, error) {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	if len(value) != 40 && len(value) != 64 {
+		return "", fmt.Errorf("fingerprint must contain 40 or 64 hexadecimal characters")
+	}
+	for _, r := range value {
+		if !(r >= '0' && r <= '9' || r >= 'A' && r <= 'F') {
+			return "", fmt.Errorf("fingerprint must contain only hexadecimal characters")
+		}
+	}
+	return value, nil
 }
 
 type sshAgentInfo struct {
@@ -170,6 +337,26 @@ func sshIdentityAgentOption(options []string) string {
 		}
 	}
 	return ""
+}
+
+func sshForwardAgentEnabled(options []string) bool {
+	for index := 0; index < len(options); index++ {
+		option := options[index]
+		if option == "-A" {
+			return true
+		}
+		if option == "-o" && index+1 < len(options) {
+			if strings.EqualFold(sshConfigOptionValue(options[index+1], "ForwardAgent"), "yes") {
+				return true
+			}
+			index++
+			continue
+		}
+		if strings.HasPrefix(option, "-o") && strings.EqualFold(sshConfigOptionValue(strings.TrimPrefix(option, "-o"), "ForwardAgent"), "yes") {
+			return true
+		}
+	}
+	return false
 }
 
 func sshConfigOptionValue(option, name string) string {

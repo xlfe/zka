@@ -106,7 +106,7 @@ func (d *Daemon) watchAttention(ctx context.Context, conn net.Conn) {
 		}
 		fingerprint = string(raw)
 		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		return json.NewEncoder(conn).Encode(response{Version: protocolVersion, OK: true, Data: raw})
+		return json.NewEncoder(conn).Encode(response{Version: daemonProtocolVersion, OK: true, Data: raw})
 	}
 	if err := send(true); err != nil {
 		return

@@ -91,7 +91,7 @@ func TestStoreRejectsFutureSchema(t *testing.T) {
 	}
 }
 
-func TestStoreMigratesV3PanesAsLegacyAgentRelays(t *testing.T) {
+func TestStoreMarksOldPanesAsMissingCredentialEnvironment(t *testing.T) {
 	paths := testPaths(t.TempDir())
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func TestStoreMigratesV3PanesAsLegacyAgentRelays(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.SchemaVersion != stateSchemaVersion || state.Workspaces["workspace"].Panes["pane"].AgentRelayVersion != 0 {
+	if state.SchemaVersion != stateSchemaVersion || state.Workspaces["workspace"].Panes["pane"].CredentialEnvironmentVersion != 0 {
 		t.Fatalf("migrated state = %#v", state)
 	}
 }

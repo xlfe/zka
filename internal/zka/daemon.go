@@ -19,13 +19,14 @@ import (
 )
 
 type Daemon struct {
-	mu          sync.Mutex
-	lifeMu      sync.Mutex
-	attentionMu sync.Mutex
-	captureMu   sync.Mutex
-	topologyMu  sync.Mutex
-	cleanupMu   sync.Mutex
-	wg          sync.WaitGroup
+	mu           sync.Mutex
+	lifeMu       sync.Mutex
+	attentionMu  sync.Mutex
+	captureMu    sync.Mutex
+	topologyMu   sync.Mutex
+	cleanupMu    sync.Mutex
+	credentialMu sync.Mutex
+	wg           sync.WaitGroup
 
 	paths    Paths
 	store    *Store
@@ -38,31 +39,37 @@ type Daemon struct {
 	logger   *log.Logger
 	sshAgent sshAgentInfo
 
-	ctx               context.Context
-	cancel            context.CancelFunc
-	listener          net.Listener
-	watcher           *net.UnixConn
-	conns             map[net.Conn]struct{}
-	started           bool
-	closed            bool
-	workerErr         error
-	events            chan WatcherEvent
-	capturing         map[string]bool
-	captureAgain      map[string]bool
-	admitting         map[string]bool
-	admitAgain        map[string]bool
-	reconciling       map[string]bool
-	reconcileAgain    map[string]bool
-	deferredReconcile map[string]bool
-	captureHold       map[string]int
-	captureHoldUntil  map[string]time.Time
-	backoff           map[string]*endpointBackoff
-	cleaning          map[string]bool
-	cleanups          map[string]*sync.Mutex
-	deleted           map[string]string
-	remotes           *RemoteManager
-	agentRelays       *agentRelayManager
-	attentionSubs     map[chan struct{}]struct{}
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	listener              net.Listener
+	watcher               *net.UnixConn
+	conns                 map[net.Conn]struct{}
+	started               bool
+	closed                bool
+	workerErr             error
+	events                chan WatcherEvent
+	capturing             map[string]bool
+	captureAgain          map[string]bool
+	admitting             map[string]bool
+	admitAgain            map[string]bool
+	reconciling           map[string]bool
+	reconcileAgain        map[string]bool
+	deferredReconcile     map[string]bool
+	captureHold           map[string]int
+	captureHoldUntil      map[string]time.Time
+	backoff               map[string]*endpointBackoff
+	cleaning              map[string]bool
+	cleanups              map[string]*sync.Mutex
+	deleted               map[string]string
+	remotes               *RemoteManager
+	attentionSubs         map[chan struct{}]struct{}
+	credentialSSHSources  map[string]string
+	credentialOpenPGP     map[string]*credentialOpenPGPManifest
+	credentialActive      map[string]int
+	credentialNotices     map[string]credentialNoticeState
+	credentialTransports  map[string]incomingCredentialTransport
+	credentialClaims      map[string]*sync.Mutex
+	credentialInteractive func() bool
 }
 
 func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, error) {
@@ -139,26 +146,32 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 			Runner:  runner,
 			Command: cfg.Kitty.KittenCommand,
 		},
-		logger:            logger,
-		sshAgent:          newSSHAgentInfo(cfg, os.Getenv("SSH_AUTH_SOCK")),
-		ctx:               ctx,
-		cancel:            cancel,
-		events:            make(chan WatcherEvent, 128),
-		capturing:         map[string]bool{},
-		captureAgain:      map[string]bool{},
-		admitting:         map[string]bool{},
-		admitAgain:        map[string]bool{},
-		reconciling:       map[string]bool{},
-		reconcileAgain:    map[string]bool{},
-		deferredReconcile: map[string]bool{},
-		captureHold:       map[string]int{},
-		captureHoldUntil:  map[string]time.Time{},
-		backoff:           map[string]*endpointBackoff{},
-		cleaning:          map[string]bool{},
-		cleanups:          map[string]*sync.Mutex{},
-		deleted:           map[string]string{},
-		conns:             map[net.Conn]struct{}{},
-		attentionSubs:     map[chan struct{}]struct{}{},
+		logger:               logger,
+		sshAgent:             newSSHAgentInfo(cfg, os.Getenv("SSH_AUTH_SOCK")),
+		ctx:                  ctx,
+		cancel:               cancel,
+		events:               make(chan WatcherEvent, 128),
+		capturing:            map[string]bool{},
+		captureAgain:         map[string]bool{},
+		admitting:            map[string]bool{},
+		admitAgain:           map[string]bool{},
+		reconciling:          map[string]bool{},
+		reconcileAgain:       map[string]bool{},
+		deferredReconcile:    map[string]bool{},
+		captureHold:          map[string]int{},
+		captureHoldUntil:     map[string]time.Time{},
+		backoff:              map[string]*endpointBackoff{},
+		cleaning:             map[string]bool{},
+		cleanups:             map[string]*sync.Mutex{},
+		deleted:              map[string]string{},
+		conns:                map[net.Conn]struct{}{},
+		attentionSubs:        map[chan struct{}]struct{}{},
+		credentialSSHSources: map[string]string{},
+		credentialOpenPGP:    map[string]*credentialOpenPGPManifest{},
+		credentialActive:     map[string]int{},
+		credentialNotices:    map[string]credentialNoticeState{},
+		credentialTransports: map[string]incomingCredentialTransport{},
+		credentialClaims:     map[string]*sync.Mutex{},
 	}
 	store.SetOnSave(d.signalAttention)
 	// Constructor injection rather than a setter: d exists by this point, so
@@ -172,7 +185,6 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 		d.desktop = newDBusNotifier(logger, d.handleDesktopAction)
 	}
 	d.remotes = NewRemoteManager(d)
-	d.agentRelays = newAgentRelayManager(paths.AgentDir, d.sshAgent.EffectiveSocket)
 	return d, nil
 }
 
@@ -199,22 +211,6 @@ func (d *Daemon) Start() error {
 		_ = os.Remove(d.paths.Socket)
 		d.lifeMu.Unlock()
 		return err
-	}
-	if d.config.SSH.ForwardAgent {
-		for _, workspace := range d.state.Workspaces {
-			if workspace.RemoteHost != "" {
-				continue
-			}
-			if _, err := d.agentRelays.ensure(workspace.ID, workspace.AgentAttachmentID); err != nil {
-				_ = watcher.Close()
-				_ = ln.Close()
-				_ = os.Remove(d.paths.Socket)
-				_ = os.Remove(d.paths.WatcherSocket)
-				d.agentRelays.close()
-				d.lifeMu.Unlock()
-				return err
-			}
-		}
 	}
 	d.listener = ln
 	d.watcher = watcher
@@ -249,7 +245,6 @@ func (d *Daemon) Close() error {
 		_ = conn.Close()
 	}
 	d.remotes.Close()
-	d.agentRelays.close()
 	d.lifeMu.Unlock()
 	// After the unlock and before the join: the notifier's signal goroutine
 	// calls startWorker, which takes lifeMu. Shutting it down while holding
@@ -361,8 +356,8 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 		d.writeResponse(conn, nil, fmt.Errorf("decode request: %w", err))
 		return
 	}
-	if req.Version != protocolVersion {
-		d.writeResponse(conn, nil, fmt.Errorf("unsupported protocol %d (daemon requires %d; upgrade and restart all zka peers)", req.Version, protocolVersion))
+	if req.Version != daemonProtocolVersion {
+		d.writeResponse(conn, nil, fmt.Errorf("unsupported protocol %d (daemon requires %d; upgrade and restart all zka peers)", req.Version, daemonProtocolVersion))
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
@@ -385,7 +380,7 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 }
 
 func (d *Daemon) writeResponse(w io.Writer, data any, callErr error) {
-	res := response{Version: protocolVersion, OK: callErr == nil}
+	res := response{Version: daemonProtocolVersion, OK: callErr == nil}
 	if callErr != nil {
 		res.Error = callErr.Error()
 	} else if data != nil {
@@ -504,27 +499,10 @@ type attachmentUpdateRequest struct {
 }
 
 type attachmentPaneReadyRequest struct {
-	Workspace   string `json:"workspace"`
-	Attachment  string `json:"attachment"`
-	Pane        string `json:"pane"`
-	Ready       bool   `json:"ready"`
-	AgentSocket string `json:"agent_socket,omitempty"`
-}
-
-type workspaceAgentRequest struct {
 	Workspace  string `json:"workspace"`
-	Attachment string `json:"attachment,omitempty"`
-}
-
-type workspaceAgentStatus struct {
-	Enabled             bool     `json:"enabled"`
-	State               string   `json:"state"`
-	Available           bool     `json:"available"`
-	Owner               string   `json:"owner"`
-	RelaySocket         string   `json:"relay_socket,omitempty"`
-	ClaimedAttachmentID string   `json:"claimed_attachment_id,omitempty"`
-	ClaimedNodeID       string   `json:"claimed_node_id,omitempty"`
-	LegacyPaneIDs       []string `json:"legacy_pane_ids,omitempty"`
+	Attachment string `json:"attachment"`
+	Pane       string `json:"pane"`
+	Ready      bool   `json:"ready"`
 }
 
 type manifestUpdateRequest struct {
@@ -586,7 +564,7 @@ func decodePayload(raw json.RawMessage, out any) error {
 func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (any, error) {
 	switch op {
 	case "ping":
-		return map[string]any{"pid": os.Getpid(), "schema_version": stateSchemaVersion, "protocol_version": protocolVersion, "node": d.state.Node}, nil
+		return map[string]any{"pid": os.Getpid(), "schema_version": stateSchemaVersion, "protocol_version": daemonProtocolVersion, "remote_protocol_version": remoteProtocolVersion, "node": d.state.Node}, nil
 	case "node":
 		return d.state.Node, nil
 	case "ssh_agent":
@@ -675,24 +653,49 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 			return nil, err
 		}
 		return d.setAttachmentPaneReady(req)
-	case "workspace_agent_claim":
-		var req workspaceAgentRequest
+	case "credentials_claim":
+		var req workspaceCredentialRequest
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
-		return d.claimWorkspaceAgent(req)
-	case "workspace_agent_release":
-		var req workspaceAgentRequest
+		return d.claimWorkspaceCredentials(ctx, req)
+	case "credentials_release":
+		var req workspaceCredentialRequest
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
-		return d.releaseWorkspaceAgent(req.Workspace)
-	case "workspace_agent_status":
-		var req workspaceAgentRequest
+		return d.releaseWorkspaceCredentials(req.Workspace)
+	case "credentials_status":
+		var req workspaceCredentialRequest
+		if len(raw) != 0 {
+			if err := json.Unmarshal(raw, &req); err != nil {
+				return nil, err
+			}
+		}
+		if req.Workspace != "" {
+			status, err := d.workspaceCredentialStatus(req.Workspace)
+			if err != nil {
+				return nil, err
+			}
+			all := d.allCredentialStatuses()
+			return credentialStatusResponse{Transport: all.Transport, Workspaces: []workspaceCredentialStatus{status}, ActiveOperations: all.ActiveOperations}, nil
+		}
+		return d.allCredentialStatuses(), nil
+	case "credentials_transport_session":
+		var req credentialTransportSessionRequest
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
-		return d.workspaceAgentStatus(req.Workspace)
+		return nil, d.setIncomingCredentialTransport(req)
+	case "credentials_target_snapshot":
+		var req credentialTransportSessionRequest
+		if err := decodePayload(raw, &req); err != nil {
+			return nil, err
+		}
+		if err := d.setIncomingCredentialTransport(req); err != nil {
+			return nil, err
+		}
+		return d.listWorkspaces(), nil
 	case "update_manifest":
 		var req manifestUpdateRequest
 		if err := decodePayload(raw, &req); err != nil {
@@ -746,7 +749,25 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
+		if req.Op == "credentials_claim" {
+			var claim workspaceCredentialRequest
+			if err := decodePayload(req.Payload, &claim); err != nil {
+				return nil, err
+			}
+			manifest, err := buildCredentialBundleManifestForSocket(ctx, d.config, claim.Bundle, d.runner, d.credentialSSHSocketForCaller(req.CallerSSHAuthSock))
+			if err != nil {
+				return nil, err
+			}
+			claim.Manifest = manifest
+			req.Payload, err = json.Marshal(claim)
+			if err != nil {
+				return nil, err
+			}
+		}
 		result, err := d.remotes.Call(ctx, req.Host, req.Op, json.RawMessage(req.Payload))
+		if err == nil {
+			d.reconcileCredentialProviderSources(req, result)
+		}
 		return result, withSSHAgentMismatchHint(err, d.sshAgent, req.CallerSSHAuthSock)
 	default:
 		return nil, fmt.Errorf("unknown operation %q", op)
@@ -822,15 +843,9 @@ func (d *Daemon) createWorkspace(req createWorkspaceRequest) (*Workspace, error)
 			return nil, err
 		}
 	}
-	if d.config.SSH.ForwardAgent {
-		if _, err := d.agentRelays.ensure(workspace.ID, ""); err != nil {
-			return nil, err
-		}
-	}
 	d.state.Workspaces[workspace.ID] = workspace
 	if err := d.store.Save(d.state); err != nil {
 		delete(d.state.Workspaces, workspace.ID)
-		d.agentRelays.remove(workspace.ID)
 		return nil, err
 	}
 	return workspace.Clone(), nil
@@ -878,7 +893,6 @@ func (d *Daemon) deleteWorkspace(ref string) error {
 		d.state.Workspaces[workspace.ID] = workspace
 		return err
 	}
-	d.agentRelays.remove(workspace.ID)
 	return d.store.RemoveWorkspaceSessions(workspace.ID)
 }
 
@@ -1223,7 +1237,6 @@ func (d *Daemon) registerAttachment(workspaceRef string, attachment Attachment) 
 		if err := d.store.Save(d.state); err != nil {
 			return nil, err
 		}
-		d.agentRelays.clearAttachment(workspace.ID, existing.ID)
 		return existing.Clone(), nil
 	}
 	attachment.Status = AttachmentPreparing
@@ -1244,7 +1257,6 @@ func (d *Daemon) registerAttachment(workspaceRef string, attachment Attachment) 
 	if err := d.store.Save(d.state); err != nil {
 		return nil, err
 	}
-	d.agentRelays.clearAttachment(workspace.ID, attachment.ID)
 	return attachment.Clone(), nil
 }
 
@@ -1397,21 +1409,6 @@ func (d *Daemon) setAttachmentPaneReady(req attachmentPaneReadyRequest) (*Attach
 	if attachment.Status == AttachmentDetached || attachment.Revoked {
 		return nil, fmt.Errorf("attachment %s is detached or revoked", attachment.ID)
 	}
-	if req.AgentSocket != "" {
-		if !d.config.SSH.ForwardAgent {
-			return nil, fmt.Errorf("SSH agent forwarding is disabled")
-		}
-		if attachment.Transport.Kind != "ssh" {
-			return nil, fmt.Errorf("forwarded SSH agents require an SSH attachment")
-		}
-		if !filepath.IsAbs(req.AgentSocket) {
-			return nil, fmt.Errorf("forwarded SSH agent is not an absolute Unix socket")
-		}
-		info, statErr := os.Lstat(req.AgentSocket)
-		if statErr != nil || info.Mode()&os.ModeSocket == 0 {
-			return nil, fmt.Errorf("forwarded SSH agent is not an available Unix socket")
-		}
-	}
 	if attachment.ClientHeartbeats == nil {
 		attachment.ClientHeartbeats = map[string]time.Time{}
 	}
@@ -1421,150 +1418,18 @@ func (d *Daemon) setAttachmentPaneReady(req attachmentPaneReadyRequest) (*Attach
 	} else {
 		delete(attachment.ClientHeartbeats, req.Pane)
 	}
-	d.agentRelays.register(workspace.ID, agentSource{
-		Attachment: attachment.ID, Pane: req.Pane, Socket: req.AgentSocket, Heartbeat: now,
-	}, req.Ready && req.AgentSocket != "" && !pane.BackendDead)
 	return attachment.Clone(), nil
 }
 
-func liveLegacyPaneIDs(workspace *Workspace) []string {
+func panesRequiringCredentialEnvironment(workspace *Workspace) []string {
 	var ids []string
 	for _, pane := range workspace.Panes {
-		if pane.BackendCreated && !pane.BackendDead && !pane.Retiring() && pane.AgentRelayVersion < agentRelayVersion {
+		if pane.BackendCreated && !pane.BackendDead && !pane.Retiring() && pane.CredentialEnvironmentVersion < credentialEnvironmentVersion {
 			ids = append(ids, pane.ID)
 		}
 	}
 	sort.Strings(ids)
 	return ids
-}
-
-func (d *Daemon) claimWorkspaceAgent(req workspaceAgentRequest) (workspaceAgentStatus, error) {
-	if req.Workspace == "" || req.Attachment == "" {
-		return workspaceAgentStatus{}, fmt.Errorf("workspace and attachment are required")
-	}
-	if !d.config.SSH.ForwardAgent {
-		return workspaceAgentStatus{}, fmt.Errorf("SSH agent forwarding is disabled; enable services.zka.ssh.forwardAgent")
-	}
-	d.mu.Lock()
-	workspace, err := d.resolveWorkspaceLocked(req.Workspace)
-	if err != nil {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, err
-	}
-	if workspace.RemoteHost != "" {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, fmt.Errorf("workspace %q is not authoritative on this host", workspace.Name)
-	}
-	if err := requireWorkspaceMutable(workspace); err != nil {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, err
-	}
-	attachment := workspace.Attachments[req.Attachment]
-	if attachment == nil {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, fmt.Errorf("unknown attachment %q", req.Attachment)
-	}
-	if attachment.Transport.Kind != "ssh" || attachment.Status != AttachmentReady || attachment.Revoked {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, fmt.Errorf("attachment %s is not a ready SSH attachment", attachment.ID)
-	}
-	legacy := liveLegacyPaneIDs(workspace)
-	if len(legacy) != 0 {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, fmt.Errorf("workspace has legacy panes without a stable agent relay: %s; recreate those panes or the workspace", strings.Join(legacy, ", "))
-	}
-	if !d.agentRelays.sourceAvailable(workspace.ID, attachment.ID) {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, fmt.Errorf("attachment %s has no fresh forwarded SSH agent", attachment.ID)
-	}
-	workspace.AgentAttachmentID = attachment.ID
-	workspace.UpdatedAt = time.Now().UTC()
-	if err := d.store.Save(d.state); err != nil {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, err
-	}
-	workspaceID := workspace.ID
-	d.mu.Unlock()
-	d.agentRelays.setClaim(workspaceID, attachment.ID)
-	return d.workspaceAgentStatus(workspaceID)
-}
-
-func (d *Daemon) releaseWorkspaceAgent(workspaceRef string) (workspaceAgentStatus, error) {
-	if workspaceRef == "" {
-		return workspaceAgentStatus{}, fmt.Errorf("workspace is required")
-	}
-	d.mu.Lock()
-	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
-	if err != nil {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, err
-	}
-	if workspace.RemoteHost != "" {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, fmt.Errorf("workspace %q is not authoritative on this host", workspace.Name)
-	}
-	workspace.AgentAttachmentID = ""
-	workspace.UpdatedAt = time.Now().UTC()
-	if err := d.store.Save(d.state); err != nil {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, err
-	}
-	workspaceID := workspace.ID
-	d.mu.Unlock()
-	d.agentRelays.setClaim(workspaceID, "")
-	return d.workspaceAgentStatus(workspaceID)
-}
-
-func (d *Daemon) workspaceAgentStatus(workspaceRef string) (workspaceAgentStatus, error) {
-	d.mu.Lock()
-	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
-	if err != nil {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, err
-	}
-	if workspace.RemoteHost != "" {
-		d.mu.Unlock()
-		return workspaceAgentStatus{}, fmt.Errorf("workspace %q is not authoritative on this host", workspace.Name)
-	}
-	status := workspaceAgentStatus{
-		Enabled: d.config.SSH.ForwardAgent, Owner: "origin",
-		ClaimedAttachmentID: workspace.AgentAttachmentID,
-		LegacyPaneIDs:       liveLegacyPaneIDs(workspace),
-	}
-	if d.config.SSH.ForwardAgent {
-		status.RelaySocket = d.agentRelays.path(workspace.ID)
-	}
-	if workspace.AgentAttachmentID != "" {
-		status.Owner = "attachment"
-		if attachment := workspace.Attachments[workspace.AgentAttachmentID]; attachment != nil {
-			status.ClaimedNodeID = attachment.Node.ID
-		}
-	}
-	workspaceID := workspace.ID
-	claimed := workspace.AgentAttachmentID
-	d.mu.Unlock()
-
-	switch {
-	case !status.Enabled:
-		status.State = "disabled"
-	case len(status.LegacyPaneIDs) != 0:
-		status.State = "legacy"
-	case claimed == "":
-		status.Available = d.agentRelays.available(workspaceID, "")
-		if status.Available {
-			status.State = "origin"
-		} else {
-			status.State = "disconnected"
-		}
-	default:
-		status.Available = d.agentRelays.available(workspaceID, claimed)
-		if status.Available {
-			status.State = "forwarded"
-		} else {
-			status.State = "disconnected"
-		}
-	}
-	return status, nil
 }
 
 func validateAttachmentReady(workspace *Workspace, attachment *Attachment) error {
@@ -2107,9 +1972,6 @@ func (d *Daemon) commitMove(req moveCommitRequest) (moveCommitResponse, error) {
 	if err := d.store.Save(d.state); err != nil {
 		return moveCommitResponse{}, err
 	}
-	if previous != nil {
-		d.agentRelays.clearAttachment(workspace.ID, previous.ID)
-	}
 	return moveCommitResponse{Workspace: workspace.Clone(), Previous: previous}, nil
 }
 
@@ -2147,10 +2009,12 @@ func (d *Daemon) detachAttachment(workspaceRef, attachmentID string) (*Workspace
 		workspace.Revision++
 	}
 	workspace.PendingRevocations = removeString(workspace.PendingRevocations, attachmentID)
+	if workspace.CredentialClaim != nil && workspace.CredentialClaim.OwnerAttachmentID == attachmentID {
+		workspace.CredentialClaim = nil
+	}
 	if err := d.store.Save(d.state); err != nil {
 		return nil, err
 	}
-	d.agentRelays.clearAttachment(workspace.ID, attachmentID)
 	return workspace.Clone(), nil
 }
 
@@ -2208,7 +2072,7 @@ func (d *Daemon) applyEvent(_ context.Context, event Event) (*Workspace, error) 
 	case "process_started":
 		pane.Process = ProcessStatus{Running: true, PID: event.PID, Started: now}
 		pane.BackendCreated, pane.BackendReady, pane.BackendStart = true, true, false
-		pane.AgentRelayVersion = event.AgentRelayVersion
+		pane.CredentialEnvironmentVersion = event.CredentialEnvironmentVersion
 		pane.BackendDead, pane.BackendError = false, ""
 	case "process_exit":
 		pane.Process.Running, pane.Process.PID, pane.Process.ExitCode, pane.Process.Exited = false, 0, event.ExitCode, now

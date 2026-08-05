@@ -9,25 +9,39 @@ import (
 	"testing"
 )
 
-func TestDoctorOriginReportsDaemonAndCallerSSHAgents(t *testing.T) {
-	t.Setenv("SSH_AUTH_SOCK", "/run/user/1234/agent-a.socket")
+func TestDoctorOriginReportsCredentialChecks(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
 	d.config.SSH.Command = "/definitely/missing/zka-ssh"
 	serveTestDaemon(t, d)
-	t.Setenv("SSH_AUTH_SOCK", "/run/user/1234/agent-b.socket")
-
 	var stdout, stderr bytes.Buffer
 	_, err = runDoctor([]string{"--origin", "devbox.example"}, d.paths, &stdout, &stderr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"zkad-ssh-agent", "caller-ssh-agent", "ssh-agent-match", "/run/user/1234/agent-a.socket", "/run/user/1234/agent-b.socket"} {
+	for _, expected := range []string{"credentials-config", "credentials-provider", "credentials-claim", "credentials-transport", "openpgp-keys"} {
 		if !bytes.Contains(stdout.Bytes(), []byte(expected)) {
 			t.Fatalf("doctor output missing %q: %s", expected, stdout.String())
 		}
+	}
+}
+
+func TestDoctorWarningIsLoudWithoutFailing(t *testing.T) {
+	var stdout bytes.Buffer
+	code, err := writeDoctorResult([]doctorCheck{{
+		Name: "openpgp-keys", OK: true, Warning: true,
+		Detail: "work=11112222…99990000/A1B2C3D4:software",
+	}}, false, &stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("warning exit code = %d, want 0", code)
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("WARN  openpgp-keys")) || !bytes.Contains(stdout.Bytes(), []byte(":software")) {
+		t.Fatalf("warning output = %q", stdout.String())
 	}
 }
 
@@ -138,7 +152,7 @@ func TestDoctorHeadlessSkipsViewLayerChecks(t *testing.T) {
 	}
 	out := stdout.String()
 	// kitty, kitten, swaymsg, and kitty-watcher are skipped by configuration;
-	// zmx/ssh/ntfy-send and the agent checks must still be real lookups.
+	// zmx/ssh/ntfy-send and credential checks must still be real lookups.
 	if got := bytes.Count(stdout.Bytes(), []byte("skipped on a headless origin")); got != 5 {
 		t.Fatalf("skip count = %d in:\n%s", got, out)
 	}

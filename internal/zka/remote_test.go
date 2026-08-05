@@ -7,10 +7,11 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/yamux"
 )
 
 const (
@@ -34,11 +35,15 @@ func TestRemoteControlHelloAndWorkspaceSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hello.Type != "hello" || hello.Protocol != remoteProtocolName || hello.Version != protocolVersion {
+	if hello.Type != "hello" || hello.Protocol != remoteProtocolName || hello.Version != remoteProtocolVersion {
 		t.Fatalf("hello = %#v", hello)
 	}
+	var serverHello remoteServerHello
+	if err := json.Unmarshal(hello.Payload, &serverHello); err != nil || serverHello.Node.ID != d.state.Node.ID {
+		t.Fatalf("server identity = %#v, %v", serverHello, err)
+	}
 	payload, _ := json.Marshal(refRequest{Ref: workspace.ID})
-	request := remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "request", ID: "7", Op: "get", Payload: payload}
+	request := remoteEnvelope{Protocol: remoteProtocolName, Version: remoteProtocolVersion, Type: "request", ID: "7", Op: "get", Payload: payload}
 	if err := json.NewEncoder(serverInput).Encode(request); err != nil {
 		t.Fatal(err)
 	}
@@ -68,32 +73,6 @@ func TestRemoteControlHelloAndWorkspaceSnapshot(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("remote control did not stop")
-	}
-}
-
-func TestRemoteAgentForwardingDiagnosticOmitsSocketPath(t *testing.T) {
-	root := t.TempDir()
-	socket := filepath.Join(root, "agent.sock")
-	listenTestAgent(t, socket, "agent")
-	config := filepath.Join(root, "config.json")
-	if err := os.WriteFile(config, []byte(`{"ssh":{"forward_agent":true}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("ZKA_CONFIG", config)
-	t.Setenv("SSH_AUTH_SOCK", socket)
-	payload, err := dispatchRemoteControl(context.Background(), API{}, "agent_forwarding", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var status remoteAgentForwardingStatus
-	if err := json.Unmarshal(payload, &status); err != nil {
-		t.Fatal(err)
-	}
-	if !status.Enabled || !status.ForwardedSocket || status.RelayVersion != agentRelayVersion {
-		t.Fatalf("diagnostic = %#v", status)
-	}
-	if strings.Contains(string(payload), socket) {
-		t.Fatal("diagnostic exposed forwarded socket path")
 	}
 }
 
@@ -666,6 +645,9 @@ func TestInitialSSHExit255ReturnsDiagnostic(t *testing.T) {
 	if !strings.Contains(logs.String(), "Permission denied (publickey)") {
 		t.Fatalf("daemon log = %q", logs.String())
 	}
+	if status := d.remotes.credentialTransportStatusForHost("devbox.example"); status.State != "terminal" || !strings.Contains(status.LastError, "Permission denied") {
+		t.Fatalf("terminal transport status = %#v", status)
+	}
 	if retryErr := api.RemoteCall(ctx, "devbox.example", "list", nil, new([]*Workspace)); retryErr == nil {
 		t.Fatal("retry unexpectedly succeeded")
 	}
@@ -712,7 +694,9 @@ func TestEstablishedSSHExit255RetriesAndPreservesLastFailure(t *testing.T) {
 	var logs boundedTailBuffer
 	d.logger.SetOutput(&logs)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	// Leave enough room for two jittered reconnects even under a loaded Nix
+	// builder; the production backoff intentionally grows to 30 seconds.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_, err = d.remotes.Call(ctx, "devbox.example", "list", nil)
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "status 255") || !strings.Contains(err.Error(), "connection reset") {
@@ -720,6 +704,53 @@ func TestEstablishedSSHExit255RetriesAndPreservesLastFailure(t *testing.T) {
 	}
 	if strings.Count(logs.String(), "connection reset") < 2 {
 		t.Fatalf("established connection was not retried; daemon log = %q", logs.String())
+	}
+}
+
+func TestRemoteSSHTerminalClassifiesAuthenticationAndHostTrustFailures(t *testing.T) {
+	for _, detail := range []string{
+		"Permission denied (publickey).",
+		"Host key verification failed.",
+		"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!",
+		"no matching host key type found",
+	} {
+		if !remoteSSHTerminal(errors.New("ssh failed"), detail) {
+			t.Fatalf("terminal SSH failure was classified as retryable: %q", detail)
+		}
+	}
+	if remoteSSHTerminal(errors.New("ssh failed"), "Connection reset by peer") {
+		t.Fatal("transient connection reset was classified as terminal")
+	}
+}
+
+func TestCredentialProviderIdentityBindsNodeToSSHSource(t *testing.T) {
+	const nodeID = "fedcba9876543210fedcba9876543210"
+	cfg := defaultConfig()
+	cfg.Credentials.Providers["laptop"] = CredentialProviderConfig{
+		NodeID: nodeID, SSHSourceAddresses: []string{"192.0.2.10", "2001:db8::/64"},
+	}
+	for _, connection := range []string{
+		"192.0.2.10 42000 192.0.2.20 22",
+		"2001:db8::42 42000 2001:db8::99 22",
+	} {
+		if err := authenticateCredentialProvider(cfg, Host{ID: nodeID}, connection); err != nil {
+			t.Fatalf("connection %q: %v", connection, err)
+		}
+	}
+	for _, test := range []struct {
+		node, connection string
+	}{
+		{"0123456789abcdef0123456789abcdef", "192.0.2.10 42000 192.0.2.20 22"},
+		{nodeID, "198.51.100.10 42000 192.0.2.20 22"},
+		{nodeID, ""},
+	} {
+		if err := authenticateCredentialProvider(cfg, Host{ID: test.node}, test.connection); err == nil {
+			t.Fatalf("unauthenticated provider accepted: %#v", test)
+		}
+	}
+	cfg.Credentials.Providers["laptop"] = CredentialProviderConfig{NodeID: nodeID}
+	if err := authenticateCredentialProvider(cfg, Host{ID: nodeID}, ""); err != nil {
+		t.Fatalf("roaming provider with no address restriction: %v", err)
 	}
 }
 
@@ -733,9 +764,22 @@ func TestZKASSHHelperProcess(t *testing.T) {
 			time.Sleep(time.Hour)
 		}
 	case "hello-exit255":
-		_ = json.NewEncoder(os.Stdout).Encode(remoteEnvelope{Protocol: remoteProtocolName, Version: protocolVersion, Type: "hello"})
+		session, err := yamux.Server(newStdioConn(os.Stdin, os.Stdout), remoteYamuxConfig())
+		if err != nil {
+			os.Exit(2)
+		}
+		control, err := session.AcceptStream()
+		if err != nil {
+			os.Exit(2)
+		}
+		payload, _ := json.Marshal(remoteServerHello{Node: Host{ID: "0123456789abcdef0123456789abcdef"}})
+		_ = json.NewEncoder(control).Encode(remoteEnvelope{Protocol: remoteProtocolName, Version: remoteProtocolVersion, Type: "hello", Payload: payload})
+		// Do not exit until the real client has accepted the hello and written its
+		// response; otherwise a loaded builder can turn this established-session
+		// retry test into an initial-handshake race.
+		_, _ = readRemoteEnvelope(bufio.NewReader(control))
 		_, _ = io.WriteString(os.Stderr, "client_loop: send disconnect: connection reset\n")
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		os.Exit(255)
 	}
 }

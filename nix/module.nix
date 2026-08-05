@@ -106,6 +106,40 @@ let
       cfg.notifications.ntfyCommand
     else
       "${cfg.notifications.ntfyPackage}/bin/${cfg.notifications.ntfyCommand}";
+  anyOpenPGPBundle = lib.any (bundle: bundle.openpgp.enable) (lib.attrValues cfg.credentials.bundles);
+  forbiddenForwardAgent = lib.any (
+    option:
+    let
+      lowered = lib.toLower option;
+    in
+    option == "-A"
+    || builtins.match "^-o *forwardagent[ =]+yes$" lowered != null
+    || builtins.match "^forwardagent[ =]+yes$" lowered != null
+  ) (cfg.ssh.options ++ cfg.ssh.extraOptions);
+  credentialBundleAssertions = lib.concatLists (lib.mapAttrsToList (name: bundle: [
+    {
+      assertion = builtins.match "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" name != null;
+      message = "services.zka.credentials bundle names must start with an alphanumeric character and contain at most 64 letters, digits, dots, underscores, or hyphens";
+    }
+    {
+      assertion = bundle.sshAgent.enable || bundle.openpgp.enable;
+      message = "services.zka.credentials.bundles.${name} must enable at least one capability";
+    }
+    {
+      assertion = lib.all (fingerprint: builtins.match "^[0-9A-Fa-f]{40}([0-9A-Fa-f]{24})?$" fingerprint != null) bundle.openpgp.signingKeys;
+      message = "services.zka.credentials.bundles.${name}.openpgp.signingKeys must contain full 40- or 64-hex-character fingerprints";
+    }
+  ]) cfg.credentials.bundles);
+  credentialProviderAssertions = lib.concatLists (lib.mapAttrsToList (name: provider: [
+    {
+      assertion = builtins.match "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" name != null;
+      message = "services.zka.credentials provider names must start with an alphanumeric character and contain at most 64 letters, digits, dots, underscores, or hyphens";
+    }
+    {
+      assertion = builtins.match "^[0-9a-f]{32}$" provider.nodeID != null;
+      message = "services.zka.credentials.providers.${name}.nodeID must be a 32-character lowercase hexadecimal zka node ID";
+    }
+  ]) cfg.credentials.providers);
   runtimeConfig = json.generate "zka-config.json" {
     headless = cfg.headless;
     attention.states = cfg.attention.states;
@@ -124,7 +158,28 @@ let
       command = "${cfg.ssh.package}/bin/ssh";
       options = cfg.ssh.options ++ cfg.ssh.extraOptions;
       identity_agent = cfg.ssh.identityAgent;
-      forward_agent = cfg.ssh.forwardAgent;
+      expected_node_ids = cfg.ssh.expectedNodeIDs;
+    };
+    credentials = {
+      default_bundle = if cfg.credentials.defaultBundle == null then "" else cfg.credentials.defaultBundle;
+      gnupg = {
+        command = "${cfg.credentials.gnupg.package}/bin/gpg";
+        gpgconf_command = "${cfg.credentials.gnupg.package}/bin/gpgconf";
+        gpg_connect_agent_command = "${cfg.credentials.gnupg.package}/bin/gpg-connect-agent";
+        configure_agent = cfg.credentials.gnupg.configureAgent;
+        operation_timeout = cfg.credentials.gnupg.operationTimeout;
+      };
+      bundles = lib.mapAttrs (_: bundle: {
+        ssh_agent.enable = bundle.sshAgent.enable;
+        openpgp = {
+          enable = bundle.openpgp.enable;
+          signing_keys = bundle.openpgp.signingKeys;
+        };
+      }) cfg.credentials.bundles;
+      providers = lib.mapAttrs (_: provider: {
+        node_id = provider.nodeID;
+        ssh_source_addresses = provider.sshSourceAddresses;
+      }) cfg.credentials.providers;
     };
     notifications = {
       desktop_enabled = cfg.notifications.desktopEnabled;
@@ -148,6 +203,7 @@ let
   ++ lib.optional (cfg.zmx.package != null) cfg.zmx.package
   ++ lib.optional (cfg.sway.package != null) cfg.sway.package
   ++ lib.optional (cfg.notifications.ntfyPackage != null) cfg.notifications.ntfyPackage
+  ++ lib.optional (anyOpenPGPBundle || cfg.credentials.gnupg.configureAgent) cfg.credentials.gnupg.package
   ++ cfg.extraPackages;
 in
 {
@@ -232,12 +288,6 @@ in
         description = "Persistent OpenSSH IdentityAgent used by zkad and remote pane attachments; supports OpenSSH tokens such as %i.";
       };
 
-      forwardAgent = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Enable OpenSSH agent forwarding and stable per-workspace agent relay sockets for remote zka attachments.";
-      };
-
       options = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [
@@ -256,6 +306,92 @@ in
         default = [ ];
         description = "Additional OpenSSH options appended to the default ssh.options list.";
       };
+
+      expectedNodeIDs = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        example.devbox = "0123456789abcdef0123456789abcdef";
+        description = "Expected authoritative zka node ID for each outbound SSH host alias; required when this host provides credential bundles.";
+      };
+    };
+
+    credentials = {
+      defaultBundle = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "work";
+        description = "Credential bundle selected when a claim omits --bundle; this does not claim credentials automatically.";
+      };
+
+      gnupg = {
+        package = lib.mkPackageOption pkgs "gnupg" { };
+
+        configureAgent = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            Configure this provider host's global user gpg-agent, restricted
+            extra socket, and pinentry. This takes ownership of a globally
+            shared agent and may interact with other smart-card consumers.
+          '';
+        };
+
+        pinentryPackage = lib.mkOption {
+          type = lib.types.package;
+          default = pkgs.pinentry-gnome3;
+          defaultText = lib.literalExpression "pkgs.pinentry-gnome3";
+          description = "Graphical pinentry package configured for the provider's global gpg-agent.";
+        };
+
+        operationTimeout = lib.mkOption {
+          type = lib.types.str;
+          default = "45s";
+          description = "Go duration bounding each forwarded private-key operation.";
+        };
+      };
+
+      bundles = lib.mkOption {
+        default = { };
+        description = "Named, semantic credential capability bundles available for workspace claims.";
+        type = lib.types.attrsOf (lib.types.submodule ({ ... }: {
+          options = {
+            sshAgent.enable = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = "Expose the provider's selected SSH agent through this bundle.";
+            };
+            openpgp.enable = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = "Expose filtered OpenPGP signing and decryption through this bundle.";
+            };
+            openpgp.signingKeys = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = "Full OpenPGP fingerprints authorized when this node provides the bundle; leave empty on a target-only node.";
+            };
+          };
+        }));
+      };
+
+      providers = lib.mkOption {
+        default = { };
+        description = "Credential-provider node IDs trusted by this target, with optional SSH source-address restrictions for fixed hosts.";
+        type = lib.types.attrsOf (lib.types.submodule ({ ... }: {
+          options = {
+            nodeID = lib.mkOption {
+              type = lib.types.str;
+              description = "Pinned 32-character zka node ID advertised by this provider.";
+            };
+            sshSourceAddresses = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              example = [ "192.0.2.10" "2001:db8::/64" ];
+              description = "Optional IP addresses or CIDR networks from which this provider may establish SSH_CONNECTION; leave empty for roaming providers.";
+            };
+          };
+        }));
+      };
     };
 
     extraPackages = lib.mkOption {
@@ -273,13 +409,13 @@ in
     notifications.desktopEnabled = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Whether newly actionable panes raise local desktop notifications.";
+      description = "Whether newly actionable panes and credential-use warnings try the local desktop channel; private-key operations require successful ntfy fallback when this is disabled or unavailable.";
     };
 
     notifications.ntfyEnabled = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Whether newly actionable local panes are sent through ntfy.";
+      description = "Whether newly actionable local panes and best-effort refusal notices are sent through ntfy; credential-use fallback is mandatory and ignores this switch.";
     };
 
     notifications.ntfyIncludeEvidence = lib.mkOption {
@@ -352,13 +488,25 @@ in
           assertion = cfg.notifications.ntfyPackage == null || !lib.hasPrefix "/" cfg.notifications.ntfyCommand;
           message = "services.zka.notifications.ntfyCommand must be a bare name when ntfyPackage is set";
         }
-      ];
+        {
+          assertion = !forbiddenForwardAgent;
+          message = "services.zka.ssh options must not enable ForwardAgent; use a credential bundle with sshAgent.enable";
+        }
+        {
+          assertion = cfg.credentials.defaultBundle == null || builtins.hasAttr cfg.credentials.defaultBundle cfg.credentials.bundles;
+          message = "services.zka.credentials.defaultBundle must name a configured credential bundle";
+        }
+      ] ++ credentialBundleAssertions ++ credentialProviderAssertions;
 
       warnings =
         lib.optional (cfg.headless && cfg.notifications.ntfyEnabled && cfg.notifications.ntfyPackage == null)
           "services.zka: headless origin with ntfy enabled but no notifications.ntfyPackage; unless extraPackages supplies the helper, no notification channel will reach you"
         ++ lib.optional (cfg.headless && cfg.linger.users == [ ])
-          "services.zka: headless origin without services.zka.linger.users; zkad stops with your last SSH session unless lingering is managed elsewhere";
+          "services.zka: headless origin without services.zka.linger.users; zkad stops with your last SSH session unless lingering is managed elsewhere"
+        ++ lib.optional (anyOpenPGPBundle && cfg.notifications.ntfyPackage == null)
+          "services.zka: OpenPGP credential use fails closed when desktop delivery fails and ntfy-send is unavailable; set notifications.ntfyPackage or provide the helper through extraPackages"
+        ++ lib.optional cfg.credentials.gnupg.configureAgent
+          "services.zka.credentials.gnupg.configureAgent takes ownership of the globally shared user gpg-agent and extra socket; coordinate with other smart-card consumers";
 
       users.users = lib.genAttrs cfg.linger.users (_: { linger = true; });
 
@@ -378,6 +526,12 @@ in
           UMask = "0077";
           NoNewPrivileges = true;
         };
+      };
+
+      programs.gnupg.agent = lib.mkIf cfg.credentials.gnupg.configureAgent {
+        enable = true;
+        enableExtraSocket = true;
+        pinentryPackage = cfg.credentials.gnupg.pinentryPackage;
       };
     }
 

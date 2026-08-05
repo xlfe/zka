@@ -45,8 +45,9 @@ func (s *Store) Ensure() error {
 // Load intentionally treats the pre-v3 schemas as empty state. v3 changes
 // process ownership: Kitty view closure now removes its zmx backend. Migrating
 // the old records would make that ownership ambiguous, so only zka's generated
-// files are reset. v3/v4 migrate to v5. Existing zmx processes are deliberately
-// left untouched, and v4 receives a one-time rollback backup before migration.
+// files are reset. Schemas v3-v6 migrate to the current schema. Existing zmx
+// processes are deliberately left untouched, and v4-v6 receive a one-time
+// rollback backup before migration.
 func (s *Store) Load() (StateData, error) {
 	if err := s.Ensure(); err != nil {
 		return StateData{}, err
@@ -79,7 +80,7 @@ func (s *Store) Load() (StateData, error) {
 	if header.SchemaVersion < 3 || header.SchemaVersion > stateSchemaVersion {
 		return StateData{}, fmt.Errorf("unsupported state schema %d (want %d)", header.SchemaVersion, stateSchemaVersion)
 	}
-	if header.SchemaVersion == 4 || header.SchemaVersion == 5 {
+	if header.SchemaVersion == 4 || header.SchemaVersion == 5 || header.SchemaVersion == 6 {
 		if err := s.writeMigrationBackup(b, header.SchemaVersion); err != nil {
 			return StateData{}, err
 		}
@@ -152,9 +153,8 @@ func (s *Store) Load() (StateData, error) {
 			attachment.ReconcileStatus = "pending"
 		}
 	}
-	// v3 panes predate the stable agent relay. Leaving their zero relay
-	// version intact lets the CLI identify the exact backends that must be
-	// recreated before a forwarded agent can be claimed safely.
+	// Panes without a credential environment version retain zero so status can
+	// identify the exact backends that need recreation before OpenPGP use.
 	state.SchemaVersion = stateSchemaVersion
 	return state, nil
 }
@@ -262,6 +262,9 @@ func normalizeWorkspace(workspace *Workspace) {
 	}
 	if workspace.Attachments == nil {
 		workspace.Attachments = map[string]*Attachment{}
+	}
+	if workspace.CredentialClaim != nil && workspace.CredentialClaim.Capabilities == nil {
+		workspace.CredentialClaim.Capabilities = map[string]CredentialCapabilityStatus{}
 	}
 	for _, pane := range workspace.Panes {
 		if pane.Notifications == nil {

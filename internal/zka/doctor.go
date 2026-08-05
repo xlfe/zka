@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,9 +18,10 @@ import (
 )
 
 type doctorCheck struct {
-	Name   string `json:"name"`
-	OK     bool   `json:"ok"`
-	Detail string `json:"detail"`
+	Name    string `json:"name"`
+	OK      bool   `json:"ok"`
+	Warning bool   `json:"warning,omitempty"`
+	Detail  string `json:"detail"`
 }
 
 func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
@@ -37,11 +39,16 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 	if cfgErr != nil {
 		return writeDoctorResult(checks, *jsonOut, stdout)
 	}
+	checks = append(checks, credentialsConfigDoctorCheck(cfg))
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	api := NewAPI(paths)
-	_, err := api.Ping(ctx)
-	checks = append(checks, doctorCheck{Name: "daemon", OK: err == nil, Detail: doctorDetail(err, paths.Socket)})
+	node, err := api.Node(ctx)
+	daemonDetail := paths.Socket
+	if err == nil {
+		daemonDetail += "; node=" + node.ID
+	}
+	checks = append(checks, doctorCheck{Name: "daemon", OK: err == nil, Detail: doctorDetail(err, daemonDetail)})
 	stateErr := NewStore(paths).Ensure()
 	checks = append(checks, doctorCheck{Name: "state-dir", OK: stateErr == nil, Detail: doctorDetail(stateErr, paths.StateDir)})
 	commands := []struct{ name, command string }{
@@ -58,6 +65,13 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 	}
 	if cfg.Integrations.ClaudeManagedHooks {
 		commands = append(commands, struct{ name, command string }{"claude", "claude"})
+	}
+	if configHasOpenPGPBundle(cfg) {
+		commands = append(commands,
+			struct{ name, command string }{"gpg", cfg.Credentials.GnuPG.Command},
+			struct{ name, command string }{"gpgconf", cfg.Credentials.GnuPG.GPGConfCommand},
+			struct{ name, command string }{"gpg-connect-agent", cfg.Credentials.GnuPG.GPGConnectAgentCommand},
+		)
 	}
 	// The view layer is skipped by configuration, not probing: a probe cannot
 	// distinguish "no kitty because headless" from "no kitty because broken".
@@ -87,47 +101,28 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		managedHookDoctorCheck("codex-hooks", "/etc/codex/requirements.toml", "hook codex", cfg.Integrations.CodexManagedHooks),
 		managedHookDoctorCheck("claude-hooks", "/etc/claude-code/managed-settings.d/50-zka.json", "hook claude", cfg.Integrations.ClaudeManagedHooks),
 	)
+	checks = append(checks, credentialsProviderDoctorCheck(ctx, cfg, ExecRunner{}), openPGPKeysDoctorCheck(ctx, cfg, ExecRunner{}))
+	var credentialStatus credentialStatusResponse
+	var credentialStatusErr error
 	if *origin != "" {
-		forwardingConfigDetail := "disabled; enable services.zka.ssh.forwardAgent"
-		if cfg.SSH.ForwardAgent {
-			forwardingConfigDetail = "enabled"
-		}
-		checks = append(checks, doctorCheck{
-			Name: "ssh-agent-forwarding-config", OK: cfg.SSH.ForwardAgent,
-			Detail: forwardingConfigDetail,
-		})
-		daemonAgent, agentErr := api.SSHAgent(ctx)
-		if agentErr != nil {
-			checks = append(checks, doctorCheck{Name: "zkad-ssh-agent", OK: false, Detail: agentErr.Error() + " (restart zkad after upgrading)"})
-		} else {
-			sshAdd := siblingSSHCommand(cfg.SSH.Command, "ssh-add")
-			checks = append(checks, doctorSSHAgentChecks(ctx, daemonAgent, os.Getenv("SSH_AUTH_SOCK"), func(ctx context.Context, socket string) ([]string, error) {
-				return inspectSSHAgent(ctx, sshAdd, socket)
-			})...)
-		}
 		var workspaces []*Workspace
 		remoteErr := api.RemoteCall(ctx, *origin, "list", nil, &workspaces)
 		detail := fmt.Sprintf("%s (%d workspaces)", *origin, len(workspaces))
 		checks = append(checks, doctorCheck{Name: "remote-control", OK: remoteErr == nil, Detail: doctorDetail(remoteErr, detail)})
-		var forwarding remoteAgentForwardingStatus
-		forwardingErr := api.RemoteCall(ctx, *origin, "agent_forwarding", nil, &forwarding)
-		remoteConfigOK := forwardingErr == nil && forwarding.Enabled && forwarding.RelayVersion == agentRelayVersion
-		remoteConfigDetail := fmt.Sprintf("relay version %d", forwarding.RelayVersion)
-		if forwardingErr != nil {
-			remoteConfigDetail = forwardingErr.Error()
-		} else if !forwarding.Enabled {
-			remoteConfigDetail = "disabled on origin"
+		credentialStatusErr = api.RemoteCall(ctx, *origin, "credentials_status", nil, &credentialStatus)
+		localStatus, localStatusErr := api.CredentialStatus(ctx, "")
+		if localStatusErr == nil {
+			credentialStatus.Transport = localStatus.Transport
+		} else if credentialStatusErr == nil {
+			credentialStatusErr = localStatusErr
 		}
-		checks = append(checks, doctorCheck{Name: "remote-agent-relay", OK: remoteConfigOK, Detail: remoteConfigDetail})
-		forwardedOK := forwardingErr == nil && forwarding.ForwardedSocket
-		forwardedDetail := "forwarded agent socket is available"
-		if forwardingErr != nil {
-			forwardedDetail = forwardingErr.Error()
-		} else if !forwarding.ForwardedSocket {
-			forwardedDetail = "control SSH did not receive a dialable forwarded agent"
-		}
-		checks = append(checks, doctorCheck{Name: "remote-forwarded-agent", OK: forwardedOK, Detail: forwardedDetail})
+	} else {
+		credentialStatus, credentialStatusErr = api.CredentialStatus(ctx, "")
 	}
+	checks = append(checks,
+		credentialsClaimDoctorCheck(credentialStatus, credentialStatusErr),
+		credentialsTransportDoctorCheck(credentialStatus.Transport, credentialStatusErr),
+	)
 	// One round trip shared by both checks that need the workspace set.
 	workspaces, workspacesErr := api.Workspaces(ctx)
 	checks = append(checks,
@@ -136,6 +131,156 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		topologyRenderableCheck(workspaces, workspacesErr),
 	)
 	return writeDoctorResult(checks, *jsonOut, stdout)
+}
+
+func configHasOpenPGPBundle(cfg Config) bool {
+	for _, bundle := range cfg.Credentials.Bundles {
+		if bundle.OpenPGP.Enable {
+			return true
+		}
+	}
+	return false
+}
+
+func configHasOpenPGPProviderKeys(cfg Config) bool {
+	for _, bundle := range cfg.Credentials.Bundles {
+		if bundle.OpenPGP.Enable && len(bundle.OpenPGP.SigningKeys) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func credentialsConfigDoctorCheck(cfg Config) doctorCheck {
+	if len(cfg.Credentials.Bundles) == 0 {
+		return doctorCheck{Name: "credentials-config", OK: true, Detail: "no credential bundles configured"}
+	}
+	names := make([]string, 0, len(cfg.Credentials.Bundles))
+	for name, bundle := range cfg.Credentials.Bundles {
+		capabilities := make([]string, 0, 2)
+		if bundle.SSHAgent.Enable {
+			capabilities = append(capabilities, credentialCapabilitySSH)
+		}
+		if bundle.OpenPGP.Enable {
+			capabilities = append(capabilities, credentialCapabilityOpenPGP)
+		}
+		names = append(names, name+"="+strings.Join(capabilities, "+"))
+	}
+	sort.Strings(names)
+	detail := strings.Join(names, ", ")
+	if cfg.Credentials.DefaultBundle != "" {
+		detail += "; default=" + cfg.Credentials.DefaultBundle
+	}
+	return doctorCheck{Name: "credentials-config", OK: true, Detail: detail}
+}
+
+func credentialsProviderDoctorCheck(ctx context.Context, cfg Config, runner CommandRunner) doctorCheck {
+	const name = "credentials-provider"
+	if len(cfg.Credentials.Bundles) == 0 {
+		return doctorCheck{Name: name, OK: true, Detail: "no provider capabilities configured"}
+	}
+	var problems []string
+	sshRequired := false
+	for _, bundle := range cfg.Credentials.Bundles {
+		sshRequired = sshRequired || bundle.SSHAgent.Enable
+	}
+	if sshRequired {
+		info := newSSHAgentInfo(cfg, os.Getenv("SSH_AUTH_SOCK"))
+		conn, err := dialAgentSocket(info.EffectiveSocket)
+		if err != nil {
+			problems = append(problems, "ssh-agent: "+err.Error())
+		} else {
+			_ = conn.Close()
+		}
+	}
+	if configHasOpenPGPProviderKeys(cfg) {
+		socket, _, err := runner.Run(ctx, cfg.Credentials.GnuPG.GPGConfCommand, "--list-dirs", "agent-extra-socket")
+		if err != nil {
+			problems = append(problems, "openpgp: "+err.Error())
+		} else {
+			conn, dialErr := net.DialTimeout("unix", strings.TrimSpace(socket), 500*time.Millisecond)
+			if dialErr != nil {
+				problems = append(problems, "openpgp: "+dialErr.Error())
+			} else {
+				_ = conn.Close()
+			}
+		}
+	}
+	if len(problems) != 0 {
+		return doctorCheck{Name: name, Detail: strings.Join(problems, "; ")}
+	}
+	return doctorCheck{Name: name, OK: true, Detail: "configured provider sockets are reachable"}
+}
+
+func openPGPKeysDoctorCheck(ctx context.Context, cfg Config, runner CommandRunner) doctorCheck {
+	const name = "openpgp-keys"
+	bundles := make([]string, 0, len(cfg.Credentials.Bundles))
+	softwareBacked := false
+	for bundleName, bundle := range cfg.Credentials.Bundles {
+		if !bundle.OpenPGP.Enable || len(bundle.OpenPGP.SigningKeys) == 0 {
+			continue
+		}
+		manifest, err := buildOpenPGPManifest(ctx, cfg, bundle.OpenPGP.SigningKeys, runner)
+		if err != nil {
+			return doctorCheck{Name: name, Detail: bundleName + ": " + err.Error()}
+		}
+		keys := make([]string, 0, len(manifest.AllowedKeygrips))
+		for grip, fingerprint := range manifest.AllowedKeygrips {
+			backing := "software"
+			if manifest.CardBacked[grip] {
+				backing = "card"
+			} else {
+				softwareBacked = true
+			}
+			keys = append(keys, shortFingerprint(fingerprint)+"/"+grip[:8]+":"+backing)
+		}
+		sort.Strings(keys)
+		bundles = append(bundles, bundleName+"="+strings.Join(keys, ","))
+	}
+	if len(bundles) == 0 {
+		return doctorCheck{Name: name, OK: true, Detail: "no OpenPGP provider keys configured on this node"}
+	}
+	sort.Strings(bundles)
+	return doctorCheck{Name: name, OK: true, Warning: softwareBacked, Detail: strings.Join(bundles, "; ")}
+}
+
+func credentialsClaimDoctorCheck(status credentialStatusResponse, err error) doctorCheck {
+	const name = "credentials-claim"
+	if err != nil {
+		return doctorCheck{Name: name, Detail: err.Error()}
+	}
+	var claimed []string
+	for _, workspace := range status.Workspaces {
+		if workspace.State == "unclaimed" {
+			continue
+		}
+		capabilities := make([]string, 0, len(workspace.Capabilities))
+		for capability, view := range workspace.Capabilities {
+			capabilities = append(capabilities, capability+":"+view.State)
+		}
+		sort.Strings(capabilities)
+		claimed = append(claimed, fmt.Sprintf("%s=%s@%s[%s]", workspace.WorkspaceName, workspace.Bundle, shortID(workspace.OwnerNode), strings.Join(capabilities, ",")))
+	}
+	if len(claimed) == 0 {
+		return doctorCheck{Name: name, OK: true, Detail: "no workspaces currently claim credentials"}
+	}
+	sort.Strings(claimed)
+	return doctorCheck{Name: name, OK: true, Detail: strings.Join(claimed, "; ")}
+}
+
+func credentialsTransportDoctorCheck(status credentialTransportView, err error) doctorCheck {
+	const name = "credentials-transport"
+	if err != nil {
+		return doctorCheck{Name: name, Detail: err.Error()}
+	}
+	detail := status.State
+	if status.Attempts != 0 {
+		detail += fmt.Sprintf(" after %d attempts", status.Attempts)
+	}
+	if status.LastError != "" {
+		detail += ": " + status.LastError
+	}
+	return doctorCheck{Name: name, OK: status.State == "ready" || status.State == "idle", Detail: detail}
 }
 
 // desktopNotifyProbe proves the desktop channel and names what answered.
@@ -424,6 +569,8 @@ func writeDoctorResult(checks []doctorCheck, jsonOut bool, stdout io.Writer) (in
 			status := "ok"
 			if !check.OK {
 				status = "FAIL"
+			} else if check.Warning {
+				status = "WARN"
 			}
 			fmt.Fprintf(stdout, "%-5s %-16s %s\n", status, check.Name, check.Detail)
 		}

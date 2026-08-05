@@ -11,7 +11,18 @@ import (
 )
 
 const (
-	stateSchemaVersion = 6
+	stateSchemaVersion = 7
+	// 11 combines credential target heartbeat/snapshot reconciliation. There is
+	// no compatibility shim: every CLI and daemon on a node must be upgraded
+	// together.
+	// 10 replaces the workspace-agent API with credential bundles. There is no
+	// compatibility shim: every CLI and daemon on a node must be upgraded
+	// together.
+	daemonProtocolVersion = 11
+	// 11 binds both peer node IDs into the SSH control handshake and requires a
+	// credential-provider acknowledgement before a claim can be created.
+	// 10 replaces the JSON-lines-only SSH connection with yamux streams and
+	// credential-bundle capabilities. Mixed-version peers fail at negotiation.
 	// 9: workspace birth crossed the remote-control protocol
 	// (create_workspace). A pre-9 origin would reject the op with a bare
 	// "unknown remote operation", so the version check turns skew into an
@@ -20,9 +31,9 @@ const (
 	// remote pane, and sends the source pane instead. An origin that predates
 	// this would quietly place every remote pane in the home directory, so the
 	// version check turns that into an explicit upgrade prompt.
-	protocolVersion    = 9
-	remoteProtocolName = "zka.workspace"
-	remoteProtocolMax  = 1 << 20
+	remoteProtocolVersion = 11
+	remoteProtocolName    = "zka.workspace"
+	remoteProtocolMax     = 1 << 20
 )
 
 type AgentState string
@@ -125,32 +136,32 @@ type NotificationRecord struct {
 // Pane is the durable identity of one Kitty terminal pane and its hidden zmx
 // PTY. Foreground programs are never stored as restore commands.
 type Pane struct {
-	ID                string                        `json:"id"`
-	AllocationKey     string                        `json:"allocation_key,omitempty"`
-	Position          int                           `json:"position"`
-	Backend           BackendRef                    `json:"backend"`
-	CWD               string                        `json:"cwd,omitempty"`
-	Title             string                        `json:"title,omitempty"`
-	LaunchOptions     launchOptions                 `json:"launch_options,omitempty"`
-	Agent             string                        `json:"agent,omitempty"`
-	State             AgentState                    `json:"state"`
-	Evidence          Evidence                      `json:"evidence"`
-	LastTurnID        string                        `json:"last_turn_id,omitempty"`
-	AttentionSeen     string                        `json:"attention_seen,omitempty"`
-	Process           ProcessStatus                 `json:"process"`
-	Notifications     map[string]NotificationRecord `json:"notifications,omitempty"`
-	BackendCreated    bool                          `json:"backend_created"`
-	AgentRelayVersion int                           `json:"agent_relay_version,omitempty"`
-	BackendReady      bool                          `json:"backend_ready"`
-	BackendStart      bool                          `json:"backend_starting,omitempty"`
-	BackendDead       bool                          `json:"backend_dead,omitempty"`
-	BackendError      string                        `json:"backend_error,omitempty"`
-	RemovalError      string                        `json:"removal_error,omitempty"`
-	Phase             PaneLifecycle                 `json:"phase"`
-	PhaseAt           time.Time                     `json:"phase_at,omitempty"`
-	Admission         PaneAdmission                 `json:"admission,omitempty"`
-	CreatedAt         time.Time                     `json:"created_at"`
-	UpdatedAt         time.Time                     `json:"updated_at"`
+	ID                           string                        `json:"id"`
+	AllocationKey                string                        `json:"allocation_key,omitempty"`
+	Position                     int                           `json:"position"`
+	Backend                      BackendRef                    `json:"backend"`
+	CWD                          string                        `json:"cwd,omitempty"`
+	Title                        string                        `json:"title,omitempty"`
+	LaunchOptions                launchOptions                 `json:"launch_options,omitempty"`
+	Agent                        string                        `json:"agent,omitempty"`
+	State                        AgentState                    `json:"state"`
+	Evidence                     Evidence                      `json:"evidence"`
+	LastTurnID                   string                        `json:"last_turn_id,omitempty"`
+	AttentionSeen                string                        `json:"attention_seen,omitempty"`
+	Process                      ProcessStatus                 `json:"process"`
+	Notifications                map[string]NotificationRecord `json:"notifications,omitempty"`
+	BackendCreated               bool                          `json:"backend_created"`
+	CredentialEnvironmentVersion int                           `json:"credential_environment_version,omitempty"`
+	BackendReady                 bool                          `json:"backend_ready"`
+	BackendStart                 bool                          `json:"backend_starting,omitempty"`
+	BackendDead                  bool                          `json:"backend_dead,omitempty"`
+	BackendError                 string                        `json:"backend_error,omitempty"`
+	RemovalError                 string                        `json:"removal_error,omitempty"`
+	Phase                        PaneLifecycle                 `json:"phase"`
+	PhaseAt                      time.Time                     `json:"phase_at,omitempty"`
+	Admission                    PaneAdmission                 `json:"admission,omitempty"`
+	CreatedAt                    time.Time                     `json:"created_at"`
+	UpdatedAt                    time.Time                     `json:"updated_at"`
 }
 
 // PaneLifecycle replaces the overlapping Visible / TopologyPending /
@@ -293,7 +304,7 @@ type Workspace struct {
 	Manifest            Manifest               `json:"manifest"`
 	Attachments         map[string]*Attachment `json:"attachments"`
 	PrimaryAttachmentID string                 `json:"primary_attachment_id,omitempty"`
-	AgentAttachmentID   string                 `json:"agent_attachment_id,omitempty"`
+	CredentialClaim     *CredentialClaim       `json:"credential_claim,omitempty"`
 	PendingRevocations  []string               `json:"pending_revocations,omitempty"`
 	Attention           AgentState             `json:"attention"`
 	RestoreFocusPaneID  string                 `json:"restore_focus_pane_id,omitempty"`
@@ -301,6 +312,23 @@ type Workspace struct {
 	DeletionError       string                 `json:"deletion_error,omitempty"`
 	CreatedAt           time.Time              `json:"created_at"`
 	UpdatedAt           time.Time              `json:"updated_at"`
+}
+
+type CredentialClaim struct {
+	Bundle            string                                `json:"bundle"`
+	OwnerAttachmentID string                                `json:"owner_attachment_id"`
+	OwnerNodeID       string                                `json:"owner_node_id"`
+	Generation        uint64                                `json:"generation"`
+	State             string                                `json:"state"`
+	Capabilities      map[string]CredentialCapabilityStatus `json:"capabilities"`
+	OpenPGPKeys       []string                              `json:"openpgp_keys,omitempty"`
+	UpdatedAt         time.Time                             `json:"updated_at"`
+}
+
+type CredentialCapabilityStatus struct {
+	State     string `json:"state"`
+	Detail    string `json:"detail,omitempty"`
+	Available bool   `json:"available"`
 }
 
 func (w *Workspace) Clone() *Workspace {
@@ -374,16 +402,16 @@ func newStateData() StateData {
 }
 
 type Event struct {
-	WorkspaceID       string         `json:"workspace_id"`
-	PaneID            string         `json:"pane_id"`
-	Kind              string         `json:"kind"`
-	Source            string         `json:"source"`
-	TurnID            string         `json:"turn_id,omitempty"`
-	Detail            string         `json:"detail,omitempty"`
-	PID               int            `json:"pid,omitempty"`
-	AgentRelayVersion int            `json:"agent_relay_version,omitempty"`
-	ExitCode          *int           `json:"exit_code,omitempty"`
-	Fields            map[string]any `json:"fields,omitempty"`
+	WorkspaceID                  string         `json:"workspace_id"`
+	PaneID                       string         `json:"pane_id"`
+	Kind                         string         `json:"kind"`
+	Source                       string         `json:"source"`
+	TurnID                       string         `json:"turn_id,omitempty"`
+	Detail                       string         `json:"detail,omitempty"`
+	PID                          int            `json:"pid,omitempty"`
+	CredentialEnvironmentVersion int            `json:"credential_environment_version,omitempty"`
+	ExitCode                     *int           `json:"exit_code,omitempty"`
+	Fields                       map[string]any `json:"fields,omitempty"`
 }
 
 type WatcherEvent struct {

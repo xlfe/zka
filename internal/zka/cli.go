@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,7 +20,7 @@ import (
 	"time"
 )
 
-const Version = "0.7.0"
+const Version = "0.8.0"
 
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
@@ -92,7 +93,7 @@ Commands:
   launch      Choose or create a workspace in the graphical launcher
   attention   Show, watch, focus, or defer panes that need you
   kitty       Create a managed Kitty workspace
-  workspace   Manage workspace views, lifecycle, focus, and SSH agent ownership
+  workspace   Manage workspace views, lifecycle, focus, and credential claims
   doctor      Check local or remote integration
   daemon      Run zkad (normally via systemd --user)
 
@@ -316,8 +317,8 @@ func runWorkspace(args []string, paths Paths, stdout, stderr io.Writer) (int, er
 		return runWorkspaceFocus(args[1:], paths, stdout, stderr)
 	case "seen":
 		return runWorkspaceSeen(args[1:], paths, stdout, stderr)
-	case "agent":
-		return runWorkspaceAgent(args[1:], paths, stdout, stderr)
+	case "credentials":
+		return runWorkspaceCredentials(args[1:], paths, stdout, stderr)
 	default:
 		printWorkspaceUsage(stderr)
 		return 2, fmt.Errorf("unknown workspace command %q", args[0])
@@ -330,8 +331,8 @@ func printWorkspaceUsage(w io.Writer) {
   list [--origin SSH_ALIAS] [--json]
   inspect [SSH_ALIAS:]REF [--json]
   reconcile [SSH_ALIAS:]REF [--attachment ID]
-  create [SSH_ALIAS:]NAME [--template FILE] [--cwd DIR] [--attach] [--claim-agent]
-  attach [SSH_ALIAS:]REF [--pane PANE] [--claim-agent]
+  create [SSH_ALIAS:]NAME [--template FILE] [--cwd DIR] [--attach] [--claim-credentials] [--credential-bundle NAME]
+  attach [SSH_ALIAS:]REF [--pane PANE] [--claim-credentials] [--credential-bundle NAME]
   move [SSH_ALIAS:]REF [--pane PANE]
   detach REF
   forget [SSH_ALIAS:]REF
@@ -339,9 +340,171 @@ func printWorkspaceUsage(w io.Writer) {
   kill [SSH_ALIAS:]REF
   focus REF [--pane PANE]
   seen REF [--pane PANE]
-  agent claim [SSH_ALIAS:]REF
-  agent release [SSH_ALIAS:]REF
-  agent status [--json] [SSH_ALIAS:]REF`)
+  credentials claim [--bundle NAME] [SSH_ALIAS:]REF
+  credentials release [SSH_ALIAS:]REF
+  credentials status [--json] [[SSH_ALIAS:]REF]`)
+}
+
+func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	if len(args) == 0 {
+		return 2, fmt.Errorf("workspace credentials requires claim, release, or status")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	api := NewAPI(paths)
+	switch args[0] {
+	case "claim":
+		fs := newFlagSet("workspace credentials claim", stderr)
+		bundleName := fs.String("bundle", "", "credential bundle to claim")
+		if err := parseInterspersed(fs, args[1:]); err != nil {
+			return 2, err
+		}
+		if fs.NArg() != 1 {
+			return 2, fmt.Errorf("workspace credentials claim requires one workspace reference")
+		}
+		cfg, err := LoadConfig()
+		if err != nil {
+			return 1, err
+		}
+		if *bundleName == "" {
+			*bundleName = cfg.Credentials.DefaultBundle
+		}
+		if *bundleName == "" {
+			return 2, fmt.Errorf("--bundle is required because credentials.default_bundle is not set")
+		}
+		refreshCredentialStartupTTY(ctx, cfg, *bundleName, ExecRunner{})
+		host, _ := splitWorkspaceRef(fs.Arg(0))
+		workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
+		if err != nil {
+			return 1, err
+		}
+		if host == "" {
+			host = workspace.RemoteHost
+		}
+		if host == "" {
+			return 1, fmt.Errorf("workspace %q is authoritative here; remote credential claims require an SSH attachment", workspace.Name)
+		}
+		localWorkspace, err := api.Workspace(ctx, workspace.ID)
+		if err != nil {
+			return 1, err
+		}
+		node, err := api.Node(ctx)
+		if err != nil {
+			return 1, err
+		}
+		attachment := preferredLocalAttachment(localWorkspace, node.ID)
+		if attachment == nil || attachment.Transport.Kind != "ssh" || !attachmentUsable(attachment) {
+			return 1, fmt.Errorf("no ready local SSH attachment for workspace %q; run workspace attach first", workspace.Name)
+		}
+		var status workspaceCredentialStatus
+		err = api.RemoteCall(ctx, host, "credentials_claim", workspaceCredentialRequest{
+			Workspace: workspace.ID, Attachment: attachment.ID, Bundle: *bundleName,
+		}, &status)
+		if err != nil {
+			return 1, err
+		}
+		var refreshed Workspace
+		_ = api.RemoteCall(ctx, host, "get", refRequest{Ref: workspace.ID}, &refreshed)
+		writeWorkspaceCredentialStatus(stdout, status)
+		return 0, nil
+	case "release", "status":
+		fs := newFlagSet("workspace credentials "+args[0], stderr)
+		jsonOut := fs.Bool("json", false, "emit JSON")
+		if err := parseInterspersed(fs, args[1:]); err != nil {
+			return 2, err
+		}
+		if fs.NArg() > 1 || args[0] == "release" && fs.NArg() != 1 {
+			return 2, fmt.Errorf("workspace credentials %s accepts %s workspace reference", args[0], map[bool]string{true: "one", false: "at most one"}[args[0] == "release"])
+		}
+		if fs.NArg() == 0 {
+			status, err := api.CredentialStatus(ctx, "")
+			if err != nil {
+				return 1, err
+			}
+			if *jsonOut {
+				return 0, writeJSON(stdout, status)
+			}
+			for _, workspace := range status.Workspaces {
+				writeWorkspaceCredentialStatus(stdout, workspace)
+			}
+			return 0, nil
+		}
+		host, _ := splitWorkspaceRef(fs.Arg(0))
+		workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
+		if err != nil {
+			return 1, err
+		}
+		if host == "" {
+			host = workspace.RemoteHost
+		}
+		if host != "" {
+			var response credentialStatusResponse
+			if args[0] == "release" {
+				var released workspaceCredentialStatus
+				err = api.RemoteCall(ctx, host, "credentials_release", workspaceCredentialRequest{Workspace: workspace.ID}, &released)
+				response.Workspaces = []workspaceCredentialStatus{released}
+			} else {
+				err = api.RemoteCall(ctx, host, "credentials_status", workspaceCredentialRequest{Workspace: workspace.ID}, &response)
+			}
+			if err != nil {
+				return 1, err
+			}
+			if *jsonOut {
+				return 0, writeJSON(stdout, response)
+			}
+			for _, item := range response.Workspaces {
+				writeWorkspaceCredentialStatus(stdout, item)
+			}
+			return 0, nil
+		}
+		if args[0] == "release" {
+			released, err := api.ReleaseWorkspaceCredentials(ctx, workspace.ID)
+			if err != nil {
+				return 1, err
+			}
+			writeWorkspaceCredentialStatus(stdout, released)
+			return 0, nil
+		}
+		response, err := api.CredentialStatus(ctx, workspace.ID)
+		if err != nil {
+			return 1, err
+		}
+		if *jsonOut {
+			return 0, writeJSON(stdout, response)
+		}
+		for _, item := range response.Workspaces {
+			writeWorkspaceCredentialStatus(stdout, item)
+		}
+		return 0, nil
+	default:
+		return 2, fmt.Errorf("unknown workspace credentials command %q", args[0])
+	}
+}
+
+func writeWorkspaceCredentialStatus(w io.Writer, status workspaceCredentialStatus) {
+	fmt.Fprintf(w, "credentials=%s workspace=%s", status.State, status.WorkspaceName)
+	if status.Bundle != "" {
+		fmt.Fprintf(w, " bundle=%s", status.Bundle)
+	}
+	if status.OwnerNode != "" {
+		fmt.Fprintf(w, " node=%s", shortID(status.OwnerNode))
+	}
+	capabilities := make([]string, 0, len(status.Capabilities))
+	for name, capability := range status.Capabilities {
+		value := name + ":" + capability.State
+		if capability.Detail != "" {
+			value += "(" + capability.Detail + ")"
+		}
+		capabilities = append(capabilities, value)
+	}
+	sort.Strings(capabilities)
+	if len(capabilities) != 0 {
+		fmt.Fprintf(w, " capabilities=%s", strings.Join(capabilities, ","))
+	}
+	if len(status.RecreatePaneIDs) != 0 {
+		fmt.Fprintf(w, " recreate_panes=%s", strings.Join(status.RecreatePaneIDs, ","))
+	}
+	fmt.Fprintln(w)
 }
 
 // runWorkspaceCreate births a workspace without launching Kitty, locally or on
@@ -353,7 +516,8 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 	cwd := fs.String("cwd", "", "default pane working directory on the origin")
 	templatePath := fs.String("template", "", "topology-only Kitty session template")
 	attach := fs.Bool("attach", false, "attach the workspace here after creating it")
-	claimAgent := fs.Bool("claim-agent", false, "use this machine's SSH agent after attaching")
+	claimCredentials := fs.Bool("claim-credentials", false, "claim a credential bundle after attaching")
+	credentialBundle := fs.String("credential-bundle", "", "credential bundle to claim")
 	if err := parseInterspersed(fs, args); err != nil {
 		return 2, err
 	}
@@ -364,11 +528,14 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 	if host == "" && strings.TrimSpace(name) == "" {
 		return 2, fmt.Errorf("workspace create requires a name (append SSH_ALIAS: for an automatic remote name)")
 	}
-	if *claimAgent && !*attach {
-		return 2, fmt.Errorf("--claim-agent requires --attach")
+	if *claimCredentials && !*attach {
+		return 2, fmt.Errorf("--claim-credentials requires --attach")
 	}
-	if *claimAgent && host == "" {
-		return 2, fmt.Errorf("--claim-agent requires a remote workspace")
+	if *credentialBundle != "" && !*claimCredentials {
+		return 2, fmt.Errorf("--credential-bundle requires --claim-credentials")
+	}
+	if *claimCredentials && host == "" {
+		return 2, fmt.Errorf("--claim-credentials requires a remote workspace")
 	}
 	if *cwd != "" && !filepath.IsAbs(*cwd) {
 		if host != "" {
@@ -437,14 +604,20 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 		ref = host + ":" + workspace.ID
 	}
 	attachArgs := []string{ref}
-	if *claimAgent {
-		attachArgs = append(attachArgs, "--claim-agent")
+	if *claimCredentials {
+		attachArgs = append(attachArgs, "--claim-credentials")
+		if *credentialBundle != "" {
+			attachArgs = append(attachArgs, "--credential-bundle", *credentialBundle)
+		}
 	}
 	code, err := runWorkspaceAttach(attachArgs, paths, false, stdout, stderr)
 	if err != nil {
 		retry := "zka workspace attach " + ref
-		if *claimAgent {
-			retry += " --claim-agent"
+		if *claimCredentials {
+			retry += " --claim-credentials"
+			if *credentialBundle != "" {
+				retry += " --credential-bundle " + *credentialBundle
+			}
 		}
 		return code, fmt.Errorf("workspace %s created but its attach sequence did not complete; retry with: %s: %w", workspace.Name, retry, err)
 	}
@@ -494,122 +667,6 @@ func shortDigest(digest string) string {
 		return digest[:12]
 	}
 	return digest
-}
-
-func runWorkspaceAgent(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
-	if len(args) == 0 {
-		return 2, fmt.Errorf("workspace agent requires claim, release, or status")
-	}
-	switch args[0] {
-	case "claim":
-		fs := newFlagSet("workspace agent claim", stderr)
-		if err := fs.Parse(args[1:]); err != nil {
-			return 2, err
-		}
-		if fs.NArg() != 1 {
-			return 2, fmt.Errorf("workspace agent claim requires one workspace reference")
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		api := NewAPI(paths)
-		host, _ := splitWorkspaceRef(fs.Arg(0))
-		workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
-		if err != nil {
-			return 1, err
-		}
-		if host == "" {
-			host = workspace.RemoteHost
-		}
-		if host == "" {
-			return 1, fmt.Errorf("workspace %q is authoritative here and already uses the origin agent", workspace.Name)
-		}
-		localWorkspace, err := api.Workspace(ctx, workspace.ID)
-		if err != nil {
-			return 1, err
-		}
-		node, err := api.Node(ctx)
-		if err != nil {
-			return 1, err
-		}
-		attachment := preferredLocalAttachment(localWorkspace, node.ID)
-		if attachment == nil || attachment.Transport.Kind != "ssh" || !attachmentUsable(attachment) {
-			return 1, fmt.Errorf("no ready local SSH attachment for workspace %q; run workspace attach first", workspace.Name)
-		}
-		var status workspaceAgentStatus
-		err = api.RemoteCall(ctx, host, "workspace_agent_claim", workspaceAgentRequest{
-			Workspace: workspace.ID, Attachment: attachment.ID,
-		}, &status)
-		if err != nil {
-			return 1, err
-		}
-		writeWorkspaceAgentStatus(stdout, status)
-		return 0, nil
-	case "release", "status":
-		name := "workspace agent " + args[0]
-		fs := newFlagSet(name, stderr)
-		jsonOut := false
-		if args[0] == "status" {
-			fs.BoolVar(&jsonOut, "json", false, "emit JSON")
-		}
-		if err := parseInterspersed(fs, args[1:]); err != nil {
-			return 2, err
-		}
-		if fs.NArg() != 1 {
-			return 2, fmt.Errorf("%s requires one workspace reference", name)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		api := NewAPI(paths)
-		host, _ := splitWorkspaceRef(fs.Arg(0))
-		workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
-		if err != nil {
-			return 1, err
-		}
-		if host == "" {
-			host = workspace.RemoteHost
-		}
-		var status workspaceAgentStatus
-		op := "workspace_agent_status"
-		if args[0] == "release" {
-			op = "workspace_agent_release"
-		}
-		if host == "" {
-			if op == "workspace_agent_release" {
-				status, err = api.ReleaseWorkspaceAgent(ctx, workspace.ID)
-			} else {
-				status, err = api.WorkspaceAgentStatus(ctx, workspace.ID)
-			}
-		} else {
-			err = api.RemoteCall(ctx, host, op, workspaceAgentRequest{Workspace: workspace.ID}, &status)
-		}
-		if err != nil {
-			return 1, err
-		}
-		if jsonOut {
-			return 0, writeJSON(stdout, status)
-		}
-		writeWorkspaceAgentStatus(stdout, status)
-		return 0, nil
-	default:
-		return 2, fmt.Errorf("unknown workspace agent command %q", args[0])
-	}
-}
-
-func writeWorkspaceAgentStatus(w io.Writer, status workspaceAgentStatus) {
-	fmt.Fprintf(w, "agent=%s owner=%s available=%t", status.State, status.Owner, status.Available)
-	if status.ClaimedAttachmentID != "" {
-		fmt.Fprintf(w, " attachment=%s", status.ClaimedAttachmentID)
-	}
-	if status.ClaimedNodeID != "" {
-		fmt.Fprintf(w, " node=%s", status.ClaimedNodeID)
-	}
-	if status.RelaySocket != "" {
-		fmt.Fprintf(w, " relay=%s", status.RelaySocket)
-	}
-	if len(status.LegacyPaneIDs) != 0 {
-		fmt.Fprintf(w, " legacy_panes=%s", strings.Join(status.LegacyPaneIDs, ","))
-	}
-	fmt.Fprintln(w)
 }
 
 func runWorkspaceList(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
@@ -671,7 +728,8 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	}
 	fs := newFlagSet(name, stderr)
 	paneRef := fs.String("pane", "", "pane to focus after attaching")
-	claimAgent := fs.Bool("claim-agent", false, "use this machine's SSH agent after attaching")
+	claimCredentials := fs.Bool("claim-credentials", false, "claim a credential bundle after attaching")
+	credentialBundle := fs.String("credential-bundle", "", "credential bundle to claim")
 	if err := parseInterspersed(fs, args); err != nil {
 		return 2, err
 	}
@@ -682,8 +740,11 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	defer cancel()
 	api := NewAPI(paths)
 	host, ref := splitWorkspaceRef(fs.Arg(0))
-	if *claimAgent && host == "" {
-		return 2, fmt.Errorf("--claim-agent requires a remote workspace")
+	if *claimCredentials && host == "" {
+		return 2, fmt.Errorf("--claim-credentials requires a remote workspace")
+	}
+	if *credentialBundle != "" && !*claimCredentials {
+		return 2, fmt.Errorf("--credential-bundle requires --claim-credentials")
 	}
 	var workspace *Workspace
 	var err error
@@ -764,8 +825,8 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 		if err := focusAttachment(ctx, paths, workspace, existing, *paneRef); err != nil {
 			return 1, err
 		}
-		if *claimAgent {
-			if err := claimAttachedWorkspaceAgent(api, host, workspace, existing.ID); err != nil {
+		if *claimCredentials {
+			if err := claimAttachedWorkspaceCredentials(api, host, workspace, existing.ID, *credentialBundle); err != nil {
 				return 1, err
 			}
 		}
@@ -847,8 +908,8 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	if err := focusAttachment(ctx, paths, workspace, workspace.Attachments[attachmentID], *paneRef); err != nil {
 		return 1, err
 	}
-	if *claimAgent {
-		if err := claimAttachedWorkspaceAgent(api, host, workspace, attachmentID); err != nil {
+	if *claimCredentials {
+		if err := claimAttachedWorkspaceCredentials(api, host, workspace, attachmentID, *credentialBundle); err != nil {
 			return 1, err
 		}
 	}
@@ -856,14 +917,25 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	return 0, nil
 }
 
-func claimAttachedWorkspaceAgent(api API, host string, workspace *Workspace, attachmentID string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspace, attachmentID, bundleName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	var status workspaceAgentStatus
-	if err := api.RemoteCall(ctx, host, "workspace_agent_claim", workspaceAgentRequest{
-		Workspace: workspace.ID, Attachment: attachmentID,
+	cfg, err := LoadConfig()
+	if err != nil {
+		return err
+	}
+	if bundleName == "" {
+		bundleName = cfg.Credentials.DefaultBundle
+	}
+	if bundleName == "" {
+		return fmt.Errorf("workspace %s attached but no credential bundle was selected", workspace.Name)
+	}
+	refreshCredentialStartupTTY(ctx, cfg, bundleName, ExecRunner{})
+	var status workspaceCredentialStatus
+	if err := api.RemoteCall(ctx, host, "credentials_claim", workspaceCredentialRequest{
+		Workspace: workspace.ID, Attachment: attachmentID, Bundle: bundleName,
 	}, &status); err != nil {
-		return fmt.Errorf("workspace %s attached but its SSH agent was not claimed: %w", workspace.Name, err)
+		return fmt.Errorf("workspace %s attached but credential bundle %s was not claimed: %w", workspace.Name, bundleName, err)
 	}
 	return nil
 }
@@ -1642,9 +1714,21 @@ func paneCommandEnvironment(cfg Config, paths Paths, workspaceID, paneID string,
 	environment := append([]string(nil), os.Environ()...)
 	environment = replaceEnvironmentValue(environment, "ZKA_WORKSPACE_ID", workspaceID)
 	environment = replaceEnvironmentValue(environment, "ZKA_PANE_ID", paneID)
-	if creating && cfg.SSH.ForwardAgent {
-		environment = replaceEnvironmentValue(environment, "SSH_AUTH_SOCK", agentRelaySocketPath(paths.AgentDir, workspaceID))
-		environment = replaceEnvironmentValue(environment, "ZKA_AGENT_RELAY_VERSION", strconv.Itoa(agentRelayVersion))
+	if creating && cfg.credentialsEnabled() {
+		sshEnabled, openPGPEnabled := false, false
+		for _, bundle := range cfg.Credentials.Bundles {
+			sshEnabled = sshEnabled || bundle.SSHAgent.Enable
+			openPGPEnabled = openPGPEnabled || bundle.OpenPGP.Enable
+		}
+		if sshEnabled {
+			environment = replaceEnvironmentValue(environment, "SSH_AUTH_SOCK", agentRelaySocketPath(paths.AgentDir, workspaceID))
+		}
+		if openPGPEnabled {
+			if home, err := credentialOpenPGPHome(paths, workspaceID); err == nil {
+				environment = replaceEnvironmentValue(environment, "GNUPGHOME", home)
+			}
+		}
+		environment = replaceEnvironmentValue(environment, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION", strconv.Itoa(credentialEnvironmentVersion))
 	}
 	return environment
 }
@@ -1962,10 +2046,10 @@ func runPaneHost(args []string, paths Paths, stdin io.Reader, stdout, stderr io.
 		return 2, fmt.Errorf("pane-host requires --workspace, --pane, and a command after --")
 	}
 	api := NewAPI(paths)
-	relayVersion, _ := strconv.Atoi(os.Getenv("ZKA_AGENT_RELAY_VERSION"))
+	credentialVersion, _ := strconv.Atoi(os.Getenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION"))
 	workspace, err := api.Event(context.Background(), Event{
 		WorkspaceID: *workspaceID, PaneID: *paneID, Kind: "process_started", Source: "pane-host",
-		PID: os.Getpid(), AgentRelayVersion: relayVersion,
+		PID: os.Getpid(), CredentialEnvironmentVersion: credentialVersion,
 	})
 	if err != nil {
 		return 1, err
@@ -2028,10 +2112,6 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 				fmt.Errorf("remote zmx session %q is missing", pane.Backend.Ref), stdin, stdout)
 		}
 	}
-	forwardedAgentSocket := ""
-	if cfg.SSH.ForwardAgent {
-		forwardedAgentSocket = os.Getenv("SSH_AUTH_SOCK")
-	}
 	zmxArgs := []string{"attach", pane.Backend.Ref}
 	if prepared.Create {
 		zmxArgs = append(zmxArgs, "zka", "pane-host", "--workspace", workspace.ID, "--pane", pane.ID, "--")
@@ -2068,7 +2148,6 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 	}
 	heartbeat := attachmentPaneReadyRequest{
 		Workspace: workspace.ID, Attachment: *attachmentID, Pane: pane.ID, Ready: true,
-		AgentSocket: forwardedAgentSocket,
 	}
 	heartbeatCtx, heartbeatCancel := context.WithTimeout(ctx, 2*time.Second)
 	_, heartbeatErr := api.SetAttachmentPaneReady(heartbeatCtx, heartbeat)
@@ -2339,7 +2418,7 @@ func runRemoteControlCommand(args []string, paths Paths, stdin io.Reader, stdout
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return 0, runRemoteControl(ctx, paths, stdin, stdout)
+	return 0, runRemoteControlMux(ctx, paths, stdin, stdout)
 }
 
 func processExitCode(err error) int {
