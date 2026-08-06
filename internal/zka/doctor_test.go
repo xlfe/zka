@@ -192,11 +192,38 @@ func TestSwayIPCDoctorCheck(t *testing.T) {
 	}
 
 	connected := swayIPCDoctorCheck(context.Background(), false, true, probe)
-	if !connected.OK || connected.Detail != "/run/user/1234/sway.sock via XDG_RUNTIME_DIR" {
+	if !connected.OK || connected.Warning || connected.Detail != "/run/user/1234/sway.sock via XDG_RUNTIME_DIR" {
 		t.Fatalf("connected check = %#v", connected)
 	}
 	if probeCalls != 1 {
 		t.Fatalf("probe calls = %d, want 1", probeCalls)
+	}
+
+	recovered := swayIPCDoctorCheck(context.Background(), false, true, func(context.Context) (swaySocketInfo, error) {
+		return swaySocketInfo{
+			Path: "/run/user/1234/sway-ipc.1000.99.sock", Source: "XDG_RUNTIME_DIR",
+			FailedAttempts: []swaySocketAttempt{{
+				Path: "/run/user/1234/sway-ipc.1000.42.sock", Source: "SWAYSOCK", Error: "unable to connect",
+			}},
+		}, nil
+	})
+	if !recovered.OK || !recovered.Warning || !strings.Contains(recovered.Detail, "recovered via XDG_RUNTIME_DIR") ||
+		!strings.Contains(recovered.Detail, "SWAYSOCK=/run/user/1234/sway-ipc.1000.42.sock is stale") ||
+		!strings.Contains(recovered.Detail, "fix your Sway session environment import") ||
+		!strings.Contains(recovered.Detail, "does not repair other programs") {
+		t.Fatalf("recovered check = %#v", recovered)
+	}
+
+	runtimeRecovery := swayIPCDoctorCheck(context.Background(), false, true, func(context.Context) (swaySocketInfo, error) {
+		return swaySocketInfo{
+			Path: "/run/user/1234/sway-ipc.1000.99.sock", Source: "XDG_RUNTIME_DIR",
+			FailedAttempts: []swaySocketAttempt{{
+				Path: "/run/user/1234/sway-ipc.1000.98.sock", Source: "XDG_RUNTIME_DIR", Error: "unable to connect",
+			}},
+		}, nil
+	})
+	if !runtimeRecovery.OK || runtimeRecovery.Warning || runtimeRecovery.Detail != "/run/user/1234/sway-ipc.1000.99.sock via XDG_RUNTIME_DIR" {
+		t.Fatalf("runtime recovery check = %#v", runtimeRecovery)
 	}
 
 	failed := swayIPCDoctorCheck(context.Background(), false, true, func(context.Context) (swaySocketInfo, error) {

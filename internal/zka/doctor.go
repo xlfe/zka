@@ -399,6 +399,20 @@ func swayIPCDoctorCheck(ctx context.Context, headless, desktopEnabled bool, prob
 		}
 		return doctorCheck{Name: name, Detail: detail}
 	}
+	failedHints := make([]string, 0, 2)
+	for _, attempt := range socket.FailedAttempts {
+		if attempt.Source != "SWAYSOCK" && attempt.Source != "I3SOCK" {
+			continue
+		}
+		failedHints = append(failedHints, fmt.Sprintf("%s=%s is stale (%s)", attempt.Source, attempt.Path, attempt.Error))
+	}
+	if len(failedHints) != 0 {
+		return doctorCheck{
+			Name: name, OK: true, Warning: true,
+			Detail: fmt.Sprintf("recovered via %s at %s; %s; fix your Sway session environment import; zka recovery does not repair other programs in the session",
+				socket.Source, socket.Path, strings.Join(failedHints, "; ")),
+		}
+	}
 	return doctorCheck{
 		Name:   name,
 		OK:     true,

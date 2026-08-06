@@ -38,8 +38,19 @@ func setPaneForNotificationWithDetail(t *testing.T, d *Daemon, workspace *Worksp
 // fire: focusing the Kitty pane without raising the compositor window leaves the
 // pane focused inside a window the user cannot see.
 func TestDesktopActionFocusesPaneAndMarksSeen(t *testing.T) {
-	t.Setenv("SWAYSOCK", "/run/user/1234/sway-ipc.sock")
+	t.Setenv("SWAYSOCK", "/run/user/1234/stale-sway-ipc.sock")
+	t.Setenv("I3SOCK", "")
+	runtimeDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	swaySocket := listenSwayTestSocket(t, runtimeDir, "sway-ipc.1000.4242.sock", time.Now())
 	runner := quietRunner()
+	quietHandler := runner.handler
+	runner.handler = func(ctx context.Context, name string, args ...string) (string, string, error) {
+		if name == "swaymsg" && len(args) >= 2 && args[1] == "/run/user/1234/stale-sway-ipc.sock" {
+			return "", "", errors.New("unable to connect")
+		}
+		return quietHandler(ctx, name, args...)
+	}
 	d, err := newTestDaemon(t, t.TempDir(), runner)
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +83,7 @@ func TestDesktopActionFocusesPaneAndMarksSeen(t *testing.T) {
 				strings.Contains(joined, "var:zka_pane="+pane.ID) {
 				focused = true
 			}
-			if call.Name == "swaymsg" && joined == "--socket /run/user/1234/sway-ipc.sock [pid=4242] focus" {
+			if call.Name == "swaymsg" && joined == "--socket "+swaySocket+" [pid=4242] focus" {
 				raised = true
 			}
 		}

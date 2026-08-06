@@ -2,15 +2,49 @@ package zka
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 )
 
-type swaySocketInfo struct {
+const (
+	swayCommandOverallTimeout = 3 * time.Second
+	swayPrimaryAttemptTimeout = 2 * time.Second
+	swayFallbackTimeout       = 500 * time.Millisecond
+)
+
+var errNoSwayIPCSocket = errors.New("no Sway IPC socket available to zkad")
+
+type swaySocketAttempt struct {
 	Path   string `json:"path"`
 	Source string `json:"source"`
+	Error  string `json:"error"`
+}
+
+type swaySocketInfo struct {
+	Path           string              `json:"path"`
+	Source         string              `json:"source"`
+	FailedAttempts []swaySocketAttempt `json:"failed_attempts,omitempty"`
+}
+
+type swaySocketCandidate struct {
+	Path    string
+	Source  string
+	BoundAt time.Time
+}
+
+type swayCommandTimeouts struct {
+	Overall  time.Duration
+	Primary  time.Duration
+	Fallback time.Duration
+}
+
+var defaultSwayCommandTimeouts = swayCommandTimeouts{
+	Overall: swayCommandOverallTimeout, Primary: swayPrimaryAttemptTimeout, Fallback: swayFallbackTimeout,
 }
 
 // focusSwayWindow raises the compositor window owning a Kitty process. The
@@ -21,74 +55,163 @@ func focusSwayWindow(ctx context.Context, runner CommandRunner, command string, 
 	if pid <= 0 {
 		return nil
 	}
-	socket, ok := resolveSwaySocket()
-	if !ok {
+	_, err := runSwayCommand(ctx, runner, command, fmt.Sprintf("[pid=%d] focus", pid))
+	if errors.Is(err, errNoSwayIPCSocket) {
 		return nil
 	}
-	if command == "" {
-		command = "swaymsg"
-	}
-	if runner == nil {
-		runner = ExecRunner{}
-	}
-	if _, _, err := runner.Run(ctx, command, "--socket", socket.Path, fmt.Sprintf("[pid=%d] focus", pid)); err != nil {
-		return fmt.Errorf("focus Sway window for Kitty process %d via %s (%s): %w", pid, socket.Path, socket.Source, err)
+	if err != nil {
+		return fmt.Errorf("focus Sway window for Kitty process %d: %w", pid, err)
 	}
 	return nil
 }
 
 func probeSwayIPC(ctx context.Context, runner CommandRunner, command string) (swaySocketInfo, error) {
-	socket, ok := resolveSwaySocket()
-	if !ok {
-		return swaySocketInfo{}, fmt.Errorf("no Sway IPC socket available to zkad")
+	socket, err := runSwayCommand(ctx, runner, command, "--type", "get_version")
+	if err != nil {
+		return swaySocketInfo{}, fmt.Errorf("probe Sway IPC: %w", err)
 	}
+	return socket, nil
+}
+
+func runSwayCommand(ctx context.Context, runner CommandRunner, command string, operationArgs ...string) (swaySocketInfo, error) {
+	return runSwayCommandWith(ctx, runner, command, os.Getenv, os.ReadDir, defaultSwayCommandTimeouts, operationArgs...)
+}
+
+func runSwayCommandWith(
+	ctx context.Context,
+	runner CommandRunner,
+	command string,
+	getenv func(string) string,
+	readDir func(string) ([]os.DirEntry, error),
+	timeouts swayCommandTimeouts,
+	operationArgs ...string,
+) (swaySocketInfo, error) {
 	if command == "" {
 		command = "swaymsg"
 	}
 	if runner == nil {
 		runner = ExecRunner{}
 	}
-	if _, _, err := runner.Run(ctx, command, "--socket", socket.Path, "--type", "get_version"); err != nil {
-		return swaySocketInfo{}, fmt.Errorf("probe Sway IPC via %s (%s): %w", socket.Path, socket.Source, err)
+	overallCtx, overallCancel := context.WithTimeout(ctx, timeouts.Overall)
+	defer overallCancel()
+
+	seen := map[string]bool{}
+	failed := make([]swaySocketAttempt, 0, 4)
+	primaryAttempt := true
+	attempt := func(candidate swaySocketCandidate) (swaySocketInfo, bool) {
+		path := filepath.Clean(strings.TrimSpace(candidate.Path))
+		if path == "." || seen[path] {
+			return swaySocketInfo{}, false
+		}
+		seen[path] = true
+		timeout := timeouts.Fallback
+		if primaryAttempt {
+			timeout = timeouts.Primary
+			primaryAttempt = false
+		}
+		attemptCtx, attemptCancel := context.WithTimeout(overallCtx, timeout)
+		args := []string{"--socket", path}
+		args = append(args, operationArgs...)
+		_, _, err := runner.Run(attemptCtx, command, args...)
+		// A command that completed successfully at the deadline still completed.
+		// Prefer the context error only when the runner itself failed, otherwise a
+		// healthy hint can become a false stale-socket warning.
+		if err != nil && attemptCtx.Err() != nil {
+			err = attemptCtx.Err()
+		}
+		attemptCancel()
+		if err == nil {
+			return swaySocketInfo{
+				Path: path, Source: candidate.Source,
+				FailedAttempts: append([]swaySocketAttempt(nil), failed...),
+			}, true
+		}
+		failed = append(failed, swaySocketAttempt{Path: path, Source: candidate.Source, Error: err.Error()})
+		return swaySocketInfo{}, false
 	}
-	return socket, nil
-}
 
-func resolveSwaySocket() (swaySocketInfo, bool) {
-	return resolveSwaySocketWith(os.Getenv, os.ReadDir)
-}
-
-func resolveSwaySocketWith(
-	getenv func(string) string,
-	readDir func(string) ([]os.DirEntry, error),
-) (swaySocketInfo, bool) {
 	for _, variable := range []string{"SWAYSOCK", "I3SOCK"} {
-		if path := strings.TrimSpace(getenv(variable)); path != "" {
-			return swaySocketInfo{Path: path, Source: variable}, true
+		path := strings.TrimSpace(getenv(variable))
+		if path == "" {
+			continue
+		}
+		if socket, ok := attempt(swaySocketCandidate{Path: path, Source: variable}); ok {
+			return socket, nil
+		}
+		if overallCtx.Err() != nil {
+			return swaySocketInfo{}, swayCommandFailure(failed, nil)
 		}
 	}
-	// zkad starts from default.target and can beat Sway's environment import.
-	// Resolve the per-user runtime socket on every action so a socket created
-	// after daemon startup becomes visible without restarting zkad.
+
+	candidates, discoveryErr := discoverRuntimeSwaySockets(getenv, readDir, seen)
+	for _, candidate := range candidates {
+		if socket, ok := attempt(candidate); ok {
+			return socket, nil
+		}
+		if overallCtx.Err() != nil {
+			break
+		}
+	}
+	if len(failed) == 0 && discoveryErr == nil {
+		return swaySocketInfo{}, errNoSwayIPCSocket
+	}
+	return swaySocketInfo{}, swayCommandFailure(failed, discoveryErr)
+}
+
+func discoverRuntimeSwaySockets(
+	getenv func(string) string,
+	readDir func(string) ([]os.DirEntry, error),
+	alreadyTried map[string]bool,
+) ([]swaySocketCandidate, error) {
 	runtimeDir := strings.TrimSpace(getenv("XDG_RUNTIME_DIR"))
 	if runtimeDir == "" {
-		return swaySocketInfo{}, false
+		return nil, nil
 	}
 	entries, err := readDir(runtimeDir)
 	if err != nil {
-		return swaySocketInfo{}, false
+		return nil, fmt.Errorf("scan XDG_RUNTIME_DIR %s: %w", runtimeDir, err)
 	}
+	candidates := make([]swaySocketCandidate, 0, 2)
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), "sway-ipc.") || !strings.HasSuffix(entry.Name(), ".sock") {
 			continue
 		}
-		info, err := entry.Info()
-		if err == nil && info.Mode()&os.ModeSocket != 0 {
-			return swaySocketInfo{
-				Path:   filepath.Join(runtimeDir, entry.Name()),
-				Source: "XDG_RUNTIME_DIR",
-			}, true
+		info, infoErr := entry.Info()
+		if infoErr != nil || info.Mode()&os.ModeSocket == 0 {
+			continue
 		}
+		path := filepath.Clean(filepath.Join(runtimeDir, entry.Name()))
+		// Deduplicate across phases. A stale SWAYSOCK commonly remains as a
+		// socket entry after Sway restarts; retrying it wastes a fallback slot.
+		if alreadyTried[path] {
+			continue
+		}
+		candidates = append(candidates, swaySocketCandidate{
+			Path: path, Source: "XDG_RUNTIME_DIR", BoundAt: info.ModTime(),
+		})
 	}
-	return swaySocketInfo{}, false
+	// A Unix socket's mtime is set when it is bound, so newest-first normally
+	// selects the compositor that replaced a stale environment hint. This is
+	// deterministic and more useful than os.ReadDir's alphabetical order.
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].BoundAt.Equal(candidates[j].BoundAt) {
+			return candidates[i].Path < candidates[j].Path
+		}
+		return candidates[i].BoundAt.After(candidates[j].BoundAt)
+	})
+	return candidates, nil
+}
+
+func swayCommandFailure(attempts []swaySocketAttempt, discoveryErr error) error {
+	parts := make([]string, 0, len(attempts)+1)
+	for _, attempt := range attempts {
+		parts = append(parts, fmt.Sprintf("%s=%s: %s", attempt.Source, attempt.Path, attempt.Error))
+	}
+	if discoveryErr != nil {
+		parts = append(parts, discoveryErr.Error())
+	}
+	if len(parts) == 0 {
+		return errNoSwayIPCSocket
+	}
+	return fmt.Errorf("no reachable Sway IPC socket: %s", strings.Join(parts, "; "))
 }

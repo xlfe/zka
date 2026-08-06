@@ -24,7 +24,7 @@ and provider socket paths on the provider.
 </p>
 
 > [!NOTE]
-> zka 0.8.1 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
+> zka 0.8.2 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
 > builds on Kitty, zmx, OpenSSH, systemd user services, and coding-agent hooks
 > instead of replacing them.
 
@@ -438,7 +438,7 @@ services.zka.credentials.bundles.work.openpgp.signingKeys = [
 > provider. Anyone who followed those instructions can have affected panes:
 > local Git push and SSH fail because `SSH_AUTH_SOCK` names an absent relay,
 > while GPG sees an empty managed keyring with agent autostart disabled. Upgrade
-> to v0.8.1 on the whole fleet and follow the migration steps below.
+> to v0.8.2 on the whole fleet and follow the migration steps below.
 
 Pin the two zka nodes before claiming credentials. `zka doctor` prints the
 local `node=` value. On `laptop`, bind the outbound SSH alias to `devbox`'s
@@ -621,6 +621,21 @@ or substitute for OpenSSH host/user authentication.
 | Local user | Runtime/state directories are mode `0700`, files and Unix sockets are `0600`, and the systemd unit uses `UMask=0077` and `NoNewPrivileges=true`. | Any process already running as that Unix user can read user-owned state and can connect to a credential socket whose path it can reach. Per-workspace sockets are routing boundaries, not same-UID isolation. |
 | Workspace | Remote provider credential access requires an explicit durable claim owned by a ready attachment. Disconnect removes listeners; reconnect republishes only the current bundle/generation. Locally created panes inherit origin credentials without a claim. | A claimed origin is trusted to request the granted operations. A compromised origin process is not confined to the visible pane that motivated the claim. |
 | Provider identity | The outbound alias is pinned to an expected target node ID, and the origin accepts credential listeners only from configured provider node IDs. Optional source CIDRs can narrow fixed-host deployments. | The provider node ID is asserted inside an authenticated SSH session but is not yet bound to the particular client public key. Another key authorized for the same account could assert a configured ID. Public-key binding through sshd authentication metadata remains future work. |
+
+### Socket resolution policy
+
+Socket paths carry different kinds of meaning, so zka does not apply one
+fallback rule to all of them:
+
+| Class | Examples | Failure behavior |
+| --- | --- | --- |
+| **Hints** | `SWAYSOCK`, `I3SOCK` | Try the environment hint first, then discover a live compositor socket under `XDG_RUNTIME_DIR`. Doctor warns when a set hint failed. |
+| **Policy** | `SSH_AUTH_SOCK`, GnuPG `agent-extra-socket` | Never scan for a substitute. The selected socket determines which keys are authorized, so an unreachable path fails closed. |
+| **Identity** | zka control/watcher sockets, Kitty attachment endpoints, workspace SSH relays and GnuPG homes | Keep the stable path owned by zka and repair or republish that endpoint; never attach to a lookalike socket. |
+
+`XDG_RUNTIME_DIR` is the session root supplied by `pam_systemd`, not another
+socket hint. zka derives its owned runtime paths from it and does not attempt to
+rediscover a different runtime directory.
 
 ### Credential authority
 
@@ -1066,6 +1081,18 @@ FAIL  credentials-provider openpgp: dial unix /run/user/1000/gnupg/S.gpg-agent.e
 FAIL  credentials-transport degraded: provider control session is unavailable
 ```
 
+A stale compositor hint also warns without breaking Focus actions:
+
+```text
+WARN  sway-ipc         recovered via XDG_RUNTIME_DIR at /run/user/1000/sway-ipc.1000.99.sock; SWAYSOCK=/run/user/1000/sway-ipc.1000.42.sock is stale (exit status 1: Unable to connect); fix your Sway session environment import; zka recovery does not repair other programs in the session
+```
+
+zka retries compositor discovery on each Focus action rather than caching the
+recovered path. This recovery fixes notification and CLI focusing only. Other
+programs still see the stale environment value until the Sway session imports
+its current `SWAYSOCK`; import it into the systemd user manager at every Sway
+start rather than treating zka's warning as the durable repair.
+
 Inside a legacy v0.8.0 pane, the targeted diagnosis precedes contaminated
 provider checks and prints only origin-owned paths:
 
@@ -1120,13 +1147,15 @@ routing the new pane through zka.
 
 ## Project status
 
-Version 0.8.1 combines three systems: durable Kitty-native workspaces, Codex and
+Version 0.8.2 combines three systems: durable Kitty-native workspaces, Codex and
 Claude Code attention routing, and reconnect-safe remote credential bundles for
 SSH agents and filtered OpenPGP. It also includes remote mirrors and two-phase
 moves, headless origins, Waybar streaming, desktop/ntfy notifications, and
-durable cleanup after partial failures. Version 0.8.1 also restores inherited
+durable cleanup after partial failures. Version 0.8.2 restores inherited
 SSH and GnuPG credentials in locally created panes and inventories ambiguous
-v0.8.0 pane environments before recreation.
+v0.8.0 pane environments before recreation. It also recovers Focus actions from
+stale compositor environment hints while keeping the underlying session problem
+visible as a doctor warning.
 
 State schemas v1 and v2 are reset on the first v0.3-or-newer start because v3
 changed process ownership. The reset removes old zka state and generated Kitty
