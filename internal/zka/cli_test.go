@@ -12,28 +12,76 @@ import (
 	"testing"
 )
 
-func TestPaneCommandEnvironmentUsesStableAgentOnlyForNewBackends(t *testing.T) {
-	t.Setenv("SSH_AUTH_SOCK", "/tmp/ephemeral-agent.sock")
-	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "")
+func TestLocalAndRemotePaneBackendCommandsSelectCredentialEnvironment(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "/tmp/local-agent.sock")
+	t.Setenv("GNUPGHOME", "/tmp/local-gnupg")
+	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "2")
 	paths := testPaths(t.TempDir())
 	var cfg Config
-	var bundle CredentialBundleConfig
-	bundle.SSHAgent.Enable = true
-	bundle.OpenPGP.Enable = true
-	cfg.Credentials.Bundles = map[string]CredentialBundleConfig{"work": bundle}
-	created := paneCommandEnvironment(cfg, paths, "workspace", "pane", true)
-	if got := testEnvironmentValue(created, "SSH_AUTH_SOCK"); got != agentRelaySocketPath(paths.AgentDir, "workspace") {
-		t.Fatalf("created SSH_AUTH_SOCK = %q", got)
+	cfg.ZMX.Command = "zmx"
+	var sshBundle, openPGPBundle CredentialBundleConfig
+	sshBundle.SSHAgent.Enable = true
+	openPGPBundle.OpenPGP.Enable = true
+	cfg.Credentials.Bundles = map[string]CredentialBundleConfig{"ssh": sshBundle, "openpgp": openPGPBundle}
+	prepared := preparePaneResponse{
+		Workspace: &Workspace{ID: "workspace", Shell: []string{"fish"}},
+		Pane:      &Pane{ID: "pane", Backend: BackendRef{Ref: "backend"}},
+		Create:    true,
 	}
-	if got := testEnvironmentValue(created, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "2" {
-		t.Fatalf("relay version = %q", got)
+
+	local := localPaneBackendCommand(cfg, prepared)
+	if got := testEnvironmentValue(local.Env, "SSH_AUTH_SOCK"); got != "/tmp/local-agent.sock" {
+		t.Fatalf("local SSH_AUTH_SOCK = %q", got)
 	}
-	if got, want := testEnvironmentValue(created, "GNUPGHOME"), filepath.Join(paths.StateDir, "credentials", "workspace", "gnupg"); got != want {
-		t.Fatalf("GNUPGHOME = %q, want %q", got, want)
+	if got := testEnvironmentValue(local.Env, "GNUPGHOME"); got != "/tmp/local-gnupg" {
+		t.Fatalf("local GNUPGHOME = %q", got)
 	}
-	attached := paneCommandEnvironment(cfg, paths, "workspace", "pane", false)
-	if got := testEnvironmentValue(attached, "SSH_AUTH_SOCK"); got != "/tmp/ephemeral-agent.sock" {
-		t.Fatalf("reattach SSH_AUTH_SOCK = %q", got)
+	if testEnvironmentContains(local.Env, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION") {
+		t.Fatalf("local command retained managed environment marker: %#v", local.Env)
+	}
+
+	remote := remotePaneBackendCommand(cfg, paths, prepared)
+	if got := testEnvironmentValue(remote.Env, "SSH_AUTH_SOCK"); got != agentRelaySocketPath(paths.AgentDir, "workspace") {
+		t.Fatalf("remote SSH_AUTH_SOCK = %q", got)
+	}
+	if got, want := testEnvironmentValue(remote.Env, "GNUPGHOME"), filepath.Join(paths.StateDir, "credentials", "workspace", "gnupg"); got != want {
+		t.Fatalf("remote GNUPGHOME = %q, want %q", got, want)
+	}
+	if got := testEnvironmentValue(remote.Env, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "3" {
+		t.Fatalf("remote credential environment version = %q", got)
+	}
+
+	prepared.Create = false
+	attached := remotePaneBackendCommand(cfg, paths, prepared)
+	if got := testEnvironmentValue(attached.Env, "SSH_AUTH_SOCK"); got != "/tmp/local-agent.sock" {
+		t.Fatalf("reattach process SSH_AUTH_SOCK = %q", got)
+	}
+	if testEnvironmentContains(attached.Env, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION") {
+		t.Fatalf("reattach process claimed to rewrite the backend environment: %#v", attached.Env)
+	}
+}
+
+func TestLocalPaneBackendCommandPreservesUnsetCredentialEnvironment(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "restore-after-test")
+	t.Setenv("GNUPGHOME", "restore-after-test")
+	if err := os.Unsetenv("SSH_AUTH_SOCK"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv("GNUPGHOME"); err != nil {
+		t.Fatal(err)
+	}
+	prepared := preparePaneResponse{
+		Workspace: &Workspace{ID: "workspace", Shell: []string{"fish"}},
+		Pane:      &Pane{ID: "pane", Backend: BackendRef{Ref: "backend"}},
+		Create:    true,
+	}
+	var cfg Config
+	cfg.ZMX.Command = "zmx"
+	cmd := localPaneBackendCommand(cfg, prepared)
+	for _, name := range []string{"SSH_AUTH_SOCK", "GNUPGHOME", "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"} {
+		if testEnvironmentContains(cmd.Env, name) {
+			t.Fatalf("local command invented %s: %#v", name, cmd.Env)
+		}
 	}
 }
 
@@ -45,6 +93,16 @@ func testEnvironmentValue(environment []string, name string) string {
 		}
 	}
 	return ""
+}
+
+func testEnvironmentContains(environment []string, name string) bool {
+	prefix := name + "="
+	for _, entry := range environment {
+		if strings.HasPrefix(entry, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestWorkspaceCredentialsStatusCLIReportsUnclaimedByDefault(t *testing.T) {

@@ -153,8 +153,9 @@ func (s *Store) Load() (StateData, error) {
 			attachment.ReconcileStatus = "pending"
 		}
 	}
-	// Panes without a credential environment version retain zero so status can
-	// identify the exact backends that need recreation before OpenPGP use.
+	// Zero remains meaningful: it denotes a local or pre-managed backend. A
+	// remote claim may require recreating it, while an unclaimed local workspace
+	// should leave it alone.
 	state.SchemaVersion = stateSchemaVersion
 	return state, nil
 }

@@ -62,15 +62,16 @@ type credentialCapabilityView struct {
 }
 
 type workspaceCredentialStatus struct {
-	WorkspaceID     string                              `json:"workspace_id"`
-	WorkspaceName   string                              `json:"workspace_name"`
-	Bundle          string                              `json:"bundle,omitempty"`
-	OwnerNode       string                              `json:"owner_node,omitempty"`
-	OwnerAttachment string                              `json:"owner_attachment,omitempty"`
-	Generation      uint64                              `json:"generation,omitempty"`
-	State           string                              `json:"state"`
-	Capabilities    map[string]credentialCapabilityView `json:"capabilities"`
-	RecreatePaneIDs []string                            `json:"panes_requiring_recreation,omitempty"`
+	WorkspaceID      string                              `json:"workspace_id"`
+	WorkspaceName    string                              `json:"workspace_name"`
+	Bundle           string                              `json:"bundle,omitempty"`
+	OwnerNode        string                              `json:"owner_node,omitempty"`
+	OwnerAttachment  string                              `json:"owner_attachment,omitempty"`
+	Generation       uint64                              `json:"generation,omitempty"`
+	State            string                              `json:"state"`
+	Capabilities     map[string]credentialCapabilityView `json:"capabilities"`
+	RecreatePaneIDs  []string                            `json:"panes_requiring_recreation,omitempty"`
+	RecreationDetail string                              `json:"pane_recreation_detail,omitempty"`
 }
 
 type credentialStatusResponse struct {
@@ -546,32 +547,12 @@ func (d *Daemon) workspaceCredentialStatus(workspaceRef string) (workspaceCreden
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, err
 	}
-	status := workspaceCredentialStatus{
-		WorkspaceID: workspace.ID, WorkspaceName: workspace.Name, State: "unclaimed",
-		Capabilities: map[string]credentialCapabilityView{},
-	}
+	status := credentialStatusFromWorkspace(workspace)
 	if workspace.CredentialClaim == nil {
 		d.mu.Unlock()
 		return status, nil
 	}
 	workspaceSnapshot := workspace.Clone()
-	claim := workspace.CredentialClaim
-	status.Bundle = claim.Bundle
-	status.OwnerNode = claim.OwnerNodeID
-	status.OwnerAttachment = claim.OwnerAttachmentID
-	status.Generation = claim.Generation
-	status.State = claim.State
-	for name, capability := range claim.Capabilities {
-		status.Capabilities[name] = credentialCapabilityView{State: capability.State, Available: capability.Available, Detail: capability.Detail}
-	}
-	if _, ok := claim.Capabilities[credentialCapabilityOpenPGP]; ok {
-		status.RecreatePaneIDs = panesRequiringCredentialEnvironment(workspace)
-		if len(status.RecreatePaneIDs) != 0 {
-			capability := status.Capabilities[credentialCapabilityOpenPGP]
-			capability.Detail = "existing panes require recreation to receive GNUPGHOME"
-			status.Capabilities[credentialCapabilityOpenPGP] = capability
-		}
-	}
 	d.mu.Unlock()
 	if !d.credentialClaimTransportReady(workspaceSnapshot) {
 		degradeCredentialStatus(&status)
@@ -583,15 +564,7 @@ func (d *Daemon) workspaceCredentialStatus(workspaceRef string) (workspaceCreden
 func sortedCredentialStatuses(workspaces []*Workspace) []workspaceCredentialStatus {
 	statuses := make([]workspaceCredentialStatus, 0, len(workspaces))
 	for _, workspace := range workspaces {
-		status := workspaceCredentialStatus{WorkspaceID: workspace.ID, WorkspaceName: workspace.Name, State: "unclaimed", Capabilities: map[string]credentialCapabilityView{}}
-		if claim := workspace.CredentialClaim; claim != nil {
-			status.Bundle, status.OwnerNode, status.OwnerAttachment = claim.Bundle, claim.OwnerNodeID, claim.OwnerAttachmentID
-			status.Generation, status.State = claim.Generation, claim.State
-			for name, capability := range claim.Capabilities {
-				status.Capabilities[name] = credentialCapabilityView{State: capability.State, Available: capability.Available, Detail: capability.Detail}
-			}
-		}
-		statuses = append(statuses, status)
+		statuses = append(statuses, credentialStatusFromWorkspace(workspace))
 	}
 	sort.Slice(statuses, func(i, j int) bool {
 		if statuses[i].WorkspaceName != statuses[j].WorkspaceName {
@@ -600,6 +573,50 @@ func sortedCredentialStatuses(workspaces []*Workspace) []workspaceCredentialStat
 		return statuses[i].WorkspaceID < statuses[j].WorkspaceID
 	})
 	return statuses
+}
+
+func credentialStatusFromWorkspace(workspace *Workspace) workspaceCredentialStatus {
+	status := workspaceCredentialStatus{
+		WorkspaceID: workspace.ID, WorkspaceName: workspace.Name, State: "unclaimed",
+		Capabilities: map[string]credentialCapabilityView{},
+	}
+	claim := workspace.CredentialClaim
+	if claim == nil {
+		status.RecreatePaneIDs = panesWithLegacyCredentialEnvironment(workspace)
+		if len(status.RecreatePaneIDs) != 0 {
+			status.RecreationDetail = "v0.8.0 credential environment detected; run the bundle's credential probe inside each pane (for SSH, ssh-add -l; for OpenPGP, gpg --list-secret-keys) and recreate only panes where local credentials fail; remotely created panes may already be healthy"
+		}
+		return status
+	}
+
+	status.Bundle, status.OwnerNode, status.OwnerAttachment = claim.Bundle, claim.OwnerNodeID, claim.OwnerAttachmentID
+	status.Generation, status.State = claim.Generation, claim.State
+	for name, capability := range claim.Capabilities {
+		status.Capabilities[name] = credentialCapabilityView{State: capability.State, Available: capability.Available, Detail: capability.Detail}
+	}
+	status.RecreatePaneIDs = panesRequiringCredentialEnvironment(workspace)
+	if len(status.RecreatePaneIDs) == 0 {
+		return status
+	}
+	status.RecreationDetail = "some panes cannot be proven to consume this claim: version 0 panes must be recreated through the remote attachment; for version 2 panes, run the bundle's credential probe (for SSH, ssh-add -l; for OpenPGP, gpg --list-secret-keys) and recreate only panes where credentials fail"
+	if _, ok := claim.Capabilities[credentialCapabilitySSH]; ok {
+		capability := status.Capabilities[credentialCapabilitySSH]
+		capability.Detail = appendCredentialDetail(capability.Detail, "some panes require recreation to receive SSH_AUTH_SOCK")
+		status.Capabilities[credentialCapabilitySSH] = capability
+	}
+	if _, ok := claim.Capabilities[credentialCapabilityOpenPGP]; ok {
+		capability := status.Capabilities[credentialCapabilityOpenPGP]
+		capability.Detail = appendCredentialDetail(capability.Detail, "some panes require recreation to receive GNUPGHOME")
+		status.Capabilities[credentialCapabilityOpenPGP] = capability
+	}
+	return status
+}
+
+func appendCredentialDetail(existing, addition string) string {
+	if existing == "" {
+		return addition
+	}
+	return existing + "; " + addition
 }
 
 func writeCredentialStreamHello(conn net.Conn, hello credentialStreamHello) error {

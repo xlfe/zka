@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -51,6 +52,8 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 	checks = append(checks, doctorCheck{Name: "daemon", OK: err == nil, Detail: doctorDetail(err, daemonDetail)})
 	stateErr := NewStore(paths).Ensure()
 	checks = append(checks, doctorCheck{Name: "state-dir", OK: stateErr == nil, Detail: doctorDetail(stateErr, paths.StateDir)})
+	currentPaneCredentials, providerChecksUnsafe := currentPaneCredentialEnvironmentDoctorCheck(paths)
+	checks = append(checks, currentPaneCredentials)
 	commands := []struct{ name, command string }{
 		{"kitty", cfg.Kitty.Command}, {"kitten", cfg.Kitty.KittenCommand},
 		{"zmx", cfg.ZMX.Command}, {"ssh", cfg.SSH.Command},
@@ -101,7 +104,15 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		managedHookDoctorCheck("codex-hooks", "/etc/codex/requirements.toml", "hook codex", cfg.Integrations.CodexManagedHooks),
 		managedHookDoctorCheck("claude-hooks", "/etc/claude-code/managed-settings.d/50-zka.json", "hook claude", cfg.Integrations.ClaudeManagedHooks),
 	)
-	checks = append(checks, credentialsProviderDoctorCheck(ctx, cfg, ExecRunner{}), openPGPKeysDoctorCheck(ctx, cfg, ExecRunner{}))
+	if providerChecksUnsafe {
+		const detail = "skipped: the current pane has an outdated managed credential environment; recreate it before testing provider credentials"
+		checks = append(checks,
+			doctorCheck{Name: "credentials-provider", OK: true, Detail: detail},
+			doctorCheck{Name: "openpgp-keys", OK: true, Detail: detail},
+		)
+	} else {
+		checks = append(checks, credentialsProviderDoctorCheck(ctx, cfg, ExecRunner{}), openPGPKeysDoctorCheck(ctx, cfg, ExecRunner{}))
+	}
 	var credentialStatus credentialStatusResponse
 	var credentialStatusErr error
 	if *origin != "" {
@@ -122,6 +133,7 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 	checks = append(checks,
 		credentialsClaimDoctorCheck(credentialStatus, credentialStatusErr),
 		credentialsTransportDoctorCheck(credentialStatus.Transport, credentialStatusErr),
+		credentialEnvironmentInventoryDoctorCheck(credentialStatus, credentialStatusErr),
 	)
 	// One round trip shared by both checks that need the workspace set.
 	workspaces, workspacesErr := api.Workspaces(ctx)
@@ -131,6 +143,38 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		topologyRenderableCheck(workspaces, workspacesErr),
 	)
 	return writeDoctorResult(checks, *jsonOut, stdout)
+}
+
+func currentPaneCredentialEnvironmentDoctorCheck(paths Paths) (doctorCheck, bool) {
+	const name = "current-pane-credentials"
+	paneID := os.Getenv("ZKA_PANE_ID")
+	if paneID == "" {
+		return doctorCheck{Name: name, OK: true, Detail: "not running inside a zka pane"}, false
+	}
+	workspaceID := os.Getenv("ZKA_WORKSPACE_ID")
+	rawVersion := os.Getenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION")
+	if rawVersion == "" || rawVersion == "0" {
+		return doctorCheck{Name: name, OK: true, Detail: fmt.Sprintf("pane %s inherits the local SSH_AUTH_SOCK and GNUPGHOME", shortID(paneID))}, false
+	}
+	version, err := strconv.Atoi(rawVersion)
+	if err != nil || version < 0 {
+		return doctorCheck{Name: name, Detail: fmt.Sprintf("pane %s has invalid credential environment version %q", shortID(paneID), rawVersion)}, true
+	}
+	if version == credentialEnvironmentVersion {
+		return doctorCheck{Name: name, OK: true, Detail: fmt.Sprintf("pane %s uses managed remote credential environment v%d", shortID(paneID), version)}, false
+	}
+	if version > credentialEnvironmentVersion {
+		return doctorCheck{Name: name, Detail: fmt.Sprintf("pane %s uses credential environment v%d, newer than this zka supports", shortID(paneID), version)}, true
+	}
+
+	detail := fmt.Sprintf("pane %s uses legacy credential environment v%d and must be triaged for recreation", shortID(paneID), version)
+	if home, homeErr := credentialOpenPGPHome(paths, workspaceID); homeErr == nil {
+		// These are origin-side paths derived solely from the workspace ID. Do
+		// not include the provider's resolved SSH or gpg-agent socket paths:
+		// those are deliberately memory-only.
+		detail += fmt.Sprintf("; origin SSH_AUTH_SOCK=%s; origin GNUPGHOME=%s", agentRelaySocketPath(paths.AgentDir, workspaceID), home)
+	}
+	return doctorCheck{Name: name, Detail: detail}, true
 }
 
 func configHasOpenPGPBundle(cfg Config) bool {
@@ -266,6 +310,29 @@ func credentialsClaimDoctorCheck(status credentialStatusResponse, err error) doc
 	}
 	sort.Strings(claimed)
 	return doctorCheck{Name: name, OK: true, Detail: strings.Join(claimed, "; ")}
+}
+
+func credentialEnvironmentInventoryDoctorCheck(status credentialStatusResponse, err error) doctorCheck {
+	const name = "credential-environment"
+	if err != nil {
+		return doctorCheck{Name: name, Detail: err.Error()}
+	}
+	var affected []string
+	for _, workspace := range status.Workspaces {
+		if len(workspace.RecreatePaneIDs) == 0 {
+			continue
+		}
+		detail := fmt.Sprintf("%s=%s", workspace.WorkspaceName, strings.Join(workspace.RecreatePaneIDs, ","))
+		if workspace.RecreationDetail != "" {
+			detail += " (" + workspace.RecreationDetail + ")"
+		}
+		affected = append(affected, detail)
+	}
+	if len(affected) == 0 {
+		return doctorCheck{Name: name, OK: true, Detail: "no panes require credential-environment recreation"}
+	}
+	sort.Strings(affected)
+	return doctorCheck{Name: name, Detail: strings.Join(affected, "; ")}
 }
 
 func credentialsTransportDoctorCheck(status credentialTransportView, err error) doctorCheck {

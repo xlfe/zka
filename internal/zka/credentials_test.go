@@ -111,6 +111,75 @@ func sshCredentialBundle() CredentialBundleConfig {
 	return bundle
 }
 
+func TestCredentialStatusReportsPaneEnvironmentMigrationAndClaimGaps(t *testing.T) {
+	workspace := &Workspace{
+		ID: "workspace", Name: "reviewer",
+		Panes: map[string]*Pane{
+			"local":  {ID: "local", BackendCreated: true},
+			"legacy": {ID: "legacy", BackendCreated: true, CredentialEnvironmentVersion: legacyCredentialEnvironmentVersion},
+			"remote": {ID: "remote", BackendCreated: true, CredentialEnvironmentVersion: credentialEnvironmentVersion},
+			"dead":   {ID: "dead", BackendCreated: true, BackendDead: true, CredentialEnvironmentVersion: legacyCredentialEnvironmentVersion},
+		},
+	}
+
+	unclaimed := credentialStatusFromWorkspace(workspace)
+	if got, want := strings.Join(unclaimed.RecreatePaneIDs, ","), "legacy"; got != want {
+		t.Fatalf("unclaimed recreation panes = %q, want %q", got, want)
+	}
+	if !strings.Contains(unclaimed.RecreationDetail, "v0.8.0") || !strings.Contains(unclaimed.RecreationDetail, "ssh-add -l") || !strings.Contains(unclaimed.RecreationDetail, "gpg --list-secret-keys") || len(unclaimed.Capabilities) != 0 {
+		t.Fatalf("unclaimed recreation status = %#v", unclaimed)
+	}
+
+	workspace.CredentialClaim = &CredentialClaim{
+		Bundle: "work", OwnerNodeID: "provider", State: "ready",
+		Capabilities: map[string]CredentialCapabilityStatus{
+			credentialCapabilitySSH:     {State: "ready", Available: true},
+			credentialCapabilityOpenPGP: {State: "ready", Available: true, Detail: "warning: signing key is not card-backed"},
+		},
+	}
+	claimed := credentialStatusFromWorkspace(workspace)
+	if got, want := strings.Join(claimed.RecreatePaneIDs, ","), "legacy,local"; got != want {
+		t.Fatalf("claimed recreation panes = %q, want %q", got, want)
+	}
+	if !strings.Contains(claimed.RecreationDetail, "version 0") || !strings.Contains(claimed.RecreationDetail, "version 2") || !strings.Contains(claimed.RecreationDetail, "gpg --list-secret-keys") {
+		t.Fatalf("claimed recreation detail = %q", claimed.RecreationDetail)
+	}
+	if detail := claimed.Capabilities[credentialCapabilitySSH].Detail; !strings.Contains(detail, "SSH_AUTH_SOCK") {
+		t.Fatalf("SSH recreation detail = %q", detail)
+	}
+	if detail := claimed.Capabilities[credentialCapabilityOpenPGP].Detail; !strings.Contains(detail, "not card-backed") || !strings.Contains(detail, "GNUPGHOME") {
+		t.Fatalf("OpenPGP recreation detail lost warning or guidance: %q", detail)
+	}
+	for _, test := range []struct {
+		name       string
+		capability string
+		endpoint   string
+	}{
+		{name: "ssh-only", capability: credentialCapabilitySSH, endpoint: "SSH_AUTH_SOCK"},
+		{name: "openpgp-only", capability: credentialCapabilityOpenPGP, endpoint: "GNUPGHOME"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workspace.CredentialClaim.Capabilities = map[string]CredentialCapabilityStatus{
+				test.capability: {State: "ready", Available: true},
+			}
+			status := credentialStatusFromWorkspace(workspace)
+			if got := strings.Join(status.RecreatePaneIDs, ","); got != "legacy,local" {
+				t.Fatalf("recreation panes = %q", got)
+			}
+			if detail := status.Capabilities[test.capability].Detail; !strings.Contains(detail, test.endpoint) {
+				t.Fatalf("capability detail = %q", detail)
+			}
+		})
+	}
+
+	workspace.Panes["local"].CredentialEnvironmentVersion = credentialEnvironmentVersion
+	workspace.Panes["legacy"].CredentialEnvironmentVersion = credentialEnvironmentVersion
+	current := credentialStatusFromWorkspace(workspace)
+	if len(current.RecreatePaneIDs) != 0 || current.RecreationDetail != "" {
+		t.Fatalf("current remote panes require recreation: %#v", current)
+	}
+}
+
 func TestCredentialStatusDegradesAndRecoversWithTransport(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
 	if err != nil {

@@ -11,10 +11,12 @@ import (
 )
 
 const (
-	// Pane environment version 2 is the first version that receives both the
-	// stable SSH endpoint and the per-workspace GNUPGHOME when configured.
-	credentialEnvironmentVersion = 2
-	agentRelayDialTimeout        = 500 * time.Millisecond
+	// Version 2 was projected into every new pane, including authoritative
+	// local panes. Version 3 means the backend was created through a remote SSH
+	// attachment and deliberately received the managed credential endpoints.
+	legacyCredentialEnvironmentVersion = 2
+	credentialEnvironmentVersion       = 3
+	agentRelayDialTimeout              = 500 * time.Millisecond
 )
 
 // agentRelaySocketPath is stable across claim generations and transport

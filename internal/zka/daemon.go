@@ -1432,6 +1432,17 @@ func panesRequiringCredentialEnvironment(workspace *Workspace) []string {
 	return ids
 }
 
+func panesWithLegacyCredentialEnvironment(workspace *Workspace) []string {
+	var ids []string
+	for _, pane := range workspace.Panes {
+		if pane.BackendCreated && !pane.BackendDead && !pane.Retiring() && pane.CredentialEnvironmentVersion == legacyCredentialEnvironmentVersion {
+			ids = append(ids, pane.ID)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func validateAttachmentReady(workspace *Workspace, attachment *Attachment) error {
 	if err := validateViewsReady(attachment, desiredPaneIDs(workspace)); err != nil {
 		return err

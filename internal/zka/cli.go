@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const Version = "0.8.0"
+const Version = "0.8.1"
 
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
@@ -503,6 +503,9 @@ func writeWorkspaceCredentialStatus(w io.Writer, status workspaceCredentialStatu
 	}
 	if len(status.RecreatePaneIDs) != 0 {
 		fmt.Fprintf(w, " recreate_panes=%s", strings.Join(status.RecreatePaneIDs, ","))
+	}
+	if status.RecreationDetail != "" {
+		fmt.Fprintf(w, " recreation_detail=%q", status.RecreationDetail)
 	}
 	fmt.Fprintln(w)
 }
@@ -1710,10 +1713,19 @@ func writeJSON(w io.Writer, value any) error {
 	return enc.Encode(value)
 }
 
-func paneCommandEnvironment(cfg Config, paths Paths, workspaceID, paneID string, creating bool) []string {
+func localPaneCommandEnvironment(workspaceID, paneID string) []string {
 	environment := append([]string(nil), os.Environ()...)
 	environment = replaceEnvironmentValue(environment, "ZKA_WORKSPACE_ID", workspaceID)
 	environment = replaceEnvironmentValue(environment, "ZKA_PANE_ID", paneID)
+	// This variable describes zka's projection, not an ambient credential
+	// setting. A locally created backend inherits the real local credential
+	// environment and must report version zero even if its launcher happened to
+	// inherit a marker from another managed pane.
+	return removeEnvironmentValue(environment, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION")
+}
+
+func remotePaneCommandEnvironment(cfg Config, paths Paths, workspaceID, paneID string, creating bool) []string {
+	environment := localPaneCommandEnvironment(workspaceID, paneID)
 	if creating && cfg.credentialsEnabled() {
 		sshEnabled, openPGPEnabled := false, false
 		for _, bundle := range cfg.Credentials.Bundles {
@@ -1733,7 +1745,38 @@ func paneCommandEnvironment(cfg Config, paths Paths, workspaceID, paneID string,
 	return environment
 }
 
+func localPaneBackendCommand(cfg Config, prepared preparePaneResponse) *exec.Cmd {
+	return paneBackendCommand(cfg, prepared,
+		localPaneCommandEnvironment(prepared.Workspace.ID, prepared.Pane.ID))
+}
+
+func remotePaneBackendCommand(cfg Config, paths Paths, prepared preparePaneResponse) *exec.Cmd {
+	return paneBackendCommand(cfg, prepared,
+		remotePaneCommandEnvironment(cfg, paths, prepared.Workspace.ID, prepared.Pane.ID, prepared.Create))
+}
+
+func paneBackendCommand(cfg Config, prepared preparePaneResponse, environment []string) *exec.Cmd {
+	args := []string{"attach", prepared.Pane.Backend.Ref}
+	if prepared.Create {
+		args = append(args, "zka", "pane-host", "--workspace", prepared.Workspace.ID, "--pane", prepared.Pane.ID, "--")
+		args = append(args, prepared.Workspace.Shell...)
+	}
+	cmd := exec.Command(cfg.ZMX.Command, args...)
+	cmd.Env = environment
+	// exec fails the whole launch when Dir does not exist, so a directory that
+	// has since been removed must become "no directory" rather than a dead pane.
+	if prepared.Create && usableDirectory(prepared.Pane.CWD) {
+		cmd.Dir = prepared.Pane.CWD
+	}
+	return cmd
+}
+
 func replaceEnvironmentValue(environment []string, name, value string) []string {
+	environment = removeEnvironmentValue(environment, name)
+	return append(environment, name+"="+value)
+}
+
+func removeEnvironmentValue(environment []string, name string) []string {
 	prefix := name + "="
 	result := environment[:0]
 	for _, entry := range environment {
@@ -1741,7 +1784,7 @@ func replaceEnvironmentValue(environment []string, name, value string) []string 
 			result = append(result, entry)
 		}
 	}
-	return append(result, prefix+value)
+	return result
 }
 
 func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
@@ -1803,19 +1846,8 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 				fmt.Errorf("zmx session %q no longer exists", prepared.Pane.Backend.Ref), stdin, stdout)
 		}
 	}
-	commandArgs := []string{"attach", prepared.Pane.Backend.Ref}
-	if prepared.Create {
-		commandArgs = append(commandArgs, "zka", "pane-host", "--workspace", prepared.Workspace.ID, "--pane", prepared.Pane.ID, "--")
-		commandArgs = append(commandArgs, prepared.Workspace.Shell...)
-	}
-	cmd := exec.Command(cfg.ZMX.Command, commandArgs...)
+	cmd := localPaneBackendCommand(cfg, prepared)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
-	// exec fails the whole launch when Dir does not exist, so a directory that
-	// has since been removed must become "no directory" rather than a dead pane.
-	if prepared.Create && usableDirectory(prepared.Pane.CWD) {
-		cmd.Dir = prepared.Pane.CWD
-	}
-	cmd.Env = paneCommandEnvironment(cfg, paths, prepared.Workspace.ID, prepared.Pane.ID, prepared.Create)
 	if err := cmd.Start(); err != nil {
 		return runLocalDeadPane(api, kitty, endpoint, windowID, prepared.Workspace, prepared.Pane, err, stdin, stdout)
 	}
@@ -2112,17 +2144,8 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 				fmt.Errorf("remote zmx session %q is missing", pane.Backend.Ref), stdin, stdout)
 		}
 	}
-	zmxArgs := []string{"attach", pane.Backend.Ref}
-	if prepared.Create {
-		zmxArgs = append(zmxArgs, "zka", "pane-host", "--workspace", workspace.ID, "--pane", pane.ID, "--")
-		zmxArgs = append(zmxArgs, workspace.Shell...)
-	}
-	cmd := exec.Command(cfg.ZMX.Command, zmxArgs...)
+	cmd := remotePaneBackendCommand(cfg, paths, prepared)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
-	cmd.Env = paneCommandEnvironment(cfg, paths, workspace.ID, pane.ID, prepared.Create)
-	if prepared.Create && usableDirectory(pane.CWD) {
-		cmd.Dir = pane.CWD
-	}
 	if err := cmd.Start(); err != nil {
 		return runRemoteDeadPane(api, workspace, pane, *attachmentID, err, stdin, stdout)
 	}

@@ -24,7 +24,7 @@ and provider socket paths on the provider.
 </p>
 
 > [!NOTE]
-> zka 0.8.0 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
+> zka 0.8.1 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
 > builds on Kitty, zmx, OpenSSH, systemd user services, and coding-agent hooks
 > instead of replacing them.
 
@@ -160,7 +160,7 @@ create or display workspaces:
 
 Apply the configuration:
 
-```sh
+```fish
 sudo nixos-rebuild switch --flake .#my-host
 ```
 
@@ -171,7 +171,7 @@ machines where you use them.
 
 ### 2. Open the launcher
 
-```sh
+```fish
 zka launch
 ```
 
@@ -180,7 +180,7 @@ Every new tab or split automatically becomes a persistent zmx-backed pane.
 
 Prefer the CLI? Start a workspace in the current directory:
 
-```sh
+```fish
 zka kitty --name example-project --cwd "$PWD"
 ```
 
@@ -188,7 +188,7 @@ zka kitty --name example-project --cwd "$PWD"
 
 Detach closes the Kitty view and deliberately leaves every pane running:
 
-```sh
+```fish
 zka workspace detach example-project
 zka workspace attach example-project
 ```
@@ -278,7 +278,7 @@ capture and origin-pushed reconciliation, with a 30-second liveness fallback.
 
 ## Workspace commands
 
-```sh
+```fish
 zka workspace list
 zka workspace inspect example-project
 zka workspace reconcile example-project
@@ -332,7 +332,7 @@ launch --location hsplit
 focus
 ```
 
-```sh
+```fish
 zka kitty --name quad --template ./quad.kitty-session
 ```
 
@@ -352,7 +352,7 @@ enter the SSH alias, and select an origin workspace — or pick **New workspace
 on \<host\>** to create one on the origin and attach it here in one step. From
 the destination, the CLI equivalents are:
 
-```sh
+```fish
 zka workspace list --origin devbox.example
 zka workspace inspect devbox.example:example-project
 zka workspace create devbox.example:api --attach
@@ -400,7 +400,7 @@ explicitly while preserving the rest of the workspace.
 
 Credential bundles let an attachment machine act as a **provider** for a
 persistent workspace on another **origin**. A bundle names semantic
-capabilities; v0.8.0 implements two:
+capabilities; the 0.8 series implements two:
 
 - **SSH agent:** a byte proxy to the provider's selected agent. The claim is
   workspace-scoped, but the protocol is intentionally not key-filtered: every
@@ -431,6 +431,14 @@ services.zka.credentials.bundles.work.openpgp.signingKeys = [
   "1111222233334444555566667777888899990000"
 ];
 ```
+
+> [!IMPORTANT]
+> The v0.8.0 instructions required this shared configuration but v0.8.0 also
+> projected managed credential paths into every newly created local pane on the
+> provider. Anyone who followed those instructions can have affected panes:
+> local Git push and SSH fail because `SSH_AUTH_SOCK` names an absent relay,
+> while GPG sees an empty managed keyring with agent autostart disabled. Upgrade
+> to v0.8.1 on the whole fleet and follow the migration steps below.
 
 Pin the two zka nodes before claiming credentials. `zka doctor` prints the
 local `node=` value. On `laptop`, bind the outbound SSH alias to `devbox`'s
@@ -473,7 +481,7 @@ other smart-card consumer in that session.
 
 Attach, then claim the bundle explicitly:
 
-```sh
+```fish
 zka workspace attach devbox:example-project
 zka workspace credentials claim --bundle work devbox:example-project
 zka workspace credentials status --json devbox:example-project
@@ -481,7 +489,7 @@ zka workspace credentials status --json devbox:example-project
 
 Or combine creation/attachment with the claim:
 
-```sh
+```fish
 zka workspace attach devbox:example-project --claim-credentials --credential-bundle work
 zka workspace create devbox:new-project --attach --claim-credentials --credential-bundle work
 ```
@@ -490,24 +498,86 @@ zka workspace create devbox:new-project --attach --claim-credentials --credentia
 workspace-wide and ends on explicit release, workspace deletion, or detaching
 its owner attachment:
 
-```sh
+```fish
 zka workspace credentials release devbox:example-project
 ```
 
 A transient control disconnect retains the durable claim but removes the
 origin endpoints and reports the capabilities as degraded. Reconnection
 re-resolves provider sockets and idempotently republishes authorized endpoints.
-Existing SSH panes keep their stable `SSH_AUTH_SOCK`; an existing pane without
-the managed `GNUPGHOME` must be recreated before OpenPGP is available, and
-credential status lists only those pane IDs. If the provider daemon restarts
-without an explicit `ssh.identityAgent`, SSH becomes degraded until the bundle
-is re-claimed rather than silently switching agents.
+
+The credential environment is fixed when the zmx backend is created, not when a
+view attaches or a claim changes. A pane created locally inherits the origin's
+ordinary `SSH_AUTH_SOCK` and `GNUPGHOME`; it needs no local claim, and same-node
+claims remain unsupported. A pane created through `remote-attach` instead gets
+the stable workspace paths and fails closed until a remote provider claims the
+workspace. Attaching later never pretends to rewrite either environment.
+
+That immutability works in both directions. A locally created pane must be
+recreated through the remote attachment before it can consume a later claim. A
+remotely created pane retains managed paths when viewed at the origin and may
+need local recreation after release to regain ordinary origin credentials.
+Credential status reports the affected pane IDs for SSH, OpenPGP, or combined
+bundles. If the provider daemon restarts without an explicit
+`ssh.identityAgent`, SSH becomes degraded until the bundle is re-claimed rather
+than silently switching agents.
+
+Remote projection intentionally uses the union of capabilities in every
+configured bundle, not only the currently claimed bundle. This pre-creates
+stable paths so a later claim can activate them without replacing the backend.
+For example, an SSH-only claim can still have an empty, fail-closed `GNUPGHOME`
+when another configured bundle enables OpenPGP.
 
 Inside a pane with the managed `GNUPGHOME`, `gpg --list-keys` intentionally
 shows only the bundle's imported public keys and `gpg --list-secret-keys` shows
 no local secret keys. The normal keyring is unchanged; unset `GNUPGHOME` (or use
 an explicit `--homedir`) when you want to inspect it. This is isolation, not
 keyring data loss.
+
+### Migrating from v0.8.0
+
+After upgrading and restarting zka across the fleet, inventory legacy pane
+environments:
+
+```fish
+zka doctor
+zka workspace credentials status --json
+```
+
+Environment version 2 cannot distinguish a broken locally created pane from a
+healthy remotely created pane. Both are reported, but do not blindly recreate
+long-lived sessions. Run each probe enabled by the bundle inside the listed
+pane:
+
+```fish
+ssh-add -l
+gpg --list-secret-keys
+```
+
+Recreate panes where the local credential probe fails. A pane created remotely
+and still reaching its claimed provider is already healthy. On an unclaimed
+workspace, `pane_recreation_detail` describes the v0.8.0 repair; on a claimed
+workspace it instead explains which panes cannot be proven to consume the
+claim. Recreation terminates that pane's live backend process, so it is never
+automatic.
+
+For a pane that cannot be recreated immediately, repair the current fish shell
+and programs started from it with the real local provider environment:
+
+```fish
+set -e GNUPGHOME
+set -gx SSH_AUTH_SOCK /run/user/(id -u)/gnupg/S.gpg-agent.ssh
+```
+
+Replace the second path with `services.zka.ssh.identityAgent`. If it is not
+configured, read `SSH_AUTH_SOCK` in a normal non-zka terminal and use that
+value. Leave `ZKA_CREDENTIAL_ENVIRONMENT_VERSION` intact so doctor and status
+continue to identify the backend until it is recreated.
+
+Inside a version-2 pane, doctor reports only the origin-side workspace relay and
+managed GnuPG home. Provider agent and extra-socket paths remain memory-only and
+are never printed by this migration check. This new failed check makes `zka
+doctor` return exit status 1, including when invoked by a script.
 
 For each OpenPGP private-key operation, the provider must have an interactive
 session, must not report a positive screen lock, and must successfully deliver a
@@ -532,7 +602,7 @@ configuration, add the peer pins, then run `zka doctor --origin devbox` from the
 provider. Recreate only the panes named by credential status and verify the
 original hardware path:
 
-```sh
+```fish
 git commit -S -m "update for release"
 git verify-commit HEAD
 ```
@@ -549,7 +619,7 @@ or substitute for OpenSSH host/user authentication.
 | --- | --- | --- |
 | Network | zka opens no TCP listener. Remote control, topology, and credential streams travel inside authenticated, encrypted OpenSSH sessions; incompatible protocols fail closed. | SSH configuration, host keys, authorized client keys, and the remote Unix account remain part of the trusted computing base. |
 | Local user | Runtime/state directories are mode `0700`, files and Unix sockets are `0600`, and the systemd unit uses `UMask=0077` and `NoNewPrivileges=true`. | Any process already running as that Unix user can read user-owned state and can connect to a credential socket whose path it can reach. Per-workspace sockets are routing boundaries, not same-UID isolation. |
-| Workspace | Credential access requires an explicit durable claim owned by a ready attachment. Disconnect removes listeners; reconnect republishes only the current bundle/generation. | A claimed origin is trusted to request the granted operations. A compromised origin process is not confined to the visible pane that motivated the claim. |
+| Workspace | Remote provider credential access requires an explicit durable claim owned by a ready attachment. Disconnect removes listeners; reconnect republishes only the current bundle/generation. Locally created panes inherit origin credentials without a claim. | A claimed origin is trusted to request the granted operations. A compromised origin process is not confined to the visible pane that motivated the claim. |
 | Provider identity | The outbound alias is pinned to an expected target node ID, and the origin accepts credential listeners only from configured provider node IDs. Optional source CIDRs can narrow fixed-host deployments. | The provider node ID is asserted inside an authenticated SSH session but is not yet bound to the particular client public key. Another key authorized for the same account could assert a configured ID. Public-key binding through sshd authentication metadata remains future work. |
 
 ### Credential authority
@@ -634,7 +704,7 @@ history. Resolved items disappear automatically; finished work disappears while
 that exact pane is focused. The queue shows blocked work first, then errors,
 then completed work, oldest first within each state.
 
-```sh
+```fish
 zka attention show             # graphical queue of actionable panes
 zka attention status           # one human-readable snapshot
 zka attention status --json    # versioned machine-readable snapshot (v2)
@@ -879,14 +949,14 @@ services.zka.ssh.extraOptions = [
 
 Inspect the user manager's current environment with:
 
-```sh
+```fish
 systemctl --user show-environment | rg '^SSH_AUTH_SOCK='
 ```
 
 For a temporary, session-dependent workaround, import the interactive shell's
 agent and restart the daemon:
 
-```sh
+```fish
 systemctl --user import-environment SSH_AUTH_SOCK DISPLAY WAYLAND_DISPLAY
 systemctl --user restart zkad
 ```
@@ -953,7 +1023,7 @@ changing the provider.
 Test the terminal path independently; the displaying machine's clipboard should
 become `zka-osc52-test`:
 
-```sh
+```fish
 printf '\033]52;c;emthLW9zYzUyLXRlc3Q=\a'
 ```
 
@@ -965,7 +1035,7 @@ remote programs unconditional clipboard-read access.
 
 ## Diagnostics
 
-```sh
+```fish
 zka doctor
 zka doctor --origin devbox.example
 journalctl --user-unit zkad
@@ -978,10 +1048,12 @@ and keygrips are shortened here):
 ```text
 ok    credentials-config work=ssh-agent+openpgp; default=work
 ok    daemon           /run/user/1000/zka/zkad.sock; node=0123456789abcdef0123456789abcdef
+ok    current-pane-credentials not running inside a zka pane
 ok    credentials-provider configured provider sockets are reachable
 ok    openpgp-keys     work=11112222…99990000/A1B2C3D4:card
 ok    credentials-claim example-project=work@fedcba98[openpgp:ready,ssh-agent:ready]
 ok    credentials-transport ready
+ok    credential-environment no panes require credential-environment recreation
 ```
 
 `FAIL` makes `zka doctor` exit nonzero. `WARN` is deliberately conspicuous but
@@ -992,6 +1064,15 @@ does not fail the command; for example, a configured key ending in
 WARN  openpgp-keys     work=11112222…99990000/A1B2C3D4:software
 FAIL  credentials-provider openpgp: dial unix /run/user/1000/gnupg/S.gpg-agent.extra: connect: no such file or directory
 FAIL  credentials-transport degraded: provider control session is unavailable
+```
+
+Inside a legacy v0.8.0 pane, the targeted diagnosis precedes contaminated
+provider checks and prints only origin-owned paths:
+
+```text
+FAIL  current-pane-credentials pane 01234567 uses legacy credential environment v2 and must be triaged for recreation; origin SSH_AUTH_SOCK=/run/user/1000/zka/agents/abcdef….sock; origin GNUPGHOME=…/credentials/abcdef…/gnupg
+ok    credentials-provider skipped: the current pane has an outdated managed credential environment; recreate it before testing provider credentials
+FAIL  credential-environment example-project=01234567 (v0.8.0 credential environment detected; run the bundle's credential probe inside each pane (for SSH, ssh-add -l; for OpenPGP, gpg --list-secret-keys) and recreate only panes where local credentials fail; remotely created panes may already be healthy)
 ```
 
 `zka workspace inspect WORKSPACE` includes attachment health, pane/backend state,
@@ -1029,7 +1110,7 @@ built-in attention integration currently targets Codex and Claude Code
 lifecycle hooks.
 
 Credential bundles are semantic adapters, not arbitrary socket forwarding.
-Version 0.8.0 implements the SSH-agent and filtered OpenPGP adapters only; PIVB,
+The 0.8 series implements the SSH-agent and filtered OpenPGP adapters only; PIVB,
 OSTUI, and other capability types remain future designs.
 
 Keep short-lived utility terminals on plain Kitty unless their processes should
@@ -1039,11 +1120,13 @@ routing the new pane through zka.
 
 ## Project status
 
-Version 0.8.0 combines three systems: durable Kitty-native workspaces, Codex and
+Version 0.8.1 combines three systems: durable Kitty-native workspaces, Codex and
 Claude Code attention routing, and reconnect-safe remote credential bundles for
 SSH agents and filtered OpenPGP. It also includes remote mirrors and two-phase
 moves, headless origins, Waybar streaming, desktop/ntfy notifications, and
-durable cleanup after partial failures.
+durable cleanup after partial failures. Version 0.8.1 also restores inherited
+SSH and GnuPG credentials in locally created panes and inventories ambiguous
+v0.8.0 pane environments before recreation.
 
 State schemas v1 and v2 are reset on the first v0.3-or-newer start because v3
 changed process ownership. The reset removes old zka state and generated Kitty
@@ -1056,7 +1139,7 @@ with zmx.
 The flake supports `x86_64-linux` and `aarch64-linux`. Build the binaries and run
 the NixOS module checks with:
 
-```sh
+```fish
 nix flake check
 ```
 

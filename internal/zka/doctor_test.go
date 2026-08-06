@@ -3,11 +3,90 @@ package zka
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestCurrentPaneCredentialEnvironmentDoctorCheck(t *testing.T) {
+	paths := testPaths(t.TempDir())
+	t.Setenv("ZKA_PANE_ID", "")
+	t.Setenv("ZKA_WORKSPACE_ID", "")
+	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "")
+	if check, unsafe := currentPaneCredentialEnvironmentDoctorCheck(paths); !check.OK || unsafe || !strings.Contains(check.Detail, "not running") {
+		t.Fatalf("outside pane check = %#v unsafe=%v", check, unsafe)
+	}
+
+	t.Setenv("ZKA_PANE_ID", "pane")
+	t.Setenv("ZKA_WORKSPACE_ID", "workspace")
+	if check, unsafe := currentPaneCredentialEnvironmentDoctorCheck(paths); !check.OK || unsafe || !strings.Contains(check.Detail, "inherits the local") {
+		t.Fatalf("local pane check = %#v unsafe=%v", check, unsafe)
+	}
+
+	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "2")
+	check, unsafe := currentPaneCredentialEnvironmentDoctorCheck(paths)
+	if check.OK || !unsafe || !strings.Contains(check.Detail, agentRelaySocketPath(paths.AgentDir, "workspace")) {
+		t.Fatalf("legacy pane check = %#v unsafe=%v", check, unsafe)
+	}
+	if !strings.Contains(check.Detail, filepath.Join(paths.StateDir, "credentials", "workspace", "gnupg")) || strings.Contains(check.Detail, "agent-extra-socket") {
+		t.Fatalf("legacy pane exposed the wrong paths: %q", check.Detail)
+	}
+
+	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "3")
+	if check, unsafe = currentPaneCredentialEnvironmentDoctorCheck(paths); !check.OK || unsafe || !strings.Contains(check.Detail, "managed remote") {
+		t.Fatalf("remote pane check = %#v unsafe=%v", check, unsafe)
+	}
+}
+
+func TestDoctorLegacyPaneSkipsContaminatedProviderChecks(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveTestDaemon(t, d)
+	cfg := defaultConfig()
+	cfg.SSH.IdentityAgent = "/provider/socket/must-not-be-probed"
+	var bundle CredentialBundleConfig
+	bundle.SSHAgent.Enable = true
+	cfg.Credentials.Bundles["work"] = bundle
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", configPath)
+	t.Setenv("ZKA_PANE_ID", "pane")
+	t.Setenv("ZKA_WORKSPACE_ID", "workspace")
+	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "2")
+
+	var stdout, stderr bytes.Buffer
+	code, err := runDoctor(nil, d.paths, &stdout, &stderr)
+	if err != nil || code != 1 {
+		t.Fatalf("doctor code=%d err=%v stderr=%s", code, err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "credentials-provider skipped: the current pane") || strings.Contains(stdout.String(), "/provider/socket/must-not-be-probed") {
+		t.Fatalf("legacy doctor output = %s", stdout.String())
+	}
+}
+
+func TestCredentialEnvironmentInventoryDoctorCheck(t *testing.T) {
+	status := credentialStatusResponse{Workspaces: []workspaceCredentialStatus{
+		{WorkspaceName: "local", State: "unclaimed", RecreatePaneIDs: []string{"pane-b", "pane-a"}, RecreationDetail: "legacy migration"},
+	}}
+	check := credentialEnvironmentInventoryDoctorCheck(status, nil)
+	if check.OK || !strings.Contains(check.Detail, "local=pane-b,pane-a") || !strings.Contains(check.Detail, "legacy migration") {
+		t.Fatalf("inventory check = %#v", check)
+	}
+	if healthy := credentialEnvironmentInventoryDoctorCheck(credentialStatusResponse{}, nil); !healthy.OK {
+		t.Fatalf("healthy inventory check = %#v", healthy)
+	}
+}
 
 func TestDoctorOriginReportsCredentialChecks(t *testing.T) {
 	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
