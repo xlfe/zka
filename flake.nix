@@ -30,9 +30,19 @@
               pkgs.python3
               pkgs.gnupg
               pkgs.git
+              pkgs.pkg-config
               pkgs.shellcheck
+              pkgs.libglvnd
+              pkgs.libxkbcommon
+              pkgs.vulkan-headers
+              pkgs.wayland
             ];
             ZKA_KITTY_LIB = "${pkgs.kitty}/lib/kitty";
+            shellHook = ''
+              # Linux AF_UNIX paths are limited to 108 bytes. Nix's default
+              # /tmp/nix-shell.* TMPDIR makes Go's test-name directories too long.
+              export TMPDIR=/tmp
+            '';
           };
         }
       );

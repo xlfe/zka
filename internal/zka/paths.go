@@ -7,14 +7,15 @@ import (
 )
 
 type Paths struct {
-	StateDir      string
-	RuntimeDir    string
-	StateFile     string
-	GeneratedDir  string
-	AttachmentDir string
-	AgentDir      string
-	Socket        string
-	WatcherSocket string
+	StateDir        string
+	RuntimeDir      string
+	StateFile       string
+	GeneratedDir    string
+	AttachmentDir   string
+	AgentDir        string
+	Socket          string
+	WatcherSocket   string
+	CardLeaseSocket string
 }
 
 func DefaultPaths() (Paths, error) {
@@ -48,13 +49,14 @@ func DefaultPaths() (Paths, error) {
 		}
 	}
 	return Paths{
-		StateDir:      stateDir,
-		RuntimeDir:    runtimeDir,
-		StateFile:     filepath.Join(stateDir, "state.json"),
-		GeneratedDir:  filepath.Join(stateDir, "generated"),
-		AttachmentDir: filepath.Join(runtimeDir, "kitty"),
-		AgentDir:      filepath.Join(runtimeDir, "agents"),
-		Socket:        socket,
-		WatcherSocket: filepath.Join(runtimeDir, "watcher.sock"),
+		StateDir:        stateDir,
+		RuntimeDir:      runtimeDir,
+		StateFile:       filepath.Join(stateDir, "state.json"),
+		GeneratedDir:    filepath.Join(stateDir, "generated"),
+		AttachmentDir:   filepath.Join(runtimeDir, "kitty"),
+		AgentDir:        filepath.Join(runtimeDir, "agents"),
+		Socket:          socket,
+		WatcherSocket:   filepath.Join(runtimeDir, "watcher.sock"),
+		CardLeaseSocket: filepath.Join(runtimeDir, "card-lease.sock"),
 	}, nil
 }

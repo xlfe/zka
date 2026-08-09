@@ -1,0 +1,51 @@
+{
+  "mint_request": {
+    "version": 2,
+    "alias": "ro",
+    "external_account_audience": "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/pivb/providers/yubikey",
+    "impersonated_email": "readonly@example.iam.gserviceaccount.com",
+    "request_source": {
+      "kind": "agent-session",
+      "label": "codex:agentic/ro",
+      "session_id": "11111111111111111111111111111111"
+    },
+    "expected_card": {
+      "serial": 12345678,
+      "jwk_kid": "test-key-id",
+      "spki_der": "AQIDBA=="
+    },
+    "forward_context": {
+      "origin_node_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "workspace_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bundle": "work",
+      "claim_generation": 7,
+      "provider_node_id": "cccccccccccccccccccccccccccccccc",
+      "provider_attachment_id": "dddddddddddddddddddddddddddddddd",
+      "operation_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  },
+  "mint_response": {
+    "version": 2,
+    "id_token": "header.payload.signature",
+    "expiration_time": 1785585870,
+    "card": {
+      "serial": 12345678,
+      "jwk_kid": "test-key-id",
+      "spki_der": "AQIDBA=="
+    },
+    "expected_card": {
+      "serial": 12345678,
+      "jwk_kid": "test-key-id",
+      "spki_der": "AQIDBA=="
+    },
+    "forward_context": {
+      "origin_node_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "workspace_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bundle": "work",
+      "claim_generation": 7,
+      "provider_node_id": "cccccccccccccccccccccccccccccccc",
+      "provider_attachment_id": "dddddddddddddddddddddddddddddddd",
+      "operation_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  }
+}

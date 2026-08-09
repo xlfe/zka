@@ -341,13 +341,15 @@ func printWorkspaceUsage(w io.Writer) {
   focus REF [--pane PANE]
   seen REF [--pane PANE]
   credentials claim [--bundle NAME] [SSH_ALIAS:]REF
+  credentials activate-local [--bundle NAME] [--if-unclaimed] REF
+  credentials endpoint [--json] REF
   credentials release [SSH_ALIAS:]REF
   credentials status [--json] [[SSH_ALIAS:]REF]`)
 }
 
 func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
-		return 2, fmt.Errorf("workspace credentials requires claim, release, or status")
+		return 2, fmt.Errorf("workspace credentials requires claim, activate-local, endpoint, release, or status")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -406,6 +408,68 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		var refreshed Workspace
 		_ = api.RemoteCall(ctx, host, "get", refRequest{Ref: workspace.ID}, &refreshed)
 		writeWorkspaceCredentialStatus(stdout, status)
+		return 0, nil
+	case "activate-local":
+		fs := newFlagSet("workspace credentials activate-local", stderr)
+		bundleName := fs.String("bundle", "", "credential bundle whose PIVB capability to activate")
+		ifUnclaimed := fs.Bool("if-unclaimed", false, "leave an existing local or attachment PIVB route unchanged")
+		if err := parseInterspersed(fs, args[1:]); err != nil {
+			return 2, err
+		}
+		if fs.NArg() != 1 {
+			return 2, fmt.Errorf("workspace credentials activate-local requires one workspace reference")
+		}
+		cfg, err := LoadConfig()
+		if err != nil {
+			return 1, err
+		}
+		if *bundleName == "" {
+			*bundleName = cfg.Credentials.DefaultBundle
+		}
+		if *bundleName == "" {
+			return 2, fmt.Errorf("--bundle is required because credentials.default_bundle is not set")
+		}
+		workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
+		if err != nil {
+			return 1, err
+		}
+		if workspace.RemoteHost != "" {
+			return 1, fmt.Errorf("activate-local must run on workspace origin %s", workspace.Origin.Name)
+		}
+		status, err := api.ActivateLocalPIVB(ctx, workspace.ID, *bundleName, *ifUnclaimed)
+		if err != nil {
+			return 1, err
+		}
+		writeWorkspaceCredentialStatus(stdout, status)
+		return 0, nil
+	case "endpoint":
+		fs := newFlagSet("workspace credentials endpoint", stderr)
+		jsonOut := fs.Bool("json", false, "emit JSON")
+		if err := parseInterspersed(fs, args[1:]); err != nil {
+			return 2, err
+		}
+		if fs.NArg() != 1 {
+			return 2, fmt.Errorf("workspace credentials endpoint requires one workspace reference")
+		}
+		workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
+		if err != nil {
+			return 1, err
+		}
+		endpoint, err := api.PIVBEndpoint(ctx, workspace.ID)
+		if err != nil {
+			return 1, err
+		}
+		if *jsonOut {
+			return 0, writeJSON(stdout, endpoint)
+		}
+		if endpoint.State != "ready" {
+			detail := endpoint.Detail
+			if detail == "" {
+				detail = "activate or claim a PIVB-enabled credential bundle first"
+			}
+			return 1, fmt.Errorf("workspace PIVB route is %s: %s", endpoint.State, detail)
+		}
+		fmt.Fprintln(stdout, endpoint.Socket)
 		return 0, nil
 	case "release", "status":
 		fs := newFlagSet("workspace credentials "+args[0], stderr)

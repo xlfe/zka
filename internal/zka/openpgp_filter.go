@@ -420,6 +420,18 @@ func (f *openPGPFilter) privateKeyOperation(ctx context.Context, command, operat
 	}
 	timeout, _ := time.ParseDuration(f.daemon.config.Credentials.GnuPG.OperationTimeout)
 	deadline := time.Now().Add(timeout)
+	releaseCard := func() {}
+	if f.daemon.cardLease != nil {
+		leaseCtx, leaseCancel := context.WithDeadline(ctx, deadline)
+		defer leaseCancel()
+		var leaseErr error
+		releaseCard, leaseErr = f.daemon.cardLease.acquire(leaseCtx)
+		if leaseErr != nil {
+			f.daemon.notifyCredentialFailure(ctx, f.host, f.hello, f.allowed[f.selectedGrip], operation, "smart-card lease timed out")
+			return writeAssuanLine(f.downstream, assuanTimeout)
+		}
+	}
+	defer releaseCard()
 	finish := f.daemon.beginCredentialOperation(f.hello.Workspace, credentialCapabilityOpenPGP, operation)
 	defer finish()
 	if err := f.daemon.notifyCredentialOperation(ctx, f.host, f.hello, f.allowed[f.selectedGrip], operation); err != nil {

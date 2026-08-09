@@ -157,6 +157,18 @@ func (a API) ReleaseWorkspaceCredentials(ctx context.Context, workspace string) 
 	return out, err
 }
 
+func (a API) ActivateLocalPIVB(ctx context.Context, workspace, bundle string, ifUnclaimed bool) (workspaceCredentialStatus, error) {
+	var out workspaceCredentialStatus
+	err := a.client.Call(ctx, "credentials_activate_local", workspaceCredentialRequest{Workspace: workspace, Bundle: bundle, IfUnclaimed: ifUnclaimed}, &out)
+	return out, err
+}
+
+func (a API) PIVBEndpoint(ctx context.Context, workspace string) (pivbEndpointResponse, error) {
+	var out pivbEndpointResponse
+	err := a.client.Call(ctx, "credentials_endpoint", workspaceCredentialRequest{Workspace: workspace}, &out)
+	return out, err
+}
+
 func (a API) CredentialStatus(ctx context.Context, workspace string) (credentialStatusResponse, error) {
 	var out credentialStatusResponse
 	var payload any

@@ -201,12 +201,15 @@ func credentialsConfigDoctorCheck(cfg Config) doctorCheck {
 	}
 	names := make([]string, 0, len(cfg.Credentials.Bundles))
 	for name, bundle := range cfg.Credentials.Bundles {
-		capabilities := make([]string, 0, 2)
+		capabilities := make([]string, 0, 3)
 		if bundle.SSHAgent.Enable {
 			capabilities = append(capabilities, credentialCapabilitySSH)
 		}
 		if bundle.OpenPGP.Enable {
 			capabilities = append(capabilities, credentialCapabilityOpenPGP)
+		}
+		if bundle.PIVB.Enable {
+			capabilities = append(capabilities, credentialCapabilityPIVB)
 		}
 		names = append(names, name+"="+strings.Join(capabilities, "+"))
 	}
@@ -225,8 +228,10 @@ func credentialsProviderDoctorCheck(ctx context.Context, cfg Config, runner Comm
 	}
 	var problems []string
 	sshRequired := false
+	pivbRequired := false
 	for _, bundle := range cfg.Credentials.Bundles {
 		sshRequired = sshRequired || bundle.SSHAgent.Enable
+		pivbRequired = pivbRequired || bundle.PIVB.Enable
 	}
 	if sshRequired {
 		info := newSSHAgentInfo(cfg, os.Getenv("SSH_AUTH_SOCK"))
@@ -245,6 +250,19 @@ func credentialsProviderDoctorCheck(ctx context.Context, cfg Config, runner Comm
 			conn, dialErr := net.DialTimeout("unix", strings.TrimSpace(socket), 500*time.Millisecond)
 			if dialErr != nil {
 				problems = append(problems, "openpgp: "+dialErr.Error())
+			} else {
+				_ = conn.Close()
+			}
+		}
+	}
+	if pivbRequired {
+		socket := credentialPIVBForwardSocket(cfg)
+		if socket == "" {
+			problems = append(problems, "pivb: forwarding socket is not configured")
+		} else {
+			conn, err := net.DialTimeout("unix", socket, 500*time.Millisecond)
+			if err != nil {
+				problems = append(problems, "pivb: "+err.Error())
 			} else {
 				_ = conn.Close()
 			}

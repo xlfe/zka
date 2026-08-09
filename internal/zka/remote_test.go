@@ -91,9 +91,12 @@ func TestRemoteControlRejectsVersionMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = json.NewEncoder(serverInput).Encode(remoteEnvelope{Protocol: remoteProtocolName, Version: 1, Type: "request", ID: "bad", Op: "list"})
-	response, err := readRemoteEnvelope(reader)
-	if err != nil {
-		t.Fatal(err)
+	var response remoteEnvelope
+	for response.ID != "bad" || response.Type != "response" {
+		response, err = readRemoteEnvelope(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if response.ID != "bad" || !strings.Contains(response.Error, "incompatible") {
 		t.Fatalf("response = %#v", response)

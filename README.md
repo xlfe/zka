@@ -229,7 +229,8 @@ attachments
 
 optional credential claim owned by laptop.example
 ├── origin SSH_AUTH_SOCK → yamux stream → provider's selected SSH agent
-└── origin GNUPGHOME   → yamux stream → provider's filtered gpg-agent
+├── origin GNUPGHOME   → yamux stream → provider's filtered gpg-agent
+└── workspace PIVB socket → semantic mint stream → provider's networkless pivbd
 ```
 
 | Term | Meaning |
@@ -400,7 +401,7 @@ explicitly while preserving the rest of the workspace.
 
 Credential bundles let an attachment machine act as a **provider** for a
 persistent workspace on another **origin**. A bundle names semantic
-capabilities; the 0.8 series implements two:
+capabilities; the current protocol implements three:
 
 - **SSH agent:** a byte proxy to the provider's selected agent. The claim is
   workspace-scoped, but the protocol is intentionally not key-filtered: every
@@ -408,6 +409,10 @@ capabilities; the 0.8 series implements two:
 - **OpenPGP:** signing and decryption through the provider's restricted
   `gpg-agent` extra socket. Configured fingerprints are resolved to keygrips on
   the provider and enforced by an Assuan-aware default-deny filter.
+- **PIVB:** a constrained subject-token mint request to a provider-side,
+  networkless `pivbd`. ZKA never forwards PC/SC, APDUs, PINs, control sockets,
+  or arbitrary RSA digests. The bundle allowlists aliases and each claim pins
+  the live card's serial, JWK key ID, and public key.
 
 This is a breaking replacement for the old workspace-agent relay. Remove
 `services.zka.ssh.forwardAgent` and any `ForwardAgent=yes` or `-A` option across
@@ -423,6 +428,10 @@ services.zka.credentials = {
   bundles.work = {
     sshAgent.enable = true;
     openpgp.enable = true;
+    pivb = {
+      enable = true;
+      aliases = [ "ro" "deploy" ];
+    };
   };
 };
 
@@ -505,6 +514,39 @@ zka workspace credentials release devbox:example-project
 A transient control disconnect retains the durable claim but removes the
 origin endpoints and reports the capabilities as degraded. Reconnection
 re-resolves provider sockets and idempotently republishes authorized endpoints.
+
+PIVB routing is owned by the workspace independently of SSH/OpenPGP pane
+environments. A remote claim atomically replaces an active local PIVB provider.
+Release or owner-attachment detach removes that remote route and deliberately
+leaves the stable workspace socket unavailable; it never falls back to a local
+card. A trusted local launcher may explicitly and idempotently activate the
+origin card when the workspace is unclaimed:
+
+```fish
+zka workspace credentials activate-local --if-unclaimed --bundle work example-project
+set pivb_route (zka workspace credentials endpoint example-project)
+pivb agent-session \
+  --route-socket "$pivb_route" \
+  --alias ro \
+  --source-label codex:agentic/ro \
+  -- sbx codex
+```
+
+The bare `endpoint` command exits nonzero for an unclaimed or degraded route;
+use `endpoint --json` when inspecting route state rather than launching an
+agent session.
+
+The endpoint path stays fixed for the workspace. Provider changes replace the
+listener behind it, so an already-running fixed-alias sandbox can use a newly
+claimed provider without receiving a new socket or broader authority. The
+claim pins the live slot-9c serial, JWK key ID, and SPKI; a different card
+requires a new explicit claim or local activation. Before takeover, the origin
+also checks the remote provider, issuer, alias targets, and serial/key ID against
+its card-free PIVB policy. On every successful mint the origin relay binds the
+response to that active route pin, which origin-side pivbd verifies alongside
+the signed token and local enrollment. See
+[PIVB credential bundles](docs/pivb-credential-bundles.md) for the launcher,
+PIVB service, timeout, and smart-card lease contract.
 
 The credential environment is fixed when the zmx backend is created, not when a
 view attaches or a claim changes. A pane created locally inherits the origin's
@@ -631,7 +673,7 @@ fallback rule to all of them:
 | --- | --- | --- |
 | **Hints** | `SWAYSOCK`, `I3SOCK` | Try the environment hint first, then discover a live compositor socket under `XDG_RUNTIME_DIR`. Doctor warns when a set hint failed. |
 | **Policy** | `SSH_AUTH_SOCK`, GnuPG `agent-extra-socket` | Never scan for a substitute. The selected socket determines which keys are authorized, so an unreachable path fails closed. |
-| **Identity** | zka control/watcher sockets, Kitty attachment endpoints, workspace SSH relays and GnuPG homes | Keep the stable path owned by zka and repair or republish that endpoint; never attach to a lookalike socket. |
+| **Identity** | zka control/watcher sockets, Kitty attachment endpoints, workspace SSH/PIVB relays and GnuPG homes | Keep the stable path owned by zka and repair or republish that endpoint; never attach to a lookalike socket. |
 
 `XDG_RUNTIME_DIR` is the session root supplied by `pam_systemd`, not another
 socket hint. zka derives its owned runtime paths from it and does not attempt to
@@ -671,6 +713,27 @@ when the key is configured to require them, remain the final human authorization
 boundary. Software-backed configured keys are allowed with a loud status/doctor
 warning rather than rejected.
 
+The PIVB capability is narrower again: its route accepts one versioned
+subject-token mint operation, not a generic byte stream. ZKA overwrites the
+caller-supplied card and routing context with the card pinned by the claim and
+the authenticated origin, workspace, bundle, generation, provider, attachment,
+and operation ID. Provider-side `pivbd` validates the complete alias, target,
+audience, enrollment, and pinned public key before signing. The origin-side
+`pivbd` then verifies the JWT signature, claims, lifetime, SPKI, and local
+enrollment before returning it. Only the five-minute subject token crosses the
+route; STS and IAM exchanges still run in the sandbox's Google auth library.
+The route carries no PIN, unlock operation, digest-signing primitive, APDU,
+PC/SC session, or Google access token.
+
+ZKA also owns a cooperative provider-wide smart-card lease. Filtered OpenPGP
+private operations and PIVB hardware operations serialize through it when
+`pivbd` is configured with zka's lease socket. This removes the routine
+scdaemon/PIVB race; unrelated same-UID processes that bypass zka remain a
+residual source of card contention. Workspace-forwarded PIVB work requires the
+lease. Direct-local unlock and mint retry a temporarily missing zkad socket and
+then retain their pre-ZKA behavior; a lease denial or protocol failure never
+downgrades to uncoordinated access.
+
 Credential notices contain zka-owned provider, workspace, bundle, capability,
 operation, and fingerprint fields. Sending the mandatory fallback discloses
 that bounded metadata to the configured ntfy helper. Separately,
@@ -685,14 +748,15 @@ may contain source code, prompts, paths, or secrets.
 2. Configure both node-ID pins, and add `sshSourceAddresses` only when its
    roaming cost is acceptable; do not treat a wildcard CIDR as protection.
 3. Prefer a persistent explicit `ssh.identityAgent`, hardware-backed OpenPGP
-   keys, and touch/PIN policy appropriate to unattended remote workloads.
+   keys, and touch/PIN policy appropriate to unattended remote workloads. Wire
+   pivbd to zka's cooperative card lease when both use the same smart card.
 4. Keep desktop notification delivery or the mandatory ntfy fallback working;
    check it before relying on remote signing.
 5. Claim the smallest bundle only while needed, release it afterward, and never
    combine zka bundles with OpenSSH `ForwardAgent`.
 6. Use `zka workspace credentials status --json`, `zka doctor --origin HOST`,
    and `journalctl --user-unit zkad` to audit claims, key backing, transport,
-   active OpenPGP operations, and degraded paths.
+   active credential operations, and degraded paths.
 
 ## Attention and notifications
 
@@ -1061,12 +1125,12 @@ hardware-backed provider and a healthy claimed workspace look like this (IDs
 and keygrips are shortened here):
 
 ```text
-ok    credentials-config work=ssh-agent+openpgp; default=work
+ok    credentials-config work=ssh-agent+openpgp+pivb; default=work
 ok    daemon           /run/user/1000/zka/zkad.sock; node=0123456789abcdef0123456789abcdef
 ok    current-pane-credentials not running inside a zka pane
 ok    credentials-provider configured provider sockets are reachable
 ok    openpgp-keys     work=11112222…99990000/A1B2C3D4:card
-ok    credentials-claim example-project=work@fedcba98[openpgp:ready,ssh-agent:ready]
+ok    credentials-claim example-project=work@fedcba98[openpgp:ready,pivb:ready,ssh-agent:ready]
 ok    credentials-transport ready
 ok    credential-environment no panes require credential-environment recreation
 ```
@@ -1107,12 +1171,13 @@ canonical topology generation/digest, convergence state, agent evidence, and
 retained notification failures. `zka workspace reconcile WORKSPACE` forces a
 complete local recapture and repair without restarting the pane backends.
 
-The 0.8.0 migration writes a private `.v6.backup` beside the schema-7 state
-file. Both the local daemon protocol and remote protocol are version 11. There
-is no compatibility shim for the removed workspace-agent API or old remote
+The current migration writes a private `.v7.backup` beside a schema-7 state
+file before upgrading it to schema 8. Both the local daemon protocol and remote
+protocol are version 12. There is no compatibility shim for the removed
+workspace-agent API or old remote
 transport: upgrade the CLI and daemon fleet together, then restart zkad on all
-SSH peers. To roll back, stop zkad, replace the schema-7 state file with its
-`.v6.backup`, install the prior binary on every peer, then restart zkad.
+SSH peers. To roll back, stop zkad, replace the schema-8 state file with its
+`.v7.backup`, install the prior binary on every peer, then restart zkad.
 
 `zka doctor` checks the enabled Codex and Claude Code executables and their
 managed hook files. An integration disabled in the NixOS module is reported as
@@ -1137,8 +1202,8 @@ built-in attention integration currently targets Codex and Claude Code
 lifecycle hooks.
 
 Credential bundles are semantic adapters, not arbitrary socket forwarding.
-The 0.8 series implements the SSH-agent and filtered OpenPGP adapters only; PIVB,
-OSTUI, and other capability types remain future designs.
+The current protocol implements SSH-agent, filtered OpenPGP, and constrained
+PIVB adapters. OSTUI and other capability types remain future designs.
 
 Keep short-lived utility terminals on plain Kitty unless their processes should
 persist. Existing `new_window_with_cwd` and `new_tab_with_cwd` mappings continue
@@ -1148,8 +1213,9 @@ routing the new pane through zka.
 ## Project status
 
 Version 0.8.2 combines three systems: durable Kitty-native workspaces, Codex and
-Claude Code attention routing, and reconnect-safe remote credential bundles for
-SSH agents and filtered OpenPGP. It also includes remote mirrors and two-phase
+Claude Code attention routing, and reconnect-safe remote credential bundles.
+The current tree extends those bundles with workspace-owned PIVB routes while
+preserving the fixed-alias sandbox ABI. It also includes remote mirrors and two-phase
 moves, headless origins, Waybar streaming, desktop/ntfy notifications, and
 durable cleanup after partial failures. Version 0.8.2 restores inherited
 SSH and GnuPG credentials in locally created panes and inventories ambiguous

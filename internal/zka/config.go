@@ -63,8 +63,13 @@ type Config struct {
 type CredentialsConfig struct {
 	DefaultBundle string                              `json:"default_bundle"`
 	GnuPG         CredentialGnuPGConfig               `json:"gnupg"`
+	PIVB          CredentialPIVBConfig                `json:"pivb"`
 	Bundles       map[string]CredentialBundleConfig   `json:"bundles"`
 	Providers     map[string]CredentialProviderConfig `json:"providers"`
+}
+
+type CredentialPIVBConfig struct {
+	ForwardSocket string `json:"forward_socket"`
 }
 
 type CredentialProviderConfig struct {
@@ -88,6 +93,10 @@ type CredentialBundleConfig struct {
 		Enable      bool     `json:"enable"`
 		SigningKeys []string `json:"signing_keys"`
 	} `json:"openpgp"`
+	PIVB struct {
+		Enable  bool     `json:"enable"`
+		Aliases []string `json:"aliases"`
+	} `json:"pivb"`
 }
 
 func (c Config) credentialBundle(name string) (CredentialBundleConfig, bool) {
@@ -220,8 +229,21 @@ func LoadConfig() (Config, error) {
 		if err := validateCredentialBundleName(name); err != nil {
 			return Config{}, err
 		}
-		if !bundle.SSHAgent.Enable && !bundle.OpenPGP.Enable {
+		if !bundle.SSHAgent.Enable && !bundle.OpenPGP.Enable && !bundle.PIVB.Enable {
 			return Config{}, fmt.Errorf("credential bundle %q enables no capabilities", name)
+		}
+		if bundle.PIVB.Enable && len(bundle.PIVB.Aliases) == 0 {
+			return Config{}, fmt.Errorf("credential bundle %q enables PIVB without an alias allowlist", name)
+		}
+		seenPIVBAliases := map[string]bool{}
+		for index, alias := range bundle.PIVB.Aliases {
+			if !validPIVBAlias(alias) {
+				return Config{}, fmt.Errorf("credential bundle %q pivb.aliases[%d] is invalid", name, index)
+			}
+			if seenPIVBAliases[alias] {
+				return Config{}, fmt.Errorf("credential bundle %q repeats PIVB alias %q", name, alias)
+			}
+			seenPIVBAliases[alias] = true
 		}
 		seen := map[string]bool{}
 		for index, fingerprint := range bundle.OpenPGP.SigningKeys {
@@ -242,10 +264,26 @@ func LoadConfig() (Config, error) {
 			return Config{}, fmt.Errorf("credentials.default_bundle %q is not defined", cfg.Credentials.DefaultBundle)
 		}
 	}
+	if cfg.Credentials.PIVB.ForwardSocket != "" && !filepath.IsAbs(cfg.Credentials.PIVB.ForwardSocket) {
+		return Config{}, fmt.Errorf("credentials.pivb.forward_socket must be absolute")
+	}
 	if cfg.SSH.IdentityAgent != "" {
 		cfg.SSH.Options = append([]string{"-o", "IdentityAgent=" + cfg.SSH.IdentityAgent}, cfg.SSH.Options...)
 	}
 	return cfg, nil
+}
+
+func validPIVBAlias(value string) bool {
+	if len(value) == 0 || len(value) > 32 || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for i, r := range value {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' && i > 0 && i < len(value)-1 {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validateNodeID(id string) error {

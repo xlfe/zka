@@ -2,9 +2,11 @@ package zka
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,26 +52,30 @@ type credentialTargetSession struct {
 }
 
 type credentialTargetListener struct {
-	workspace  string
-	bundle     string
-	capability string
-	generation uint64
-	path       string
-	listener   net.Listener
-	boundInfo  os.FileInfo
-	authorized atomic.Bool
-	done       chan struct{}
-	closeOnce  sync.Once
-	mu         sync.Mutex
-	active     map[net.Conn]struct{}
+	workspace   string
+	bundle      string
+	capability  string
+	generation  uint64
+	path        string
+	listener    net.Listener
+	boundInfo   os.FileInfo
+	authorized  atomic.Bool
+	done        chan struct{}
+	closeOnce   sync.Once
+	mu          sync.Mutex
+	active      map[net.Conn]struct{}
+	pivbCard    CredentialPIVBCard
+	pivbContext pivbForwardContext
 }
 
 type desiredCredentialTarget struct {
-	workspace  string
-	bundle     string
-	capability string
-	generation uint64
-	path       string
+	workspace   string
+	bundle      string
+	capability  string
+	generation  uint64
+	path        string
+	pivbCard    CredentialPIVBCard
+	pivbContext pivbForwardContext
 }
 
 func newCredentialTargetSession(parent context.Context, paths Paths, session *yamux.Session, provider Host) (*credentialTargetSession, error) {
@@ -173,6 +179,19 @@ func (s *credentialTargetSession) reconcile() {
 				}
 				desired[target.capability+"\x00"+workspace.ID] = target
 			}
+		}
+		if bundle.PIVB.Enable && claim.PIVB != nil {
+			target := desiredCredentialTarget{
+				workspace: workspace.ID, bundle: claim.Bundle, capability: credentialCapabilityPIVB,
+				generation: claim.Generation, path: pivbRelaySocketPath(s.paths, workspace.ID),
+				pivbCard: claim.PIVB.Card,
+				pivbContext: pivbForwardContext{
+					OriginNodeID: workspace.Origin.ID, WorkspaceID: workspace.ID, Bundle: claim.Bundle,
+					ClaimGeneration: claim.Generation, ProviderNodeID: s.provider.ID,
+					ProviderAttachID: claim.OwnerAttachmentID,
+				},
+			}
+			desired[target.capability+"\x00"+workspace.ID] = target
 		}
 	}
 
@@ -281,6 +300,7 @@ func (s *credentialTargetSession) startListener(target desiredCredentialTarget) 
 		workspace: target.workspace, bundle: target.bundle, capability: target.capability,
 		generation: target.generation, path: target.path, listener: listener, boundInfo: info,
 		done: make(chan struct{}), active: map[net.Conn]struct{}{},
+		pivbCard: target.pivbCard, pivbContext: target.pivbContext,
 	}
 	targetListener.authorized.Store(true)
 	s.wg.Add(1)
@@ -335,7 +355,20 @@ func (l *credentialTargetListener) proxy(ctx context.Context, client net.Conn, s
 		done <- struct{}{}
 	}
 	go copyOne(stream, client)
-	go copyOne(client, stream)
+	if l.capability == credentialCapabilityPIVB {
+		go func() {
+			if err := proxyBoundPIVBResponse(stream, client, l.pivbCard, l.pivbContext); err != nil {
+				status, code, message := http.StatusServiceUnavailable, "PIVB_UNAVAILABLE", "remote PIVB route is unavailable: "
+				if errors.Is(err, errPIVBRemoteResponseBinding) {
+					status, code, message = http.StatusForbidden, "PIVB_CONFIG", "remote PIVB response rejected by origin: "
+				}
+				_ = writePIVBProxyError(client, status, code, message+err.Error())
+			}
+			done <- struct{}{}
+		}()
+	} else {
+		go copyOne(client, stream)
+	}
 	select {
 	case <-ctx.Done():
 	case <-l.done:

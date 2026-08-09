@@ -11,14 +11,16 @@ import (
 )
 
 const (
-	stateSchemaVersion = 7
+	stateSchemaVersion = 8
+	// 12 adds workspace-scoped, provider-mutable PIVB credential routing.
 	// 11 combines credential target heartbeat/snapshot reconciliation. There is
 	// no compatibility shim: every CLI and daemon on a node must be upgraded
 	// together.
 	// 10 replaces the workspace-agent API with credential bundles. There is no
 	// compatibility shim: every CLI and daemon on a node must be upgraded
 	// together.
-	daemonProtocolVersion = 11
+	daemonProtocolVersion = 12
+	// 12 adds the PIVB credential manifest and stream capability.
 	// 11 binds both peer node IDs into the SSH control handshake and requires a
 	// credential-provider acknowledgement before a claim can be created.
 	// 10 replaces the JSON-lines-only SSH connection with yamux streams and
@@ -31,7 +33,7 @@ const (
 	// remote pane, and sends the source pane instead. An origin that predates
 	// this would quietly place every remote pane in the home directory, so the
 	// version check turns that into an explicit upgrade prompt.
-	remoteProtocolVersion = 11
+	remoteProtocolVersion = 12
 	remoteProtocolName    = "zka.workspace"
 	remoteProtocolMax     = 1 << 20
 )
@@ -305,6 +307,7 @@ type Workspace struct {
 	Attachments         map[string]*Attachment `json:"attachments"`
 	PrimaryAttachmentID string                 `json:"primary_attachment_id,omitempty"`
 	CredentialClaim     *CredentialClaim       `json:"credential_claim,omitempty"`
+	PIVBProvider        *WorkspacePIVBProvider `json:"pivb_provider,omitempty"`
 	PendingRevocations  []string               `json:"pending_revocations,omitempty"`
 	Attention           AgentState             `json:"attention"`
 	RestoreFocusPaneID  string                 `json:"restore_focus_pane_id,omitempty"`
@@ -322,7 +325,41 @@ type CredentialClaim struct {
 	State             string                                `json:"state"`
 	Capabilities      map[string]CredentialCapabilityStatus `json:"capabilities"`
 	OpenPGPKeys       []string                              `json:"openpgp_keys,omitempty"`
+	PIVB              *CredentialPIVBManifest               `json:"pivb,omitempty"`
 	UpdatedAt         time.Time                             `json:"updated_at"`
+}
+
+type CredentialPIVBCard struct {
+	Serial  uint32 `json:"serial"`
+	KeyID   string `json:"jwk_kid"`
+	SPKIDER []byte `json:"spki_der"`
+}
+
+type CredentialPIVBAlias struct {
+	Target string `json:"target"`
+}
+
+type CredentialPIVBManifest struct {
+	ProtocolVersion  int                            `json:"protocol_version"`
+	ProviderResource string                         `json:"provider_resource"`
+	IssuerURI        string                         `json:"issuer_uri"`
+	Aliases          map[string]CredentialPIVBAlias `json:"aliases"`
+	Card             CredentialPIVBCard             `json:"card"`
+}
+
+// WorkspacePIVBProvider owns the stable workspace PIVB route independently
+// from any individual agent session. Provider and generation may change while
+// the route socket and fixed agent alias remain stable.
+type WorkspacePIVBProvider struct {
+	Source            string                 `json:"source"` // local or attachment
+	Bundle            string                 `json:"bundle"`
+	Generation        uint64                 `json:"generation"`
+	OwnerNodeID       string                 `json:"owner_node_id"`
+	OwnerAttachmentID string                 `json:"owner_attachment_id,omitempty"`
+	Manifest          CredentialPIVBManifest `json:"manifest"`
+	State             string                 `json:"state"`
+	LastError         string                 `json:"last_error,omitempty"`
+	UpdatedAt         time.Time              `json:"updated_at"`
 }
 
 type CredentialCapabilityStatus struct {

@@ -19,14 +19,15 @@ import (
 )
 
 type Daemon struct {
-	mu           sync.Mutex
-	lifeMu       sync.Mutex
-	attentionMu  sync.Mutex
-	captureMu    sync.Mutex
-	topologyMu   sync.Mutex
-	cleanupMu    sync.Mutex
-	credentialMu sync.Mutex
-	wg           sync.WaitGroup
+	mu              sync.Mutex
+	lifeMu          sync.Mutex
+	attentionMu     sync.Mutex
+	captureMu       sync.Mutex
+	topologyMu      sync.Mutex
+	cleanupMu       sync.Mutex
+	credentialMu    sync.Mutex
+	pivbReconcileMu sync.Mutex
+	wg              sync.WaitGroup
 
 	paths    Paths
 	store    *Store
@@ -43,6 +44,8 @@ type Daemon struct {
 	cancel                context.CancelFunc
 	listener              net.Listener
 	watcher               *net.UnixConn
+	cardLeaseListener     net.Listener
+	cardLease             *smartCardLease
 	conns                 map[net.Conn]struct{}
 	started               bool
 	closed                bool
@@ -69,12 +72,16 @@ type Daemon struct {
 	credentialNotices     map[string]credentialNoticeState
 	credentialTransports  map[string]incomingCredentialTransport
 	credentialClaims      map[string]*sync.Mutex
+	pivbLocalListeners    map[string]*localPIVBListener
 	credentialInteractive func() bool
 }
 
 func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, error) {
 	if paths.AgentDir == "" && paths.RuntimeDir != "" {
 		paths.AgentDir = filepath.Join(paths.RuntimeDir, "agents")
+	}
+	if paths.CardLeaseSocket == "" && paths.RuntimeDir != "" {
+		paths.CardLeaseSocket = filepath.Join(paths.RuntimeDir, "card-lease.sock")
 	}
 	if runner == nil {
 		runner = ExecRunner{}
@@ -108,6 +115,11 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 	sweptNotifications := 0
 	for _, workspace := range state.Workspaces {
 		normalizeWorkspace(workspace)
+		if workspace.PIVBProvider != nil && workspace.PIVBProvider.Source == "local" {
+			workspace.PIVBProvider.State = "starting"
+			workspace.PIVBProvider.LastError = "daemon restarted; local route listener is pending"
+			workspace.PIVBProvider.UpdatedAt = now
+		}
 		// A reservation can only be owned by a live worker, and at process start
 		// there are none, so anything still marked in flight was lost to a crash
 		// or a kill. Convert it to a retryable failure rather than a phantom
@@ -172,6 +184,8 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 		credentialNotices:    map[string]credentialNoticeState{},
 		credentialTransports: map[string]incomingCredentialTransport{},
 		credentialClaims:     map[string]*sync.Mutex{},
+		pivbLocalListeners:   map[string]*localPIVBListener{},
+		cardLease:            newSmartCardLease(),
 	}
 	store.SetOnSave(d.signalAttention)
 	// Constructor injection rather than a setter: d exists by this point, so
@@ -212,8 +226,17 @@ func (d *Daemon) Start() error {
 		d.lifeMu.Unlock()
 		return err
 	}
+	cardLeaseListener, err := listenUnix(d.paths.CardLeaseSocket)
+	if err != nil {
+		_ = watcher.Close()
+		_ = ln.Close()
+		_ = os.Remove(d.paths.Socket)
+		d.lifeMu.Unlock()
+		return err
+	}
 	d.listener = ln
 	d.watcher = watcher
+	d.cardLeaseListener = cardLeaseListener
 	d.started = true
 	d.logger.Printf("listening on %s", d.paths.Socket)
 	d.startWorkerLocked(func(ctx context.Context) { d.acceptLoop(ctx) })
@@ -221,6 +244,8 @@ func (d *Daemon) Start() error {
 	d.startWorkerLocked(func(ctx context.Context) { d.topologyLoop(ctx) })
 	d.startWorkerLocked(func(ctx context.Context) { d.backendReconcileLoop(ctx) })
 	d.startWorkerLocked(func(ctx context.Context) { d.notificationRetryLoop(ctx) })
+	d.startWorkerLocked(func(ctx context.Context) { d.localPIVBReconcileLoop(ctx) })
+	d.startWorkerLocked(func(ctx context.Context) { d.cardLeaseLoop(ctx) })
 	d.lifeMu.Unlock()
 	d.resumeLifecycleCleanup()
 	d.resumeTopologyReconciliation()
@@ -241,11 +266,18 @@ func (d *Daemon) Close() error {
 	if d.watcher != nil {
 		_ = d.watcher.Close()
 	}
+	if d.cardLeaseListener != nil {
+		_ = d.cardLeaseListener.Close()
+	}
 	for conn := range d.conns {
 		_ = conn.Close()
 	}
 	d.remotes.Close()
 	d.lifeMu.Unlock()
+	// Local PIVB listeners can be activated before Start (for example by an
+	// API caller racing daemon startup), so do not rely solely on the
+	// reconciler worker's deferred cleanup to unblock their Accept loops.
+	d.closeAllLocalPIVBListeners()
 	// After the unlock and before the join: the notifier's signal goroutine
 	// calls startWorker, which takes lifeMu. Shutting it down while holding
 	// lifeMu would deadlock, and startWorker's closed check does not help
@@ -254,6 +286,7 @@ func (d *Daemon) Close() error {
 	d.wg.Wait()
 	_ = os.Remove(d.paths.Socket)
 	_ = os.Remove(d.paths.WatcherSocket)
+	_ = os.Remove(d.paths.CardLeaseSocket)
 	return nil
 }
 
@@ -665,6 +698,18 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 			return nil, err
 		}
 		return d.releaseWorkspaceCredentials(req.Workspace)
+	case "credentials_activate_local":
+		var req workspaceCredentialRequest
+		if err := decodePayload(raw, &req); err != nil {
+			return nil, err
+		}
+		return d.activateLocalPIVB(ctx, req.Workspace, req.Bundle, req.IfUnclaimed)
+	case "credentials_endpoint":
+		var req workspaceCredentialRequest
+		if err := decodePayload(raw, &req); err != nil {
+			return nil, err
+		}
+		return d.pivbEndpoint(req.Workspace)
 	case "credentials_status":
 		var req workspaceCredentialRequest
 		if len(raw) != 0 {
@@ -2022,6 +2067,9 @@ func (d *Daemon) detachAttachment(workspaceRef, attachmentID string) (*Workspace
 	workspace.PendingRevocations = removeString(workspace.PendingRevocations, attachmentID)
 	if workspace.CredentialClaim != nil && workspace.CredentialClaim.OwnerAttachmentID == attachmentID {
 		workspace.CredentialClaim = nil
+	}
+	if workspace.PIVBProvider != nil && workspace.PIVBProvider.Source == "attachment" && workspace.PIVBProvider.OwnerAttachmentID == attachmentID {
+		workspace.PIVBProvider = nil
 	}
 	if err := d.store.Save(d.state); err != nil {
 		return nil, err

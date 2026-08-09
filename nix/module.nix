@@ -122,12 +122,24 @@ let
       message = "services.zka.credentials bundle names must start with an alphanumeric character and contain at most 64 letters, digits, dots, underscores, or hyphens";
     }
     {
-      assertion = bundle.sshAgent.enable || bundle.openpgp.enable;
+      assertion = bundle.sshAgent.enable || bundle.openpgp.enable || bundle.pivb.enable;
       message = "services.zka.credentials.bundles.${name} must enable at least one capability";
     }
     {
       assertion = lib.all (fingerprint: builtins.match "^[0-9A-Fa-f]{40}([0-9A-Fa-f]{24})?$" fingerprint != null) bundle.openpgp.signingKeys;
       message = "services.zka.credentials.bundles.${name}.openpgp.signingKeys must contain full 40- or 64-hex-character fingerprints";
+    }
+    {
+      assertion = !bundle.pivb.enable || bundle.pivb.aliases != [ ];
+      message = "services.zka.credentials.bundles.${name}.pivb.aliases must be non-empty when PIVB is enabled";
+    }
+    {
+      assertion = lib.all (alias: builtins.match "^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$" alias != null) bundle.pivb.aliases;
+      message = "services.zka.credentials.bundles.${name}.pivb.aliases contains an invalid PIVB alias";
+    }
+    {
+      assertion = lib.unique bundle.pivb.aliases == bundle.pivb.aliases;
+      message = "services.zka.credentials.bundles.${name}.pivb.aliases must not contain duplicates";
     }
   ]) cfg.credentials.bundles);
   credentialProviderAssertions = lib.concatLists (lib.mapAttrsToList (name: provider: [
@@ -169,11 +181,16 @@ let
         configure_agent = cfg.credentials.gnupg.configureAgent;
         operation_timeout = cfg.credentials.gnupg.operationTimeout;
       };
+      pivb.forward_socket = if cfg.credentials.pivb.forwardSocket == null then "" else cfg.credentials.pivb.forwardSocket;
       bundles = lib.mapAttrs (_: bundle: {
         ssh_agent.enable = bundle.sshAgent.enable;
         openpgp = {
           enable = bundle.openpgp.enable;
           signing_keys = bundle.openpgp.signingKeys;
+        };
+        pivb = {
+          enable = bundle.pivb.enable;
+          aliases = bundle.pivb.aliases;
         };
       }) cfg.credentials.bundles;
       providers = lib.mapAttrs (_: provider: {
@@ -350,6 +367,12 @@ in
         };
       };
 
+      pivb.forwardSocket = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Absolute provider-side pivbd forwarding socket; null uses $XDG_RUNTIME_DIR/pivb/forward.sock at runtime.";
+      };
+
       bundles = lib.mkOption {
         default = { };
         description = "Named, semantic credential capability bundles available for workspace claims.";
@@ -369,6 +392,16 @@ in
               type = lib.types.listOf lib.types.str;
               default = [ ];
               description = "Full OpenPGP fingerprints authorized when this node provides the bundle; leave empty on a target-only node.";
+            };
+            pivb.enable = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = "Expose the provider's constrained PIVB mint capability through this workspace bundle.";
+            };
+            pivb.aliases = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = "PIVB aliases authorized through this bundle; the active card identity is pinned when claimed.";
             };
           };
         }));
@@ -495,6 +528,10 @@ in
         {
           assertion = cfg.credentials.defaultBundle == null || builtins.hasAttr cfg.credentials.defaultBundle cfg.credentials.bundles;
           message = "services.zka.credentials.defaultBundle must name a configured credential bundle";
+        }
+        {
+          assertion = cfg.credentials.pivb.forwardSocket == null || lib.hasPrefix "/" cfg.credentials.pivb.forwardSocket;
+          message = "services.zka.credentials.pivb.forwardSocket must be absolute";
         }
       ] ++ credentialBundleAssertions ++ credentialProviderAssertions;
 

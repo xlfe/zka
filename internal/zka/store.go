@@ -45,8 +45,8 @@ func (s *Store) Ensure() error {
 // Load intentionally treats the pre-v3 schemas as empty state. v3 changes
 // process ownership: Kitty view closure now removes its zmx backend. Migrating
 // the old records would make that ownership ambiguous, so only zka's generated
-// files are reset. Schemas v3-v6 migrate to the current schema. Existing zmx
-// processes are deliberately left untouched, and v4-v6 receive a one-time
+// files are reset. Schemas v3-v7 migrate to the current schema. Existing zmx
+// processes are deliberately left untouched, and v4-v7 receive a one-time
 // rollback backup before migration.
 func (s *Store) Load() (StateData, error) {
 	if err := s.Ensure(); err != nil {
@@ -80,7 +80,7 @@ func (s *Store) Load() (StateData, error) {
 	if header.SchemaVersion < 3 || header.SchemaVersion > stateSchemaVersion {
 		return StateData{}, fmt.Errorf("unsupported state schema %d (want %d)", header.SchemaVersion, stateSchemaVersion)
 	}
-	if header.SchemaVersion == 4 || header.SchemaVersion == 5 || header.SchemaVersion == 6 {
+	if header.SchemaVersion == 4 || header.SchemaVersion == 5 || header.SchemaVersion == 6 || header.SchemaVersion == 7 {
 		if err := s.writeMigrationBackup(b, header.SchemaVersion); err != nil {
 			return StateData{}, err
 		}
