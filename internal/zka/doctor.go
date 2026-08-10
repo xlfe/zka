@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -50,6 +51,7 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		daemonDetail += "; node=" + node.ID
 	}
 	checks = append(checks, doctorCheck{Name: "daemon", OK: err == nil, Detail: doctorDetail(err, daemonDetail)})
+	checks = append(checks, hookRelayDoctorCheck(paths))
 	stateErr := NewStore(paths).Ensure()
 	checks = append(checks, doctorCheck{Name: "state-dir", OK: stateErr == nil, Detail: doctorDetail(stateErr, paths.StateDir)})
 	currentPaneCredentials, providerChecksUnsafe := currentPaneCredentialEnvironmentDoctorCheck(paths)
@@ -143,6 +145,99 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		topologyRenderableCheck(workspaces, workspacesErr),
 	)
 	return writeDoctorResult(checks, *jsonOut, stdout)
+}
+
+func hookRelayDoctorCheck(paths Paths) doctorCheck {
+	const name = "hook-relays"
+	root := hookRelayRoot(paths)
+	rootInfo, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return doctorCheck{Name: name, OK: true, Detail: "no active hook relays"}
+	}
+	if err != nil {
+		return doctorCheck{Name: name, Detail: err.Error()}
+	}
+	rootStat, ok := rootInfo.Sys().(*syscall.Stat_t)
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() || !ok || rootStat.Uid != uint32(os.Getuid()) || rootInfo.Mode().Perm() != 0o700 {
+		return doctorCheck{Name: name, Detail: fmt.Sprintf("%s is not an owned 0700 directory", root)}
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return doctorCheck{Name: name, Detail: err.Error()}
+	}
+	active, starting, stale := 0, 0, 0
+	var problems []string
+	for _, entry := range entries {
+		if !entry.IsDir() || !validHookRelaySessionID(entry.Name()) {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		dirInfo, statErr := os.Lstat(dir)
+		if statErr != nil {
+			problems = append(problems, entry.Name()+": "+statErr.Error())
+			continue
+		}
+		dirStat, owned := dirInfo.Sys().(*syscall.Stat_t)
+		if dirInfo.Mode()&os.ModeSymlink != 0 || !dirInfo.IsDir() || !owned || dirStat.Uid != uint32(os.Getuid()) || dirInfo.Mode().Perm() != 0o700 {
+			problems = append(problems, entry.Name()+": session is not an owned 0700 directory")
+			continue
+		}
+		young := time.Since(dirInfo.ModTime()) < hookRelayStaleGrace
+		lock, lockErr := os.OpenFile(filepath.Join(dir, "session.lock"), os.O_RDONLY, 0)
+		if lockErr != nil {
+			if young && errors.Is(lockErr, os.ErrNotExist) {
+				starting++
+				continue
+			}
+			problems = append(problems, entry.Name()+": "+lockErr.Error())
+			continue
+		}
+		lockErr = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		isActive := errors.Is(lockErr, syscall.EWOULDBLOCK) || errors.Is(lockErr, syscall.EAGAIN)
+		if lockErr == nil {
+			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		}
+		_ = lock.Close()
+		if lockErr != nil && !isActive {
+			problems = append(problems, entry.Name()+": inspect session lock: "+lockErr.Error())
+			continue
+		}
+		if lockErr == nil && young {
+			starting++
+			continue
+		}
+		socket := agentRelaySocketPath(root, entry.Name())
+		socketInfo, socketErr := os.Lstat(socket)
+		if young && errors.Is(socketErr, os.ErrNotExist) {
+			starting++
+			continue
+		}
+		if socketErr != nil || socketInfo.Mode()&os.ModeSocket == 0 || socketInfo.Mode().Perm() != 0o600 {
+			detail := "socket is not a 0600 Unix socket"
+			if socketErr != nil {
+				detail = socketErr.Error()
+			}
+			problems = append(problems, entry.Name()+": "+detail)
+			continue
+		}
+		if isActive {
+			active++
+		} else {
+			stale++
+		}
+	}
+	if len(problems) != 0 {
+		sort.Strings(problems)
+		return doctorCheck{Name: name, Detail: strings.Join(problems, "; ")}
+	}
+	detail := fmt.Sprintf("%d active", active)
+	if starting != 0 {
+		detail += fmt.Sprintf(", %d starting", starting)
+	}
+	if stale != 0 {
+		detail += fmt.Sprintf(", %d stale (removed on next relay startup)", stale)
+	}
+	return doctorCheck{Name: name, OK: true, Warning: stale != 0, Detail: detail}
 }
 
 func currentPaneCredentialEnvironmentDoctorCheck(paths Paths) (doctorCheck, bool) {

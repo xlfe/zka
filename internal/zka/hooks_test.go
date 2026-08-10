@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestCodexHookMapsUserPromptToHiddenPane(t *testing.T) {
@@ -225,5 +226,12 @@ func TestHookRejectsUnknownAgent(t *testing.T) {
 	code, err := runHook([]string{"other"}, testPaths(t.TempDir()), strings.NewReader(`{}`), &output)
 	if code != 2 || err == nil || !strings.Contains(err.Error(), "codex|claude") {
 		t.Fatalf("runHook = %d, %v, %q", code, err, output.String())
+	}
+}
+
+func TestSummarizeTruncatesAtUTF8Boundary(t *testing.T) {
+	got := summarize(strings.Repeat("é", 100), 180)
+	if !utf8.ValidString(got) || len(got) > 180 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("summary = %q (%d bytes)", got, len(got))
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const maxHookInputSize = 256 << 10
@@ -36,9 +37,10 @@ func runHook(args []string, paths Paths, stdin io.Reader, stdout io.Writer) (int
 	if len(args) != 1 || (args[0] != "codex" && args[0] != "claude") {
 		return 2, fmt.Errorf("hook supports only: zka hook codex|claude")
 	}
+	relaySocket := os.Getenv("ZKA_HOOK_SOCKET")
 	workspaceID := os.Getenv("ZKA_WORKSPACE_ID")
 	paneID := os.Getenv("ZKA_PANE_ID")
-	if workspaceID == "" || paneID == "" {
+	if relaySocket == "" && (workspaceID == "" || paneID == "") {
 		return hookSuccess(stdout)
 	}
 	payload, err := io.ReadAll(io.LimitReader(stdin, maxHookInputSize+1))
@@ -51,6 +53,13 @@ func runHook(args []string, paths Paths, stdin io.Reader, stdout io.Writer) (int
 	}
 	event, ok := mapHookEvent(args[0], workspaceID, paneID, input)
 	if !ok {
+		return hookSuccess(stdout)
+	}
+	if relaySocket != "" {
+		sendHookRelayEvent(relaySocket, hookRelayRequest{
+			Version: hookRelayProtocolVersion, Agent: args[0], Kind: event.Kind,
+			TurnID: hookRelayClientTurnID(event.TurnID), Detail: event.Detail,
+		})
 		return hookSuccess(stdout)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -179,8 +188,34 @@ func hookSuccess(stdout io.Writer) (int, error) {
 
 func summarize(value string, max int) string {
 	value = strings.Join(strings.Fields(value), " ")
+	return truncateUTF8(value, max)
+}
+
+func truncateUTF8(value string, max int) string {
+	if max <= 0 {
+		return ""
+	}
 	if len(value) <= max {
 		return value
 	}
-	return value[:max-1] + "…"
+	const ellipsis = "…"
+	if max < len(ellipsis) {
+		limit := max
+		for limit > 0 && !utf8.RuneStart(value[limit]) {
+			limit--
+		}
+		return value[:limit]
+	}
+	limit := max - len(ellipsis)
+	for limit > 0 && !utf8.RuneStart(value[limit]) {
+		limit--
+	}
+	return value[:limit] + ellipsis
+}
+
+func hookRelayClientTurnID(value string) string {
+	if len(value) > hookRelayMaxTurnID || !utf8.ValidString(value) || containsHookRelayControl(value) {
+		return ""
+	}
+	return value
 }

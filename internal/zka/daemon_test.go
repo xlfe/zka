@@ -563,3 +563,17 @@ func TestUnknownEventIsRejected(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestUnknownPaneErrorPrefixIsStableForRelayClassification(t *testing.T) {
+	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	_, err = d.applyEvent(context.Background(), Event{
+		WorkspaceID: workspace.ID, PaneID: "retired-pane", Kind: "stop", Source: "codex-hook",
+	})
+	if err == nil || !strings.HasPrefix(err.Error(), "unknown pane ") {
+		t.Fatalf("error = %v, want stable unknown-pane prefix", err)
+	}
+}

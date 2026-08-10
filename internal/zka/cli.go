@@ -35,8 +35,13 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) 
 		fmt.Fprintln(stdout, Version)
 		return 0, nil
 	}
-	if args[0] == "hook" && (os.Getenv("ZKA_WORKSPACE_ID") == "" || os.Getenv("ZKA_PANE_ID") == "") {
-		return hookSuccess(stdout)
+	if args[0] == "hook" {
+		if os.Getenv("ZKA_HOOK_SOCKET") != "" {
+			return runHook(args[1:], Paths{}, stdin, stdout)
+		}
+		if os.Getenv("ZKA_WORKSPACE_ID") == "" || os.Getenv("ZKA_PANE_ID") == "" {
+			return hookSuccess(stdout)
+		}
 	}
 	if args[0] == "launch" {
 		return runLauncher(args[1:], stdin, stdout, stderr)
@@ -71,6 +76,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) 
 		return runRemoteControlCommand(args[1:], paths, stdin, stdout)
 	case "doctor":
 		return normalizeFlagHelp(runDoctor(args[1:], paths, stdout, stderr))
+	case "relay":
+		return normalizeFlagHelp(runRelay(args[1:], paths, stdin, stdout, stderr))
 	case "hook":
 		return runHook(args[1:], paths, stdin, stdout)
 	default:
@@ -97,7 +104,7 @@ Commands:
   doctor      Check local or remote integration
   daemon      Run zkad (normally via systemd --user)
 
-Internal commands: pane, pane-host, remote-pane, remote-attach, remote-control, hook`)
+Internal commands: pane, pane-host, remote-pane, remote-attach, remote-control, relay, hook`)
 }
 
 func runLauncher(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {

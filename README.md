@@ -765,6 +765,14 @@ Each pane records explainable Codex or Claude Code lifecycle evidence and one of
 exposes the highest-priority aggregate. Managed hooks associate agent events
 with the hidden pane through `ZKA_WORKSPACE_ID` and `ZKA_PANE_ID`.
 
+Filesystem-isolated agents can instead receive a per-process hook socket. Run
+the trusted sandbox launcher under `zka relay hooks`; the relay binds the
+capability to the current workspace and pane, while the sandbox receives no zka
+identity or control socket. This requires launcher-side mount and environment
+wiring and must be rolled out with that launcher change. See
+[sandboxed agent hook relays](docs/sandboxed-agent-hook-relays.md) for the exact
+contract and limits.
+
 Claude support is hook-only: zka does not read screen contents, scrollback, or
 transcripts. Claude Code does not emit `Stop` after a user interrupt, and a
 dismissed permission dialog may not emit a closing event. An idle notification

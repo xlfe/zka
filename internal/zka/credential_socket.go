@@ -23,7 +23,6 @@ const (
 // reconnects, so a pane's SSH_AUTH_SOCK never depends on a particular SSH
 // control process.
 func agentRelaySocketPath(dir, workspaceID string) string {
-	const safeUnixSocketPath = 103
 	path := filepath.Join(dir, workspaceID+".sock")
 	if len(path) <= safeUnixSocketPath {
 		return path

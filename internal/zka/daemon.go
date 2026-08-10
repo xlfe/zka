@@ -222,7 +222,6 @@ func (d *Daemon) Start() error {
 	watcher, err := listenUnixgram(d.paths.WatcherSocket)
 	if err != nil {
 		_ = ln.Close()
-		_ = os.Remove(d.paths.Socket)
 		d.lifeMu.Unlock()
 		return err
 	}
@@ -230,7 +229,6 @@ func (d *Daemon) Start() error {
 	if err != nil {
 		_ = watcher.Close()
 		_ = ln.Close()
-		_ = os.Remove(d.paths.Socket)
 		d.lifeMu.Unlock()
 		return err
 	}
@@ -284,9 +282,7 @@ func (d *Daemon) Close() error {
 	// because it acquires the lock before observing it.
 	d.desktop.Shutdown()
 	d.wg.Wait()
-	_ = os.Remove(d.paths.Socket)
 	_ = os.Remove(d.paths.WatcherSocket)
-	_ = os.Remove(d.paths.CardLeaseSocket)
 	return nil
 }
 

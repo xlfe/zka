@@ -9,10 +9,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
-const maxProtocolMessage = 1 << 20
+const (
+	maxProtocolMessage = 1 << 20
+	safeUnixSocketPath = 103
+)
 
 // Leave enough time for zkad to serialize an operation deadline error before
 // the client-side socket/context deadline closes the connection.
@@ -137,25 +141,82 @@ func (c Client) WatchAttention(ctx context.Context, yield func(AttentionSnapshot
 	}
 }
 
-func listenUnix(path string) (net.Listener, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("create runtime directory: %w", err)
+type ownedUnixListener struct {
+	*net.UnixListener
+	path      string
+	boundInfo os.FileInfo
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (l *ownedUnixListener) Close() error {
+	l.closeOnce.Do(func() {
+		l.closeErr = l.UnixListener.Close()
+		if current, err := os.Lstat(l.path); err == nil && os.SameFile(l.boundInfo, current) {
+			if err := os.Remove(l.path); l.closeErr == nil && err != nil && !errors.Is(err, os.ErrNotExist) {
+				l.closeErr = err
+			}
+		}
+	})
+	return l.closeErr
+}
+
+func validateUnixSocketPath(path string) error {
+	if len(path) > safeUnixSocketPath {
+		return fmt.Errorf("Unix socket path is %d bytes; maximum is %d: shorten ZKA_RUNTIME_DIR", len(path), safeUnixSocketPath)
 	}
-	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("secure runtime directory: %w", err)
-	}
-	if err := removeStaleSocket(path); err != nil {
+	return nil
+}
+
+func bindUnix(path string, removeStale, prepareDirectory bool) (*ownedUnixListener, error) {
+	if err := validateUnixSocketPath(path); err != nil {
 		return nil, err
 	}
-	ln, err := net.Listen("unix", path)
+	if prepareDirectory {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return nil, fmt.Errorf("create runtime directory: %w", err)
+		}
+		if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+			return nil, fmt.Errorf("secure runtime directory: %w", err)
+		}
+	}
+	if removeStale {
+		if err := removeStaleSocket(path); err != nil {
+			return nil, err
+		}
+	} else if _, err := os.Lstat(path); err == nil {
+		return nil, fmt.Errorf("refusing to replace existing path %s", path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect Unix socket path: %w", err)
+	}
+	address, err := net.ResolveUnixAddr("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve Unix socket %s: %w", path, err)
+	}
+	ln, err := net.ListenUnix("unix", address)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", path, err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	ln.SetUnlinkOnClose(false)
+	info, err := os.Lstat(path)
+	if err != nil {
 		_ = ln.Close()
-		return nil, fmt.Errorf("secure daemon socket: %w", err)
+		return nil, fmt.Errorf("inspect bound Unix socket: %w", err)
 	}
-	return ln, nil
+	owned := &ownedUnixListener{UnixListener: ln, path: path, boundInfo: info}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = owned.Close()
+		return nil, fmt.Errorf("secure Unix socket: %w", err)
+	}
+	return owned, nil
+}
+
+func listenUnix(path string) (net.Listener, error) {
+	return bindUnix(path, true, true)
+}
+
+func listenUnixExclusive(path string) (*ownedUnixListener, error) {
+	return bindUnix(path, false, false)
 }
 
 func listenUnixgram(path string) (*net.UnixConn, error) {
