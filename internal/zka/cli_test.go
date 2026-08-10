@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-func TestLocalAndRemotePaneBackendCommandsSelectCredentialEnvironment(t *testing.T) {
+func TestLocalAndRemotePaneBackendCommandsUseStableCredentialEnvironment(t *testing.T) {
 	t.Setenv("SSH_AUTH_SOCK", "/tmp/local-agent.sock")
 	t.Setenv("GNUPGHOME", "/tmp/local-gnupg")
 	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "2")
@@ -29,15 +29,15 @@ func TestLocalAndRemotePaneBackendCommandsSelectCredentialEnvironment(t *testing
 		Create:    true,
 	}
 
-	local := localPaneBackendCommand(cfg, prepared)
-	if got := testEnvironmentValue(local.Env, "SSH_AUTH_SOCK"); got != "/tmp/local-agent.sock" {
+	local := localPaneBackendCommand(cfg, paths, prepared)
+	if got := testEnvironmentValue(local.Env, "SSH_AUTH_SOCK"); got != agentRelaySocketPath(paths.AgentDir, "workspace") {
 		t.Fatalf("local SSH_AUTH_SOCK = %q", got)
 	}
-	if got := testEnvironmentValue(local.Env, "GNUPGHOME"); got != "/tmp/local-gnupg" {
-		t.Fatalf("local GNUPGHOME = %q", got)
+	if got, want := testEnvironmentValue(local.Env, "GNUPGHOME"), filepath.Join(paths.StateDir, "credentials", "workspace", "gnupg"); got != want {
+		t.Fatalf("local GNUPGHOME = %q, want %q", got, want)
 	}
-	if testEnvironmentContains(local.Env, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION") {
-		t.Fatalf("local command retained managed environment marker: %#v", local.Env)
+	if got := testEnvironmentValue(local.Env, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "4" {
+		t.Fatalf("local credential environment version = %q", got)
 	}
 
 	remote := remotePaneBackendCommand(cfg, paths, prepared)
@@ -47,7 +47,7 @@ func TestLocalAndRemotePaneBackendCommandsSelectCredentialEnvironment(t *testing
 	if got, want := testEnvironmentValue(remote.Env, "GNUPGHOME"), filepath.Join(paths.StateDir, "credentials", "workspace", "gnupg"); got != want {
 		t.Fatalf("remote GNUPGHOME = %q, want %q", got, want)
 	}
-	if got := testEnvironmentValue(remote.Env, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "3" {
+	if got := testEnvironmentValue(remote.Env, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "4" {
 		t.Fatalf("remote credential environment version = %q", got)
 	}
 
@@ -77,11 +77,29 @@ func TestLocalPaneBackendCommandPreservesUnsetCredentialEnvironment(t *testing.T
 	}
 	var cfg Config
 	cfg.ZMX.Command = "zmx"
-	cmd := localPaneBackendCommand(cfg, prepared)
+	cmd := localPaneBackendCommand(cfg, Paths{}, prepared)
 	for _, name := range []string{"SSH_AUTH_SOCK", "GNUPGHOME", "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"} {
 		if testEnvironmentContains(cmd.Env, name) {
 			t.Fatalf("local command invented %s: %#v", name, cmd.Env)
 		}
+	}
+}
+
+func TestManagedPaneEnvironmentRemovesUnconfiguredAmbientCredentials(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "/tmp/ambient-agent.sock")
+	t.Setenv("GNUPGHOME", "/tmp/ambient-gnupg")
+	var cfg Config
+	var bundle CredentialBundleConfig
+	bundle.PIVB.Enable = true
+	cfg.Credentials.Bundles = map[string]CredentialBundleConfig{"pivb": bundle}
+	environment := managedPaneCommandEnvironment(cfg, testPaths(testRoot(t)), "workspace", "pane", true)
+	for _, name := range []string{"SSH_AUTH_SOCK", "GNUPGHOME"} {
+		if testEnvironmentContains(environment, name) {
+			t.Fatalf("managed environment leaked ambient %s: %#v", name, environment)
+		}
+	}
+	if got := testEnvironmentValue(environment, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "4" {
+		t.Fatalf("managed credential environment version = %q", got)
 	}
 }
 
@@ -136,6 +154,9 @@ func TestInterspersedWorkspaceFlagsMatchDocumentedSyntax(t *testing.T) {
 }
 
 func TestWorkspaceCreateDispatchAndUsage(t *testing.T) {
+	// CLI validation must not inherit the developer's configured default
+	// credential bundle. These cases intentionally stop before any RPC.
+	t.Setenv("ZKA_CONFIG", "")
 	var stdout, stderr bytes.Buffer
 	code, err := runWorkspace([]string{"create"}, Paths{}, &stdout, &stderr)
 	if code != 2 || err == nil || !strings.Contains(err.Error(), "requires one [SSH_ALIAS:]NAME") {
@@ -156,11 +177,11 @@ func TestWorkspaceCreateDispatchAndUsage(t *testing.T) {
 		t.Fatalf("relative remote cwd: code=%d err=%v", code, err)
 	}
 	code, err = runWorkspace([]string{"create", "devbox.example:api", "--claim-credentials"}, Paths{}, &stdout, &stderr)
-	if code != 2 || err == nil || !strings.Contains(err.Error(), "--claim-credentials requires --attach") {
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "credentials.default_bundle is not set") {
 		t.Fatalf("claim without attach: code=%d err=%v", code, err)
 	}
 	code, err = runWorkspace([]string{"create", "api", "--attach", "--claim-credentials"}, Paths{}, &stdout, &stderr)
-	if code != 2 || err == nil || !strings.Contains(err.Error(), "--claim-credentials requires a remote workspace") {
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "credentials.default_bundle is not set") {
 		t.Fatalf("local create claim: code=%d err=%v", code, err)
 	}
 	code, err = runWorkspace([]string{"attach", "api", "--claim-credentials"}, Paths{}, &stdout, &stderr)
@@ -191,6 +212,39 @@ func TestWorkspaceCreateSurfacesTemplateErrorsBeforeAnyRPC(t *testing.T) {
 	code, err = runWorkspace([]string{"create", "api", "--template", unsafe}, Paths{}, &stdout, &stderr)
 	if code != 2 || err == nil || !strings.Contains(err.Error(), "not topology-safe") {
 		t.Fatalf("unsafe template: code=%d err=%v", code, err)
+	}
+}
+
+func TestCreationCredentialBundleDefaultsAndOptOut(t *testing.T) {
+	var cfg Config
+	cfg.Credentials.DefaultBundle = "work"
+	cfg.Credentials.Bundles = map[string]CredentialBundleConfig{"work": {}, "personal": {}}
+	for _, test := range []struct {
+		name            string
+		explicit        string
+		noCredentials   bool
+		compatibility   bool
+		want            string
+		wantErrContains string
+	}{
+		{name: "creator default", want: "work"},
+		{name: "explicit override", explicit: "personal", want: "personal"},
+		{name: "explicit opt out", noCredentials: true},
+		{name: "conflicting opt out", explicit: "work", noCredentials: true, wantErrContains: "cannot be combined"},
+		{name: "unknown override", explicit: "missing", wantErrContains: "not configured"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := creationCredentialBundle(cfg, test.explicit, test.noCredentials, test.compatibility)
+			if test.wantErrContains != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErrContains) {
+					t.Fatalf("creationCredentialBundle() error = %v", err)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("creationCredentialBundle() = %q, %v; want %q", got, err, test.want)
+			}
+		})
 	}
 }
 

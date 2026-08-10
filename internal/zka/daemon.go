@@ -19,15 +19,15 @@ import (
 )
 
 type Daemon struct {
-	mu              sync.Mutex
-	lifeMu          sync.Mutex
-	attentionMu     sync.Mutex
-	captureMu       sync.Mutex
-	topologyMu      sync.Mutex
-	cleanupMu       sync.Mutex
-	credentialMu    sync.Mutex
-	pivbReconcileMu sync.Mutex
-	wg              sync.WaitGroup
+	mu                    sync.Mutex
+	lifeMu                sync.Mutex
+	attentionMu           sync.Mutex
+	captureMu             sync.Mutex
+	topologyMu            sync.Mutex
+	cleanupMu             sync.Mutex
+	credentialMu          sync.Mutex
+	credentialMigrationMu sync.Mutex
+	wg                    sync.WaitGroup
 
 	paths    Paths
 	store    *Store
@@ -72,7 +72,8 @@ type Daemon struct {
 	credentialNotices     map[string]credentialNoticeState
 	credentialTransports  map[string]incomingCredentialTransport
 	credentialClaims      map[string]*sync.Mutex
-	pivbLocalListeners    map[string]*localPIVBListener
+	credentialRoutes      map[string]*credentialRouteListener
+	credentialRoutePaths  map[string]string
 	credentialInteractive func() bool
 }
 
@@ -115,11 +116,6 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 	sweptNotifications := 0
 	for _, workspace := range state.Workspaces {
 		normalizeWorkspace(workspace)
-		if workspace.PIVBProvider != nil && workspace.PIVBProvider.Source == "local" {
-			workspace.PIVBProvider.State = "starting"
-			workspace.PIVBProvider.LastError = "daemon restarted; local route listener is pending"
-			workspace.PIVBProvider.UpdatedAt = now
-		}
 		// A reservation can only be owned by a live worker, and at process start
 		// there are none, so anything still marked in flight was lost to a crash
 		// or a kill. Convert it to a retryable failure rather than a phantom
@@ -184,7 +180,8 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 		credentialNotices:    map[string]credentialNoticeState{},
 		credentialTransports: map[string]incomingCredentialTransport{},
 		credentialClaims:     map[string]*sync.Mutex{},
-		pivbLocalListeners:   map[string]*localPIVBListener{},
+		credentialRoutes:     map[string]*credentialRouteListener{},
+		credentialRoutePaths: map[string]string{},
 		cardLease:            newSmartCardLease(),
 	}
 	store.SetOnSave(d.signalAttention)
@@ -242,7 +239,9 @@ func (d *Daemon) Start() error {
 	d.startWorkerLocked(func(ctx context.Context) { d.topologyLoop(ctx) })
 	d.startWorkerLocked(func(ctx context.Context) { d.backendReconcileLoop(ctx) })
 	d.startWorkerLocked(func(ctx context.Context) { d.notificationRetryLoop(ctx) })
-	d.startWorkerLocked(func(ctx context.Context) { d.localPIVBReconcileLoop(ctx) })
+	d.startWorkerLocked(func(ctx context.Context) { d.credentialRouteLoop(ctx) })
+	d.startWorkerLocked(func(ctx context.Context) { d.credentialProviderReconnectLoop(ctx) })
+	d.startWorkerLocked(func(ctx context.Context) { d.credentialEnvironmentMigrationLoop(ctx) })
 	d.startWorkerLocked(func(ctx context.Context) { d.cardLeaseLoop(ctx) })
 	d.lifeMu.Unlock()
 	d.resumeLifecycleCleanup()
@@ -272,10 +271,7 @@ func (d *Daemon) Close() error {
 	}
 	d.remotes.Close()
 	d.lifeMu.Unlock()
-	// Local PIVB listeners can be activated before Start (for example by an
-	// API caller racing daemon startup), so do not rely solely on the
-	// reconciler worker's deferred cleanup to unblock their Accept loops.
-	d.closeAllLocalPIVBListeners()
+	d.closeAllCredentialRoutes()
 	// After the unlock and before the join: the notifier's signal goroutine
 	// calls startWorker, which takes lifeMu. Shutting it down while holding
 	// lifeMu would deadlock, and startWorker's closed check does not help
@@ -699,7 +695,7 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
-		return d.activateLocalPIVB(ctx, req.Workspace, req.Bundle, req.IfUnclaimed)
+		return d.activateLocalCredentialBundle(ctx, req.Workspace, req.Bundle, req.IfUnclaimed, req.CallerSSHAuthSock)
 	case "credentials_endpoint":
 		var req workspaceCredentialRequest
 		if err := decodePayload(raw, &req); err != nil {
@@ -719,6 +715,12 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 				return nil, err
 			}
 			all := d.allCredentialStatuses()
+			for _, candidate := range all.Workspaces {
+				if candidate.WorkspaceID == status.WorkspaceID {
+					status = candidate
+					break
+				}
+			}
 			return credentialStatusResponse{Transport: all.Transport, Workspaces: []workspaceCredentialStatus{status}, ActiveOperations: all.ActiveOperations}, nil
 		}
 		return d.allCredentialStatuses(), nil
@@ -728,15 +730,6 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 			return nil, err
 		}
 		return nil, d.setIncomingCredentialTransport(req)
-	case "credentials_target_snapshot":
-		var req credentialTransportSessionRequest
-		if err := decodePayload(raw, &req); err != nil {
-			return nil, err
-		}
-		if err := d.setIncomingCredentialTransport(req); err != nil {
-			return nil, err
-		}
-		return d.listWorkspaces(), nil
 	case "update_manifest":
 		var req manifestUpdateRequest
 		if err := decodePayload(raw, &req); err != nil {
@@ -1057,6 +1050,12 @@ func (d *Daemon) preparePane(req workspacePaneRequest) (preparePaneResponse, err
 	// and no syscall may run under the global mutex.
 	if req.Pane == "" {
 		req.CWD = d.inheritedCWD(req.Workspace, req.InheritFromPane, req.CWD)
+	}
+	// A new backend receives stable credential paths on first exec. Refuse to
+	// reserve its start until those paths are published, so an eager shell can
+	// never observe ENOENT and a failed preflight remains safely retryable.
+	if err := d.preparePaneCredentialRoutes(d.ctx, req.Workspace, req.Pane); err != nil {
+		return preparePaneResponse{}, err
 	}
 	d.mu.Lock()
 	workspace, err := d.resolveWorkspaceLocked(req.Workspace)
@@ -1465,18 +1464,9 @@ func (d *Daemon) setAttachmentPaneReady(req attachmentPaneReadyRequest) (*Attach
 func panesRequiringCredentialEnvironment(workspace *Workspace) []string {
 	var ids []string
 	for _, pane := range workspace.Panes {
-		if pane.BackendCreated && !pane.BackendDead && !pane.Retiring() && pane.CredentialEnvironmentVersion < credentialEnvironmentVersion {
-			ids = append(ids, pane.ID)
-		}
-	}
-	sort.Strings(ids)
-	return ids
-}
-
-func panesWithLegacyCredentialEnvironment(workspace *Workspace) []string {
-	var ids []string
-	for _, pane := range workspace.Panes {
-		if pane.BackendCreated && !pane.BackendDead && !pane.Retiring() && pane.CredentialEnvironmentVersion == legacyCredentialEnvironmentVersion {
+		liveLegacyBackend := pane.BackendCreated && !pane.BackendDead
+		incompleteMigration := pane.CredentialMigrationState != ""
+		if !pane.Retiring() && pane.CredentialEnvironmentVersion == 0 && (liveLegacyBackend || incompleteMigration) {
 			ids = append(ids, pane.ID)
 		}
 	}
@@ -2061,12 +2051,6 @@ func (d *Daemon) detachAttachment(workspaceRef, attachmentID string) (*Workspace
 		workspace.Revision++
 	}
 	workspace.PendingRevocations = removeString(workspace.PendingRevocations, attachmentID)
-	if workspace.CredentialClaim != nil && workspace.CredentialClaim.OwnerAttachmentID == attachmentID {
-		workspace.CredentialClaim = nil
-	}
-	if workspace.PIVBProvider != nil && workspace.PIVBProvider.Source == "attachment" && workspace.PIVBProvider.OwnerAttachmentID == attachmentID {
-		workspace.PIVBProvider = nil
-	}
 	if err := d.store.Save(d.state); err != nil {
 		return nil, err
 	}
@@ -2128,11 +2112,18 @@ func (d *Daemon) applyEvent(_ context.Context, event Event) (*Workspace, error) 
 		pane.Process = ProcessStatus{Running: true, PID: event.PID, Started: now}
 		pane.BackendCreated, pane.BackendReady, pane.BackendStart = true, true, false
 		pane.CredentialEnvironmentVersion = event.CredentialEnvironmentVersion
+		if event.CredentialEnvironmentVersion == credentialEnvironmentVersion {
+			pane.CredentialMigrationState, pane.CredentialMigrationError = "", ""
+		}
 		pane.BackendDead, pane.BackendError = false, ""
 	case "process_exit":
 		pane.Process.Running, pane.Process.PID, pane.Process.ExitCode, pane.Process.Exited = false, 0, event.ExitCode, now
 		pane.BackendReady, pane.BackendStart = false, false
 		pane.BackendDead, pane.BackendError = true, event.Detail
+		if pane.CredentialMigrationState != "" {
+			pane.CredentialMigrationState = credentialMigrationFailed
+			pane.CredentialMigrationError = "replacement pane backend exited before managed credentials became ready"
+		}
 		if pane.BackendError == "" {
 			pane.BackendError = "backend process exited"
 		}

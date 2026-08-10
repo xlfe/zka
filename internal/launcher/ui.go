@@ -108,6 +108,7 @@ type ui struct {
 	localList         widget.List
 	remoteList        widget.List
 	remoteCredentials widget.Bool
+	createCredentials widget.Bool
 	nameEditor        widget.Editor
 	hostEditor        widget.Editor
 	remoteNameEditor  widget.Editor
@@ -588,7 +589,7 @@ func (ui *ui) handleEditorEvents(gtx layout.Context) {
 		}
 		switch ui.screen {
 		case screenCreate:
-			ui.launch(createArgs(ui.nameEditor.Text()), "Creating workspace…")
+			ui.launch(createArgs(ui.nameEditor.Text(), ui.createCredentials.Value), "Creating workspace…")
 		case screenRemoteHost:
 			ui.loadRemote(ui.hostEditor.Text())
 		case screenRemoteCreate:
@@ -638,7 +639,7 @@ func (ui *ui) handleClicks(gtx layout.Context) {
 		}
 	case screenCreate:
 		if ui.primaryButton.Clicked(gtx) {
-			ui.launch(createArgs(ui.nameEditor.Text()), "Creating workspace…")
+			ui.launch(createArgs(ui.nameEditor.Text(), ui.createCredentials.Value), "Creating workspace…")
 		}
 	case screenRemoteHost:
 		if ui.primaryButton.Clicked(gtx) {
@@ -706,6 +707,7 @@ func (ui *ui) openCreate() {
 		return
 	}
 	ui.screen = screenCreate
+	ui.createCredentials.Value = ui.credentialsEnabled && ui.defaultBundle != ""
 	ui.errorMessage = ""
 	ui.status = ""
 	ui.focusPending = &ui.nameEditor
@@ -726,6 +728,7 @@ func (ui *ui) openRemoteCreate() {
 		return
 	}
 	ui.screen = screenRemoteCreate
+	ui.remoteCredentials.Value = ui.credentialsEnabled && ui.defaultBundle != ""
 	ui.errorMessage = ""
 	ui.status = ""
 	ui.focusPending = &ui.remoteNameEditor
@@ -751,10 +754,11 @@ func remoteAttachArgs(host string, workspace *zka.Workspace, claimCredentials bo
 func remoteCreateArgs(host, name string, claimCredentials bool, bundle string) []string {
 	args := createRemoteArgs(host, name)
 	if claimCredentials {
-		args = append(args, "--claim-credentials")
 		if bundle != "" {
 			args = append(args, "--credential-bundle", bundle)
 		}
+	} else {
+		args = append(args, "--no-credentials")
 	}
 	return args
 }
@@ -828,10 +832,15 @@ func workspaceCredentialSummary(workspace *zka.Workspace, remoteHost, localNodeI
 	owner := "another machine"
 	if localNodeID != "" && claim.OwnerNodeID == localNodeID {
 		owner = "this machine"
-	} else if attachment := workspace.Attachments[claim.OwnerAttachmentID]; attachment != nil {
-		owner = strings.TrimSpace(attachment.Node.Name)
-		if owner == "" {
-			owner = shortID(claim.OwnerNodeID)
+	} else {
+		for _, attachment := range workspace.Attachments {
+			if attachment != nil && attachment.Node.ID == claim.OwnerNodeID {
+				owner = strings.TrimSpace(attachment.Node.Name)
+				if owner == "" {
+					owner = shortID(claim.OwnerNodeID)
+				}
+				break
+			}
 		}
 	}
 	if owner == "" {
@@ -862,6 +871,9 @@ func (ui *ui) back() {
 	case screenRemoteCreate:
 		ui.errorMessage = ""
 		ui.status = ""
+		// Existing-workspace attachment is deliberately opt-in even when the
+		// create screen defaulted credentials on.
+		ui.remoteCredentials.Value = false
 		ui.screen = screenRemoteList
 		ui.clampSelection()
 	case screenForget:
@@ -947,6 +959,12 @@ func (ui *ui) forgetSelection() {
 
 func (ui *ui) toggleCredentialSelection() {
 	if ui.busy {
+		return
+	}
+	if ui.screen == screenCreate {
+		if ui.credentialsEnabled && ui.defaultBundle != "" {
+			ui.createCredentials.Value = !ui.createCredentials.Value
+		}
 		return
 	}
 	if ui.screen == screenRemoteList {
@@ -1089,6 +1107,7 @@ func (ui *ui) layoutCreate(gtx layout.Context) layout.Dimensions {
 					return ui.editor(gtx, &ui.nameEditor, "e.g. example-project")
 				})
 			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.layoutCreateCredentialOption(gtx) }),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.operationMessage(gtx) }),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Top: 18}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -1240,18 +1259,50 @@ func (ui *ui) layoutRemoteCredentialOption(gtx layout.Context, key string) layou
 	return layout.Inset{Top: 12, Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		if !ui.credentialsEnabled || ui.defaultBundle == "" {
 			ui.remoteCredentials.Value = false
-			return ui.message(gtx, key+":credentials-disabled", "Set a default credential bundle to claim credentials while attaching.", false)
+			detail := "Set a default credential bundle to claim credentials while attaching."
+			if ui.screen == screenRemoteCreate {
+				detail = "No default credential bundle is configured; this workspace will start unclaimed."
+			}
+			return ui.message(gtx, key+":credentials-disabled", detail, false)
+		}
+		creating := ui.screen == screenRemoteCreate
+		labelText := "Claim " + ui.defaultBundle + " credentials from this machine"
+		helpText := "Credentials change only because this is an explicit attachment claim."
+		if creating {
+			labelText = "Use " + ui.defaultBundle + " credentials from this machine"
+			helpText = "The creating machine remains the provider until release or an explicit transfer."
 		}
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				style := material.CheckBox(ui.theme, &ui.remoteCredentials, "Claim "+ui.defaultBundle+" credentials from this machine")
+				style := material.CheckBox(ui.theme, &ui.remoteCredentials, labelText)
 				return style.Layout(gtx)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Left: 34}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					label := material.Caption(ui.theme, "The selected bundle is claimed after attach and remains claimed until release or owner detach.")
+					label := material.Caption(ui.theme, helpText)
 					label.Color = ui.colors.muted
 					return ui.selectableLabel(gtx, key+":credentials-help", label)
+				})
+			}),
+		)
+	})
+}
+
+func (ui *ui) layoutCreateCredentialOption(gtx layout.Context) layout.Dimensions {
+	return layout.Inset{Top: 12, Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		if !ui.credentialsEnabled || ui.defaultBundle == "" {
+			ui.createCredentials.Value = false
+			return ui.message(gtx, "create:credentials-disabled", "No default credential bundle is configured; this workspace will start unclaimed.", false)
+		}
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return material.CheckBox(ui.theme, &ui.createCredentials, "Use "+ui.defaultBundle+" credentials from this machine").Layout(gtx)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Left: 34}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					label := material.Caption(ui.theme, "The creating machine remains the provider until release or an explicit transfer.")
+					label.Color = ui.colors.muted
+					return ui.selectableLabel(gtx, "create:credentials-help", label)
 				})
 			}),
 		)

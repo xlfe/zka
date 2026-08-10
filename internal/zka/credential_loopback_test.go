@@ -153,18 +153,15 @@ func TestCredentialLoopbackSignsAndVerifiesGitCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := origin.setIncomingCredentialTransport(credentialTransportSessionRequest{Provider: providerNode, State: "ready"}); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := origin.claimWorkspaceCredentials(ctx, workspaceCredentialRequest{
-		Workspace: workspace.ID, Attachment: attachment.ID, Bundle: "work", Manifest: manifest,
+		Workspace: workspace.ID, Bundle: "work", Provider: providerNode, ProviderSource: "remote", Manifest: manifest,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	// Reconciliation may replay preparation after any control reconnect. The
 	// same manifest must therefore be harmless when prepared again.
 	if _, err := origin.claimWorkspaceCredentials(ctx, workspaceCredentialRequest{
-		Workspace: workspace.ID, Attachment: attachment.ID, Bundle: "work", Manifest: manifest,
+		Workspace: workspace.ID, Bundle: "work", Provider: providerNode, ProviderSource: "remote", Manifest: manifest,
 	}); err != nil {
 		t.Fatalf("idempotent claim preparation: %v", err)
 	}
@@ -182,6 +179,10 @@ func TestCredentialLoopbackSignsAndVerifiesGitCommit(t *testing.T) {
 	}
 	targetSocket := strings.TrimSpace(runCredentialTestCommand(t, providerEnv, gpgconf, "--homedir", targetHome, "--list-dirs", "agent-socket"))
 	waitForCredentialSocket(t, targetSocket)
+	targetSocketInfo, err := os.Lstat(targetSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	repository := filepath.Join(root, "repository")
 	if err := os.MkdirAll(repository, 0o700); err != nil {
@@ -221,8 +222,21 @@ func TestCredentialLoopbackSignsAndVerifiesGitCommit(t *testing.T) {
 	}
 	_ = conn.Close()
 	targets.close()
-	if _, err := os.Lstat(targetSocket); !os.IsNotExist(err) {
-		t.Fatalf("credential socket survived transport close: %v", err)
+	currentSocketInfo, err := os.Lstat(targetSocket)
+	if err != nil {
+		t.Fatalf("stable credential socket disappeared after transport close: %v", err)
+	}
+	if !os.SameFile(targetSocketInfo, currentSocketInfo) {
+		t.Fatal("transport close replaced the stable credential socket")
+	}
+	unavailable, err := net.DialTimeout("unix", targetSocket, time.Second)
+	if err != nil {
+		t.Fatalf("dial stable credential socket after transport close: %v", err)
+	}
+	defer unavailable.Close()
+	_ = unavailable.SetReadDeadline(time.Now().Add(time.Second))
+	if greeting, err := readAssuanLine(bufio.NewReaderSize(unavailable, assuanLineMax)); err == nil {
+		t.Fatalf("credential route remained usable after transport close: %q", greeting)
 	}
 }
 

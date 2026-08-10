@@ -406,14 +406,11 @@ func runPIVBCredentialTargetProxy(t *testing.T, card CredentialPIVBCard, trusted
 	t.Helper()
 	client, sandbox := net.Pipe()
 	stream, provider := net.Pipe()
-	listener := &credentialTargetListener{
-		capability: credentialCapabilityPIVB, done: make(chan struct{}), active: map[net.Conn]struct{}{},
-		pivbCard: card, pivbContext: trusted,
-	}
-	listener.active[client] = struct{}{}
 	proxyDone := make(chan struct{})
 	go func() {
-		listener.proxy(context.Background(), client, stream)
+		proxyRemotePIVBResponse(stream, client, card, trusted)
+		_ = client.Close()
+		_ = stream.Close()
 		close(proxyDone)
 	}()
 	remoteDone := make(chan error, 1)
@@ -511,79 +508,7 @@ func TestPIVBProxyCancelsLocalMintWhenClientDisconnects(t *testing.T) {
 	}
 }
 
-func TestLocalPIVBListenerRejectsConnectionAcceptedBeforeTakeover(t *testing.T) {
-	d, err := newTestDaemon(t, testRoot(t), quietRunner())
-	if err != nil {
-		t.Fatal(err)
-	}
-	workspace := createTestWorkspace(t, d, 1)
-	binding := WorkspacePIVBProvider{Source: "local", Bundle: "work", Generation: 1, State: "ready"}
-	d.mu.Lock()
-	d.state.Workspaces[workspace.ID].PIVBProvider = &binding
-	if err := d.store.Save(d.state); err != nil {
-		d.mu.Unlock()
-		t.Fatal(err)
-	}
-	d.mu.Unlock()
-	listener, err := d.startLocalPIVBListener(workspace.ID, binding)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(listener.close)
-
-	// Hold the state lock so serve accepts and records the connection but
-	// cannot authorize it until after the replacement is committed.
-	d.mu.Lock()
-	client, err := net.Dial("unix", listener.path)
-	if err != nil {
-		d.mu.Unlock()
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	accepted := false
-	for time.Now().Before(deadline) {
-		listener.mu.Lock()
-		accepted = len(listener.active) == 1
-		listener.mu.Unlock()
-		if accepted {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !accepted {
-		d.mu.Unlock()
-		_ = client.Close()
-		t.Fatal("local PIVB listener did not accept connection")
-	}
-	d.state.Workspaces[workspace.ID].PIVBProvider = &WorkspacePIVBProvider{
-		Source: "attachment", Bundle: "work", Generation: 2, State: "ready", OwnerAttachmentID: "remote",
-	}
-	if err := d.store.Save(d.state); err != nil {
-		d.mu.Unlock()
-		_ = client.Close()
-		t.Fatal(err)
-	}
-	d.mu.Unlock()
-
-	if err := client.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	resp, err := http.ReadResponse(bufio.NewReader(client), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	responseBody, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	_ = client.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(responseBody), "local PIVB route has been replaced") {
-		t.Fatalf("post-takeover response = %d %s", resp.StatusCode, responseBody)
-	}
-}
-
-func TestActivateLocalPIVBIsWorkspaceScopedAndCannotReplaceRemote(t *testing.T) {
+func TestPIVBBindingTransfersWithoutReplacingStableWorkspaceRoute(t *testing.T) {
 	card := testPIVBCard(t)
 	handler := http.NewServeMux()
 	handler.HandleFunc("GET /v1/describe", func(w http.ResponseWriter, _ *http.Request) {
@@ -610,7 +535,7 @@ func TestActivateLocalPIVBIsWorkspaceScopedAndCannotReplaceRemote(t *testing.T) 
 	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": bundle}
 	d.config.Credentials.PIVB.ForwardSocket = serveFakePIVB(t, handler)
 	workspace := createTestWorkspace(t, d, 1)
-	status, err := d.activateLocalPIVB(context.Background(), workspace.ID, "work", false)
+	status, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,23 +543,29 @@ func TestActivateLocalPIVBIsWorkspaceScopedAndCannotReplaceRemote(t *testing.T) 
 		t.Fatalf("local status = %#v", status)
 	}
 	d.credentialMu.Lock()
-	localListener := d.pivbLocalListeners[workspace.ID]
+	stableRoute := d.credentialRoutes[credentialRouteKey(workspace.ID, credentialCapabilityPIVB)]
 	d.credentialMu.Unlock()
-	if localListener == nil {
-		t.Fatal("local activation reported ready without publishing its listener")
+	if stableRoute == nil {
+		t.Fatal("local activation reported ready without publishing the stable workspace route")
 	}
-	firstGeneration := d.state.Workspaces[workspace.ID].PIVBProvider.Generation
-	if _, err := d.activateLocalPIVB(context.Background(), workspace.ID, "work", false); err != nil {
+	d.mu.Lock()
+	firstGeneration := d.state.Workspaces[workspace.ID].CredentialClaim.Generation
+	d.mu.Unlock()
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, ""); err != nil {
 		t.Fatal(err)
 	}
-	if got := d.state.Workspaces[workspace.ID].PIVBProvider.Generation; got != firstGeneration {
-		t.Fatalf("idempotent local activation changed generation from %d to %d", firstGeneration, got)
+	d.mu.Lock()
+	gotGeneration := d.state.Workspaces[workspace.ID].CredentialClaim.Generation
+	d.mu.Unlock()
+	if gotGeneration != firstGeneration {
+		t.Fatalf("idempotent local activation changed generation from %d to %d", firstGeneration, gotGeneration)
 	}
 	endpoint, err := d.pivbEndpoint(workspace.ID)
 	if err != nil || endpoint.Source != "local" || endpoint.Socket == "" {
 		t.Fatalf("endpoint = %#v, %v", endpoint, err)
 	}
 	attachment := readyCredentialAttachment(t, d, workspace, "remote", "provider")
+	readyCredentialTransport(t, d, attachment.Node)
 	manifest := &CredentialPIVBManifest{
 		ProtocolVersion:  pivbForwardProtocolVersion,
 		ProviderResource: "projects/1/locations/global/workloadIdentityPools/pool/providers/provider",
@@ -643,39 +574,40 @@ func TestActivateLocalPIVBIsWorkspaceScopedAndCannotReplaceRemote(t *testing.T) 
 		Card:             card,
 	}
 	if _, err := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
-		Workspace: workspace.ID, Attachment: attachment.ID, Bundle: "work",
+		Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: "work",
 		Manifest: credentialBundleManifest{Bundle: "work", PIVB: manifest},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	d.mu.Lock()
-	remoteProvider := d.state.Workspaces[workspace.ID].PIVBProvider
+	remoteProvider := d.state.Workspaces[workspace.ID].CredentialClaim
 	d.mu.Unlock()
-	if remoteProvider == nil || remoteProvider.Source != "attachment" || remoteProvider.OwnerAttachmentID != attachment.ID || remoteProvider.Generation <= firstGeneration {
+	if remoteProvider == nil || remoteProvider.ProviderSource != "remote" || remoteProvider.OwnerNodeID != attachment.Node.ID || remoteProvider.Generation <= firstGeneration {
 		t.Fatalf("remote provider did not atomically replace local provider: %#v", remoteProvider)
 	}
 	d.credentialMu.Lock()
-	staleLocal := d.pivbLocalListeners[workspace.ID]
+	currentRoute := d.credentialRoutes[credentialRouteKey(workspace.ID, credentialCapabilityPIVB)]
 	d.credentialMu.Unlock()
-	if staleLocal != nil || d.localPIVBBindingCurrent(workspace.ID, firstGeneration) {
-		t.Fatalf("local route remained authorized after remote takeover: listener=%#v", staleLocal)
+	if currentRoute != stableRoute {
+		t.Fatal("provider transfer replaced the pane-facing workspace route")
 	}
-	if noOp, err := d.activateLocalPIVB(context.Background(), workspace.ID, "work", true); err != nil || noOp.OwnerAttachment != attachment.ID {
+	if noOp, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", true, ""); err != nil || noOp.OwnerNode != attachment.Node.ID {
 		t.Fatalf("if-unclaimed activation changed or rejected remote route: status=%#v err=%v", noOp, err)
 	}
-	if _, err := d.activateLocalPIVB(context.Background(), workspace.ID, "work", false); err == nil || !strings.Contains(err.Error(), "will not replace") {
-		t.Fatalf("remote route replacement error = %v", err)
+	localAgain, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "")
+	if err != nil || localAgain.OwnerNode != d.state.Node.ID {
+		t.Fatalf("explicit local transfer = %#v, %v", localAgain, err)
 	}
 	if _, err := d.releaseWorkspaceCredentials(workspace.ID); err != nil {
 		t.Fatal(err)
 	}
 	endpoint, err = d.pivbEndpoint(workspace.ID)
-	if err != nil || endpoint.State != "unclaimed" || d.state.Workspaces[workspace.ID].PIVBProvider != nil {
-		t.Fatalf("release silently restored a PIVB provider: endpoint=%#v provider=%#v err=%v", endpoint, d.state.Workspaces[workspace.ID].PIVBProvider, err)
+	if err != nil || endpoint.State != "unclaimed" || d.state.Workspaces[workspace.ID].CredentialClaim != nil {
+		t.Fatalf("release silently restored a provider: endpoint=%#v claim=%#v err=%v", endpoint, d.state.Workspaces[workspace.ID].CredentialClaim, err)
 	}
 }
 
-func TestCredentialTransportDegradationPreservesLocalPIVB(t *testing.T) {
+func TestCredentialTransportDegradationDoesNotAffectLocalBundle(t *testing.T) {
 	status := workspaceCredentialStatus{
 		State: "ready",
 		Capabilities: map[string]credentialCapabilityView{
@@ -683,10 +615,10 @@ func TestCredentialTransportDegradationPreservesLocalPIVB(t *testing.T) {
 			credentialCapabilityPIVB: {State: "ready", Available: true, Detail: "local YubiKey"},
 		},
 	}
-	workspace := &Workspace{PIVBProvider: &WorkspacePIVBProvider{Source: "local", State: "ready"}}
+	workspace := &Workspace{CredentialClaim: &CredentialClaim{ProviderSource: "local", State: "ready"}}
 	degradeCredentialStatus(&status, workspace)
-	if status.Capabilities[credentialCapabilitySSH].Available {
-		t.Fatal("disconnected credential transport left SSH available")
+	if !status.Capabilities[credentialCapabilitySSH].Available {
+		t.Fatal("remote transport degradation blanked local SSH")
 	}
 	if pivb := status.Capabilities[credentialCapabilityPIVB]; !pivb.Available || pivb.State != "ready" || pivb.Detail != "local YubiKey" {
 		t.Fatalf("transport degradation incorrectly blanked local PIVB: %#v", pivb)
@@ -719,17 +651,17 @@ func TestLocalPIVBListenerFailureIsPersistedAsDegraded(t *testing.T) {
 	}
 	defer blocker.Close()
 
-	if _, err := d.activateLocalPIVB(context.Background(), workspace.ID, "work", false); err == nil {
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, ""); err == nil {
 		t.Fatal("local activation reported success while another live listener owned the route")
 	}
 	d.mu.Lock()
-	provider := d.state.Workspaces[workspace.ID].PIVBProvider
+	claim := d.state.Workspaces[workspace.ID].CredentialClaim
 	d.mu.Unlock()
-	if provider == nil || provider.State != "degraded" || provider.LastError == "" {
-		t.Fatalf("listener failure was not observable in provider state: %#v", provider)
+	if claim != nil {
+		t.Fatalf("listener failure published a partial credential claim: %#v", claim)
 	}
 	endpoint, err := d.pivbEndpoint(workspace.ID)
-	if err != nil || endpoint.State != "degraded" || endpoint.Detail == "" {
-		t.Fatalf("degraded endpoint = %#v, %v", endpoint, err)
+	if err != nil || endpoint.State != "unclaimed" {
+		t.Fatalf("unclaimed endpoint = %#v, %v", endpoint, err)
 	}
 }

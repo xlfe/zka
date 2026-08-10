@@ -566,6 +566,10 @@ func (d *Daemon) reconcileBackends(ctx context.Context, workspaceRef string) (ba
 		pending, live, established, removalPending := false, false, false, false
 		workspaceChanged := false
 		for paneID, pane := range workspace.Panes {
+			if pane.CredentialMigrationState == credentialMigrationPending || pane.CredentialMigrationState == credentialMigrationStarting || pane.CredentialMigrationState == credentialMigrationFailed {
+				pending = true
+				continue
+			}
 			if pane.Retiring() {
 				removalPending = true
 				continue

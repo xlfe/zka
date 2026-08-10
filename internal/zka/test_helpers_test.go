@@ -227,6 +227,20 @@ func serveTestDaemon(t testing.TB, d *Daemon) {
 	waitFor(t, func() bool { _, err := os.Stat(d.paths.Socket); return err == nil })
 }
 
+func readyCredentialTransport(t testing.TB, d *Daemon, provider Host) string {
+	t.Helper()
+	path := filepath.Join(d.paths.RuntimeDir, "test-credential-transport-"+shortID(provider.ID)+".sock")
+	listener, err := listenUnix(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	if err := d.setIncomingCredentialTransport(credentialTransportSessionRequest{Provider: provider, State: "ready", Endpoint: path}); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func createTestWorkspace(t testing.TB, daemon *Daemon, panes int) *Workspace {
 	t.Helper()
 	specs := make([]PaneSpec, panes)

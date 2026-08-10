@@ -11,11 +11,11 @@ import (
 )
 
 const (
-	// Version 2 was projected into every new pane, including authoritative
-	// local panes. Version 3 means the backend was created through a remote SSH
-	// attachment and deliberately received the managed credential endpoints.
+	// Version 2 projected managed paths into every pane. Version 3 introduced
+	// the accidental local/remote split. Version 4 restores one stable managed
+	// environment for every newly created pane.
 	legacyCredentialEnvironmentVersion = 2
-	credentialEnvironmentVersion       = 3
+	credentialEnvironmentVersion       = 4
 	agentRelayDialTimeout              = 500 * time.Millisecond
 )
 

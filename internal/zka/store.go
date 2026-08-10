@@ -45,8 +45,8 @@ func (s *Store) Ensure() error {
 // Load intentionally treats the pre-v3 schemas as empty state. v3 changes
 // process ownership: Kitty view closure now removes its zmx backend. Migrating
 // the old records would make that ownership ambiguous, so only zka's generated
-// files are reset. Schemas v3-v7 migrate to the current schema. Existing zmx
-// processes are deliberately left untouched, and v4-v7 receive a one-time
+// files are reset. Schemas v3-v8 migrate to the current schema. Existing zmx
+// processes are deliberately left untouched, and v4-v8 receive a one-time
 // rollback backup before migration.
 func (s *Store) Load() (StateData, error) {
 	if err := s.Ensure(); err != nil {
@@ -80,7 +80,7 @@ func (s *Store) Load() (StateData, error) {
 	if header.SchemaVersion < 3 || header.SchemaVersion > stateSchemaVersion {
 		return StateData{}, fmt.Errorf("unsupported state schema %d (want %d)", header.SchemaVersion, stateSchemaVersion)
 	}
-	if header.SchemaVersion == 4 || header.SchemaVersion == 5 || header.SchemaVersion == 6 || header.SchemaVersion == 7 {
+	if header.SchemaVersion >= 4 && header.SchemaVersion < stateSchemaVersion {
 		if err := s.writeMigrationBackup(b, header.SchemaVersion); err != nil {
 			return StateData{}, err
 		}
@@ -102,6 +102,9 @@ func (s *Store) Load() (StateData, error) {
 	}
 	for _, workspace := range state.Workspaces {
 		normalizeWorkspace(workspace)
+		if header.SchemaVersion < 9 {
+			migrateWorkspaceCredentialBinding(workspace)
+		}
 		if legacy {
 			now := time.Now().UTC()
 			for id, pane := range workspace.Panes {
@@ -153,11 +156,82 @@ func (s *Store) Load() (StateData, error) {
 			attachment.ReconcileStatus = "pending"
 		}
 	}
-	// Zero remains meaningful: it denotes a local or pre-managed backend. A
-	// remote claim may require recreating it, while an unclaimed local workspace
-	// should leave it alone.
+	for _, remote := range state.Remotes {
+		if remote == nil {
+			continue
+		}
+		if remote.Workspaces == nil {
+			remote.Workspaces = map[string]*Workspace{}
+		}
+		for _, workspace := range remote.Workspaces {
+			normalizeWorkspace(workspace)
+			if header.SchemaVersion < 9 {
+				migrateWorkspaceCredentialBinding(workspace)
+			}
+		}
+	}
+	// Zero remains meaningful: it denotes the direct-credential regression.
+	// zkad's guarded startup migration handles those live backends after state
+	// loading; schema migration itself never terminates a process.
 	state.SchemaVersion = stateSchemaVersion
 	return state, nil
+}
+
+func migrateWorkspaceCredentialBinding(workspace *Workspace) {
+	claim := workspace.CredentialClaim
+	legacyPIVB := workspace.PIVBProvider
+	if claim != nil {
+		claim.ProviderSource = "remote"
+		claim.OwnerAttachmentID = ""
+	}
+	if legacyPIVB == nil {
+		return
+	}
+	if claim == nil {
+		source := legacyPIVB.Source
+		if source == "attachment" {
+			source = "remote"
+		}
+		workspace.CredentialClaim = &CredentialClaim{
+			ProviderSource: source, Bundle: legacyPIVB.Bundle, OwnerNodeID: legacyPIVB.OwnerNodeID,
+			Generation: legacyPIVB.Generation, State: legacyPIVB.State,
+			Capabilities: map[string]CredentialCapabilityStatus{
+				credentialCapabilityPIVB: {
+					State: legacyPIVB.State, Available: legacyPIVB.State == "ready",
+					Detail: legacyPIVB.LastError,
+				},
+			},
+			PIVB: clonePIVBManifest(&legacyPIVB.Manifest), UpdatedAt: legacyPIVB.UpdatedAt,
+		}
+		workspace.PIVBProvider = nil
+		return
+	}
+	if legacyPIVB.Source == "attachment" && legacyPIVB.OwnerNodeID == claim.OwnerNodeID && legacyPIVB.Bundle == claim.Bundle {
+		claim.PIVB = clonePIVBManifest(&legacyPIVB.Manifest)
+		if claim.Capabilities == nil {
+			claim.Capabilities = map[string]CredentialCapabilityStatus{}
+		}
+		claim.Capabilities[credentialCapabilityPIVB] = CredentialCapabilityStatus{State: "ready", Available: true}
+		workspace.PIVBProvider = nil
+		return
+	}
+	// V8 allowed a remote SSH/OpenPGP owner and an unrelated local PIVB owner.
+	// V9 cannot silently choose between them. Preserve the legacy record for
+	// diagnostics/recovery and fail the unified binding closed until release or
+	// an explicit whole-bundle claim resolves it.
+	claim.State = "migration_conflict"
+	if claim.Capabilities == nil {
+		claim.Capabilities = map[string]CredentialCapabilityStatus{}
+	}
+	for name, capability := range claim.Capabilities {
+		capability.State = "unavailable"
+		capability.Available = false
+		capability.Detail = appendCredentialDetail(capability.Detail, "legacy split-provider state requires explicit release or transfer")
+		claim.Capabilities[name] = capability
+	}
+	claim.Capabilities[credentialCapabilityPIVB] = CredentialCapabilityStatus{
+		State: "unavailable", Available: false, Detail: "legacy local PIVB provider conflicts with the remote bundle owner",
+	}
 }
 
 // decodeLegacyPanePhases maps the pre-v6 boolean flags onto the explicit pane
@@ -266,6 +340,19 @@ func normalizeWorkspace(workspace *Workspace) {
 	}
 	if workspace.CredentialClaim != nil && workspace.CredentialClaim.Capabilities == nil {
 		workspace.CredentialClaim.Capabilities = map[string]CredentialCapabilityStatus{}
+	}
+	if workspace.CredentialClaim != nil && workspace.CredentialClaim.Generation > workspace.CredentialGeneration {
+		workspace.CredentialGeneration = workspace.CredentialClaim.Generation
+	}
+	if workspace.PIVBProvider != nil && workspace.PIVBProvider.Generation > workspace.CredentialGeneration {
+		workspace.CredentialGeneration = workspace.PIVBProvider.Generation
+	}
+	if workspace.CredentialClaim != nil && workspace.CredentialClaim.ProviderSource == "" {
+		if workspace.CredentialClaim.OwnerAttachmentID == "" && workspace.CredentialClaim.OwnerNodeID == workspace.Origin.ID {
+			workspace.CredentialClaim.ProviderSource = "local"
+		} else {
+			workspace.CredentialClaim.ProviderSource = "remote"
+		}
 	}
 	for _, pane := range workspace.Panes {
 		if pane.Notifications == nil {

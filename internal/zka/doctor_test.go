@@ -22,21 +22,18 @@ func TestCurrentPaneCredentialEnvironmentDoctorCheck(t *testing.T) {
 
 	t.Setenv("ZKA_PANE_ID", "pane")
 	t.Setenv("ZKA_WORKSPACE_ID", "workspace")
-	if check, unsafe := currentPaneCredentialEnvironmentDoctorCheck(paths); !check.OK || unsafe || !strings.Contains(check.Detail, "inherits the local") {
-		t.Fatalf("local pane check = %#v unsafe=%v", check, unsafe)
+	if check, unsafe := currentPaneCredentialEnvironmentDoctorCheck(paths); check.OK || !unsafe || !strings.Contains(check.Detail, "version 0") {
+		t.Fatalf("version-0 pane check = %#v unsafe=%v", check, unsafe)
 	}
 
 	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "2")
 	check, unsafe := currentPaneCredentialEnvironmentDoctorCheck(paths)
-	if check.OK || !unsafe || !strings.Contains(check.Detail, agentRelaySocketPath(paths.AgentDir, "workspace")) {
-		t.Fatalf("legacy pane check = %#v unsafe=%v", check, unsafe)
-	}
-	if !strings.Contains(check.Detail, filepath.Join(paths.StateDir, "credentials", "workspace", "gnupg")) || strings.Contains(check.Detail, "agent-extra-socket") {
-		t.Fatalf("legacy pane exposed the wrong paths: %q", check.Detail)
+	if !check.OK || unsafe || !strings.Contains(check.Detail, "managed credential environment v2") {
+		t.Fatalf("v2 managed pane check = %#v unsafe=%v", check, unsafe)
 	}
 
 	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "3")
-	if check, unsafe = currentPaneCredentialEnvironmentDoctorCheck(paths); !check.OK || unsafe || !strings.Contains(check.Detail, "managed remote") {
+	if check, unsafe = currentPaneCredentialEnvironmentDoctorCheck(paths); !check.OK || unsafe || !strings.Contains(check.Detail, "managed credential environment v3") {
 		t.Fatalf("remote pane check = %#v unsafe=%v", check, unsafe)
 	}
 }
@@ -63,7 +60,7 @@ func TestDoctorLegacyPaneSkipsContaminatedProviderChecks(t *testing.T) {
 	t.Setenv("ZKA_CONFIG", configPath)
 	t.Setenv("ZKA_PANE_ID", "pane")
 	t.Setenv("ZKA_WORKSPACE_ID", "workspace")
-	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "2")
+	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "0")
 
 	var stdout, stderr bytes.Buffer
 	code, err := runDoctor(nil, d.paths, &stdout, &stderr)

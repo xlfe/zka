@@ -845,10 +845,11 @@ func runRemoteControlSession(ctx context.Context, paths Paths, stdin io.Reader, 
 		return err
 	}
 	writer := &remoteControlWriter{enc: json.NewEncoder(chunkedWriter{w: stdout})}
-	if err := writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: remoteProtocolVersion, Type: "hello", Capabilities: []string{"workspace-snapshots", "events", "two-phase-move", "revocation", "workspace-lifecycle", "stream-mux-v1", "credential-bundles-v2", "topology-replica-v1", "workspace-create"}, Payload: helloPayload}); err != nil {
+	if err := writer.send(remoteEnvelope{Protocol: remoteProtocolName, Version: remoteProtocolVersion, Type: "hello", Capabilities: []string{"workspace-snapshots", "events", "two-phase-move", "revocation", "workspace-lifecycle", "stream-mux-v1", "credential-bundles-v3", "topology-replica-v1", "workspace-create"}, Payload: helloPayload}); err != nil {
 		return err
 	}
 	var credentialTargets *credentialTargetSession
+	var credentialProvider Host
 	credentialIdentityErr := errors.New("credential provider identity handshake has not completed")
 	defer func() {
 		if credentialTargets != nil {
@@ -897,6 +898,7 @@ func runRemoteControlSession(ctx context.Context, paths Paths, stdin io.Reader, 
 					credentialIdentityErr = targetErr
 				} else {
 					credentialTargets = targets
+					credentialProvider = hello.Node
 				}
 			}
 			ack := remoteEnvelope{Protocol: remoteProtocolName, Version: remoteProtocolVersion, Type: "client_hello_ack"}
@@ -914,7 +916,11 @@ func runRemoteControlSession(ctx context.Context, paths Paths, stdin io.Reader, 
 		} else if message.Op == "credentials_claim" && credentialIdentityErr != nil {
 			response.Error = credentialIdentityErr.Error()
 		} else {
-			response.Payload, err = dispatchRemoteControl(ctx, api, message.Op, message.Payload)
+			dispatchCtx := ctx
+			if credentialProvider.ID != "" {
+				dispatchCtx = context.WithValue(ctx, credentialProviderContextKey{}, credentialProvider)
+			}
+			response.Payload, err = dispatchRemoteControl(dispatchCtx, api, message.Op, message.Payload)
 			if err != nil {
 				response.Error = err.Error()
 				response.Payload = nil
@@ -926,6 +932,13 @@ func runRemoteControlSession(ctx context.Context, paths Paths, stdin io.Reader, 
 			return err
 		}
 	}
+}
+
+type credentialProviderContextKey struct{}
+
+func authenticatedCredentialProvider(ctx context.Context) Host {
+	provider, _ := ctx.Value(credentialProviderContextKey{}).(Host)
+	return provider
 }
 
 func authenticateCredentialProvider(cfg Config, claimed Host, sshConnection string) error {
@@ -1210,6 +1223,11 @@ func dispatchRemoteControl(ctx context.Context, api API, op string, raw json.Raw
 		}
 		if err := requireAuthoritative(ctx, api, req.Workspace); err != nil {
 			return nil, err
+		}
+		req.Provider = authenticatedCredentialProvider(ctx)
+		req.ProviderSource = "remote"
+		if req.Provider.ID == "" {
+			return nil, fmt.Errorf("credential provider identity is unavailable")
 		}
 		status, err := api.ClaimWorkspaceCredentials(ctx, req)
 		value = status

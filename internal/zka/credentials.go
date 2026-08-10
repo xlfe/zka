@@ -2,6 +2,7 @@ package zka
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -44,11 +45,13 @@ type credentialOpenPGPManifest struct {
 }
 
 type workspaceCredentialRequest struct {
-	Workspace   string                   `json:"workspace"`
-	Attachment  string                   `json:"attachment,omitempty"`
-	Bundle      string                   `json:"bundle,omitempty"`
-	IfUnclaimed bool                     `json:"if_unclaimed,omitempty"`
-	Manifest    credentialBundleManifest `json:"manifest,omitempty"`
+	Workspace         string                   `json:"workspace"`
+	Bundle            string                   `json:"bundle,omitempty"`
+	IfUnclaimed       bool                     `json:"if_unclaimed,omitempty"`
+	Provider          Host                     `json:"provider,omitempty"`
+	ProviderSource    string                   `json:"provider_source,omitempty"`
+	CallerSSHAuthSock string                   `json:"caller_ssh_auth_sock,omitempty"`
+	Manifest          credentialBundleManifest `json:"manifest,omitempty"`
 }
 
 type credentialStreamHello struct {
@@ -69,12 +72,15 @@ type workspaceCredentialStatus struct {
 	WorkspaceName    string                              `json:"workspace_name"`
 	Bundle           string                              `json:"bundle,omitempty"`
 	OwnerNode        string                              `json:"owner_node,omitempty"`
-	OwnerAttachment  string                              `json:"owner_attachment,omitempty"`
 	Generation       uint64                              `json:"generation,omitempty"`
 	State            string                              `json:"state"`
 	Capabilities     map[string]credentialCapabilityView `json:"capabilities"`
 	RecreatePaneIDs  []string                            `json:"panes_requiring_recreation,omitempty"`
 	RecreationDetail string                              `json:"pane_recreation_detail,omitempty"`
+	// providerSelected is process-local control flow, not API state. It tells
+	// activate-local whether this call selected/refreshed the requested local
+	// provider or returned an untouched --if-unclaimed binding.
+	providerSelected bool
 }
 
 type credentialStatusResponse struct {
@@ -93,11 +99,13 @@ type credentialTransportView struct {
 type credentialTransportSessionRequest struct {
 	Provider Host   `json:"provider"`
 	State    string `json:"state"`
+	Endpoint string `json:"endpoint,omitempty"`
 }
 
 type incomingCredentialTransport struct {
 	Provider  Host
 	State     string
+	Endpoint  string
 	UpdatedAt time.Time
 }
 
@@ -395,15 +403,15 @@ func prepareOpenPGPTarget(ctx context.Context, paths Paths, cfg Config, workspac
 //	                     │
 //	unclaimed ── claim ──► preparing ── success ──► claimed
 //	                                                 │
-//	                release / owner detach ◄─────────┤
+//	                       explicit release ◄─────────┤
 //	                                                 └─ transport loss ─► claimed/degraded
 //
 // Preparation is deliberately performed before the durable swap. A failed
 // capability therefore cannot publish a partial claim, and reconnect keeps the
 // durable owner while listeners fail closed until they are reconciled.
 func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCredentialRequest) (workspaceCredentialStatus, error) {
-	if req.Workspace == "" || req.Attachment == "" || req.Bundle == "" {
-		return workspaceCredentialStatus{}, fmt.Errorf("workspace, attachment, and bundle are required")
+	if req.Workspace == "" || req.Bundle == "" {
+		return workspaceCredentialStatus{}, fmt.Errorf("workspace and bundle are required")
 	}
 	bundle, ok := d.config.credentialBundle(req.Bundle)
 	if !ok {
@@ -445,25 +453,45 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, err
 	}
-	attachment := workspace.Attachments[req.Attachment]
-	if attachment == nil {
+	if req.IfUnclaimed && workspace.CredentialClaim != nil {
+		workspaceID := workspace.ID
 		d.mu.Unlock()
-		return workspaceCredentialStatus{}, fmt.Errorf("unknown attachment %q", req.Attachment)
+		return d.workspaceCredentialStatus(workspaceID)
 	}
-	if attachment.Transport.Kind != "ssh" || attachment.Status != AttachmentReady || attachment.Revoked {
+	provider := req.Provider
+	source := req.ProviderSource
+	if source == "" {
+		source = "remote"
+	}
+	if provider.ID == "" {
 		d.mu.Unlock()
-		return workspaceCredentialStatus{}, fmt.Errorf("attachment %s is not a ready SSH attachment", attachment.ID)
+		return workspaceCredentialStatus{}, fmt.Errorf("credential provider node is required")
+	}
+	if source != "local" && source != "remote" {
+		d.mu.Unlock()
+		return workspaceCredentialStatus{}, fmt.Errorf("invalid credential provider source %q", source)
+	}
+	if source == "local" && provider.ID != d.state.Node.ID {
+		d.mu.Unlock()
+		return workspaceCredentialStatus{}, fmt.Errorf("local credential provider must be this workspace origin")
+	}
+	if workspace.CredentialClaim != nil && len(panesRequiringCredentialEnvironment(workspace)) != 0 {
+		existing := workspace.CredentialClaim
+		if existing.ProviderSource != source || existing.OwnerNodeID != provider.ID || existing.Bundle != req.Bundle {
+			d.mu.Unlock()
+			return workspaceCredentialStatus{}, fmt.Errorf("credential provider transfer is blocked until version 0 panes complete managed-environment migration")
+		}
 	}
 	workspaceID := workspace.ID
-	ownerNode := attachment.Node.ID
+	ownerNode := provider.ID
 	previousGeneration := uint64(0)
 	if workspace.CredentialClaim != nil {
 		previousGeneration = workspace.CredentialClaim.Generation
 	}
-	if workspace.PIVBProvider != nil && workspace.PIVBProvider.Generation > previousGeneration {
-		previousGeneration = workspace.PIVBProvider.Generation
-	}
 	d.mu.Unlock()
+	if source == "remote" && !d.incomingCredentialTransportReady(ownerNode) {
+		return workspaceCredentialStatus{}, fmt.Errorf("credential provider node %s has no ready control transport", ownerNode)
+	}
 
 	capabilities := map[string]CredentialCapabilityStatus{}
 	if bundle.SSHAgent.Enable {
@@ -488,6 +516,13 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 			Detail: fmt.Sprintf("YubiKey %d key %s", req.Manifest.PIVB.Card.Serial, req.Manifest.PIVB.Card.KeyID),
 		}
 	}
+	// Stable pane-facing listeners are part of claim preparation. Publishing a
+	// durable ready claim before those paths can be bound would make creator
+	// defaults appear successful while every client fails at connect time.
+	d.reconcileCredentialRoutes(ctx)
+	if err := d.validateCredentialRoutes(workspaceID, capabilities); err != nil {
+		return workspaceCredentialStatus{}, err
+	}
 
 	d.mu.Lock()
 	workspace, err = d.resolveWorkspaceLocked(workspaceID)
@@ -495,49 +530,71 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, err
 	}
-	attachment = workspace.Attachments[req.Attachment]
-	if attachment == nil || attachment.Node.ID != ownerNode || attachment.Status != AttachmentReady || attachment.Revoked {
+	if source == "remote" && !d.incomingCredentialTransportReady(ownerNode) {
 		d.mu.Unlock()
-		return workspaceCredentialStatus{}, fmt.Errorf("attachment changed while preparing credential claim")
+		return workspaceCredentialStatus{}, fmt.Errorf("credential provider transport changed while preparing credential claim")
 	}
 	keys := []string(nil)
 	if req.Manifest.OpenPGP != nil {
 		keys = append(keys, req.Manifest.OpenPGP.Fingerprints...)
 	}
 	previousClaim := workspace.CredentialClaim
-	previousPIVBProvider := workspace.PIVBProvider
 	previousUpdatedAt := workspace.UpdatedAt
-	newGeneration := previousGeneration + 1
+	if credentialClaimMatchesManifest(previousClaim, source, ownerNode, req.Bundle, req.Manifest) {
+		d.mu.Unlock()
+		d.reconcileCredentialRoutes(ctx)
+		status, statusErr := d.workspaceCredentialStatus(workspaceID)
+		status.providerSelected = statusErr == nil
+		return status, statusErr
+	}
+	previousCredentialGeneration := workspace.CredentialGeneration
+	generationBase := previousCredentialGeneration
+	if previousClaim != nil && previousClaim.Generation > generationBase {
+		generationBase = previousClaim.Generation
+	}
+	if generationBase == ^uint64(0) {
+		d.mu.Unlock()
+		return workspaceCredentialStatus{}, fmt.Errorf("credential generation exhausted for workspace %s", workspaceID)
+	}
+	newGeneration := generationBase + 1
+	workspace.CredentialGeneration = newGeneration
 	workspace.CredentialClaim = &CredentialClaim{
-		Bundle: req.Bundle, OwnerAttachmentID: attachment.ID, OwnerNodeID: ownerNode,
+		ProviderSource: source, Bundle: req.Bundle, OwnerNodeID: ownerNode,
 		Generation: newGeneration, State: "ready", Capabilities: capabilities,
 		OpenPGPKeys: keys, PIVB: clonePIVBManifest(req.Manifest.PIVB), UpdatedAt: time.Now().UTC(),
 	}
-	if bundle.PIVB.Enable {
-		workspace.PIVBProvider = &WorkspacePIVBProvider{
-			Source: "attachment", Bundle: req.Bundle, Generation: newGeneration,
-			OwnerNodeID: ownerNode, OwnerAttachmentID: attachment.ID,
-			Manifest: *clonePIVBManifest(req.Manifest.PIVB), State: "ready", UpdatedAt: time.Now().UTC(),
-		}
-	} else if workspace.PIVBProvider != nil && workspace.PIVBProvider.Source == "attachment" {
-		workspace.PIVBProvider = nil
-	}
+	workspace.PIVBProvider = nil
 	workspace.UpdatedAt = time.Now().UTC()
 	if err := d.store.Save(d.state); err != nil {
 		workspace.CredentialClaim = previousClaim
-		workspace.PIVBProvider = previousPIVBProvider
+		workspace.CredentialGeneration = previousCredentialGeneration
 		workspace.UpdatedAt = previousUpdatedAt
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, err
 	}
 	d.mu.Unlock()
-	if bundle.PIVB.Enable {
-		// The persisted provider binding is authoritative. Close any old local
-		// listener immediately; its per-request generation check also rejects an
-		// accept racing with this takeover commit.
-		d.closeLocalPIVBListener(workspaceID)
+	d.revokeCredentialRoutes(workspaceID, previousGeneration)
+	d.reconcileCredentialRoutes(ctx)
+	status, statusErr := d.workspaceCredentialStatus(workspaceID)
+	status.providerSelected = statusErr == nil
+	return status, statusErr
+}
+
+func credentialClaimMatchesManifest(claim *CredentialClaim, source, ownerNode, bundle string, manifest credentialBundleManifest) bool {
+	if claim == nil || claim.ProviderSource != source || claim.OwnerNodeID != ownerNode || claim.Bundle != bundle || claim.State != "ready" ||
+		!sameStringSet(claim.OpenPGPKeys, manifestOpenPGPFingerprints(manifest.OpenPGP)) {
+		return false
 	}
-	return d.workspaceCredentialStatus(workspaceID)
+	left, _ := json.Marshal(claim.PIVB)
+	right, _ := json.Marshal(manifest.PIVB)
+	return bytes.Equal(left, right)
+}
+
+func manifestOpenPGPFingerprints(manifest *credentialOpenPGPManifest) []string {
+	if manifest == nil {
+		return nil
+	}
+	return manifest.Fingerprints
 }
 
 func (d *Daemon) releaseWorkspaceCredentials(workspaceRef string) (workspaceCredentialStatus, error) {
@@ -561,22 +618,23 @@ func (d *Daemon) releaseWorkspaceCredentials(workspaceRef string) (workspaceCred
 		return workspaceCredentialStatus{}, fmt.Errorf("workspace %q is not authoritative on this host", workspace.Name)
 	}
 	previousClaim := workspace.CredentialClaim
-	previousPIVBProvider := workspace.PIVBProvider
 	previousUpdatedAt := workspace.UpdatedAt
-	workspace.CredentialClaim = nil
-	if workspace.PIVBProvider != nil && workspace.PIVBProvider.Source == "attachment" {
-		workspace.PIVBProvider = nil
+	previousGeneration := uint64(0)
+	if previousClaim != nil {
+		previousGeneration = previousClaim.Generation
 	}
+	workspace.CredentialClaim = nil
+	workspace.PIVBProvider = nil
 	workspace.UpdatedAt = time.Now().UTC()
 	if err := d.store.Save(d.state); err != nil {
 		workspace.CredentialClaim = previousClaim
-		workspace.PIVBProvider = previousPIVBProvider
 		workspace.UpdatedAt = previousUpdatedAt
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, err
 	}
 	workspaceID := workspace.ID
 	d.mu.Unlock()
+	d.revokeCredentialRoutes(workspaceID, previousGeneration)
 	return d.workspaceCredentialStatus(workspaceID)
 }
 
@@ -609,6 +667,7 @@ func (d *Daemon) workspaceCredentialStatus(workspaceRef string) (workspaceCreden
 		degradeCredentialStatus(&status, workspaceSnapshot)
 	}
 	d.degradeMissingCredentialSSHSource(&status, workspaceSnapshot)
+	d.degradeMissingCredentialRoutes(&status, workspaceSnapshot)
 	return status, nil
 }
 
@@ -633,37 +692,25 @@ func credentialStatusFromWorkspace(workspace *Workspace) workspaceCredentialStat
 	}
 	claim := workspace.CredentialClaim
 	if claim == nil {
-		if provider := workspace.PIVBProvider; provider != nil {
-			status.Bundle, status.OwnerNode, status.OwnerAttachment = provider.Bundle, provider.OwnerNodeID, provider.OwnerAttachmentID
-			status.Generation, status.State = provider.Generation, provider.State
-			status.Capabilities[credentialCapabilityPIVB] = credentialCapabilityView{
-				State: provider.State, Available: provider.State == "ready",
-				Detail: appendCredentialDetail(fmt.Sprintf("%s YubiKey %d key %s", provider.Source, provider.Manifest.Card.Serial, provider.Manifest.Card.KeyID), provider.LastError),
-			}
-		}
-		status.RecreatePaneIDs = panesWithLegacyCredentialEnvironment(workspace)
+		status.RecreatePaneIDs = panesRequiringCredentialEnvironment(workspace)
 		if len(status.RecreatePaneIDs) != 0 {
-			status.RecreationDetail = "v0.8.0 credential environment detected; run the bundle's credential probe inside each pane (for SSH, ssh-add -l; for OpenPGP, gpg --list-secret-keys) and recreate only panes where local credentials fail; remotely created panes may already be healthy"
+			status.RecreationDetail = "version 0 panes are awaiting automatic managed-credential migration"
+			status.RecreationDetail = appendCredentialMigrationErrors(status.RecreationDetail, workspace, status.RecreatePaneIDs)
 		}
 		return status
 	}
 
-	status.Bundle, status.OwnerNode, status.OwnerAttachment = claim.Bundle, claim.OwnerNodeID, claim.OwnerAttachmentID
+	status.Bundle, status.OwnerNode = claim.Bundle, claim.OwnerNodeID
 	status.Generation, status.State = claim.Generation, claim.State
 	for name, capability := range claim.Capabilities {
 		status.Capabilities[name] = credentialCapabilityView{State: capability.State, Available: capability.Available, Detail: capability.Detail}
-	}
-	if provider := workspace.PIVBProvider; provider != nil && provider.Source == "local" {
-		status.Capabilities[credentialCapabilityPIVB] = credentialCapabilityView{
-			State: provider.State, Available: provider.State == "ready",
-			Detail: appendCredentialDetail(fmt.Sprintf("local YubiKey %d key %s", provider.Manifest.Card.Serial, provider.Manifest.Card.KeyID), provider.LastError),
-		}
 	}
 	status.RecreatePaneIDs = panesRequiringCredentialEnvironment(workspace)
 	if len(status.RecreatePaneIDs) == 0 {
 		return status
 	}
-	status.RecreationDetail = "some panes cannot be proven to consume this claim: version 0 panes must be recreated through the remote attachment; for version 2 panes, run the bundle's credential probe (for SSH, ssh-add -l; for OpenPGP, gpg --list-secret-keys) and recreate only panes where credentials fail"
+	status.RecreationDetail = "version 0 panes are awaiting automatic managed-credential migration; provider transfer is blocked until migration completes"
+	status.RecreationDetail = appendCredentialMigrationErrors(status.RecreationDetail, workspace, status.RecreatePaneIDs)
 	if _, ok := claim.Capabilities[credentialCapabilitySSH]; ok {
 		capability := status.Capabilities[credentialCapabilitySSH]
 		capability.Detail = appendCredentialDetail(capability.Detail, "some panes require recreation to receive SSH_AUTH_SOCK")
@@ -675,6 +722,19 @@ func credentialStatusFromWorkspace(workspace *Workspace) workspaceCredentialStat
 		status.Capabilities[credentialCapabilityOpenPGP] = capability
 	}
 	return status
+}
+
+func appendCredentialMigrationErrors(detail string, workspace *Workspace, paneIDs []string) string {
+	var failures []string
+	for _, paneID := range paneIDs {
+		if pane := workspace.Panes[paneID]; pane != nil && pane.CredentialMigrationError != "" {
+			failures = append(failures, paneID+": "+pane.CredentialMigrationError)
+		}
+	}
+	if len(failures) == 0 {
+		return detail
+	}
+	return appendCredentialDetail(detail, strings.Join(failures, "; "))
 }
 
 func appendCredentialDetail(existing, addition string) string {
@@ -760,7 +820,7 @@ func (d *Daemon) handleCredentialStream(ctx context.Context, host string, stream
 		if manifestErr != nil {
 			return
 		}
-		err = d.filterOpenPGPStream(ctx, host, hello, manifest, stream)
+		_ = d.filterOpenPGPStream(ctx, host, hello, manifest, stream)
 		return
 	case credentialCapabilityPIVB:
 		if !bundle.PIVB.Enable || claim.PIVB == nil || !samePIVBPolicy(bundle, claim.PIVB) {
@@ -777,7 +837,7 @@ func (d *Daemon) handleCredentialStream(ctx context.Context, host string, stream
 		if originNode == "" {
 			return
 		}
-		_ = d.proxyPIVBMint(ctx, stream, hello.Workspace, hello.Bundle, hello.Generation, claim.OwnerAttachmentID, originNode, claim.PIVB)
+		_ = d.proxyPIVBMint(ctx, stream, hello.Workspace, hello.Bundle, hello.Generation, "", originNode, claim.PIVB)
 		return
 	default:
 		return
@@ -794,7 +854,7 @@ func credentialSSHSourceKey(host, workspace string, generation uint64) string {
 }
 
 func (d *Daemon) setCredentialSSHSource(host, workspace string, generation uint64, socket string) {
-	if host == "" || workspace == "" || generation == 0 || socket == "" || socket == "none" {
+	if workspace == "" || generation == 0 || socket == "" || socket == "none" {
 		return
 	}
 	d.credentialMu.Lock()
@@ -973,6 +1033,7 @@ func (d *Daemon) allCredentialStatuses() credentialStatusResponse {
 			degradeCredentialStatus(&statuses[index], workspace)
 		}
 		d.degradeMissingCredentialSSHSource(&statuses[index], workspace)
+		d.degradeMissingCredentialRoutes(&statuses[index], workspace)
 	}
 	return credentialStatusResponse{
 		Transport:        transport,
@@ -981,15 +1042,38 @@ func (d *Daemon) allCredentialStatuses() credentialStatusResponse {
 	}
 }
 
+func (d *Daemon) degradeMissingCredentialRoutes(status *workspaceCredentialStatus, workspace *Workspace) {
+	if status == nil || workspace == nil || workspace.RemoteHost != "" || workspace.CredentialClaim == nil {
+		return
+	}
+	d.credentialMu.Lock()
+	defer d.credentialMu.Unlock()
+	for name, capability := range status.Capabilities {
+		listener := d.credentialRoutes[credentialRouteKey(workspace.ID, name)]
+		if listener != nil && listener.socketPublished() {
+			continue
+		}
+		status.State = "degraded"
+		capability.State = "unavailable"
+		capability.Available = false
+		capability.Detail = appendCredentialDetail(capability.Detail, "stable workspace credential route is not published; reconciliation will retry")
+		status.Capabilities[name] = capability
+	}
+}
+
 func (d *Daemon) degradeMissingCredentialSSHSource(status *workspaceCredentialStatus, workspace *Workspace) {
-	if status == nil || workspace == nil || workspace.RemoteHost == "" || workspace.CredentialClaim == nil ||
+	if status == nil || workspace == nil || workspace.CredentialClaim == nil ||
 		workspace.CredentialClaim.OwnerNodeID != d.state.Node.ID || d.sshAgent.IdentityAgent != "" {
 		return
 	}
 	if _, enabled := status.Capabilities[credentialCapabilitySSH]; !enabled {
 		return
 	}
-	key := credentialSSHSourceKey(workspace.RemoteHost, workspace.ID, workspace.CredentialClaim.Generation)
+	host := workspace.RemoteHost
+	if host == "" && workspace.CredentialClaim.ProviderSource != "local" {
+		return
+	}
+	key := credentialSSHSourceKey(host, workspace.ID, workspace.CredentialClaim.Generation)
 	d.credentialMu.Lock()
 	socket := d.credentialSSHSources[key]
 	d.credentialMu.Unlock()
@@ -1000,7 +1084,11 @@ func (d *Daemon) degradeMissingCredentialSSHSource(status *workspaceCredentialSt
 	capability := status.Capabilities[credentialCapabilitySSH]
 	capability.State = "unavailable"
 	capability.Available = false
-	capability.Detail = "provider restarted without ssh.identity_agent; re-claim credentials to restore the attaching user's agent"
+	if host == "" {
+		capability.Detail = "local credential source is unavailable; reactivate local credentials to restore the SSH agent"
+	} else {
+		capability.Detail = "provider restarted without ssh.identity_agent; re-claim credentials to restore the attaching user's agent"
+	}
 	status.Capabilities[credentialCapabilitySSH] = capability
 }
 
@@ -1011,9 +1099,25 @@ func (d *Daemon) setIncomingCredentialTransport(req credentialTransportSessionRe
 	if req.State != "ready" && req.State != "disconnected" {
 		return fmt.Errorf("invalid credential transport state %q", req.State)
 	}
+	if req.State == "ready" {
+		if req.Endpoint == "" || !filepath.IsAbs(req.Endpoint) {
+			return fmt.Errorf("credential transport endpoint must be an absolute path")
+		}
+		info, err := os.Lstat(req.Endpoint)
+		if err != nil || info.Mode()&os.ModeSocket == 0 {
+			return fmt.Errorf("credential transport endpoint %q is not a Unix socket", req.Endpoint)
+		}
+	}
 	d.credentialMu.Lock()
+	if req.State == "disconnected" {
+		current, ok := d.credentialTransports[req.Provider.ID]
+		if ok && req.Endpoint != "" && current.Endpoint != req.Endpoint {
+			d.credentialMu.Unlock()
+			return nil
+		}
+	}
 	d.credentialTransports[req.Provider.ID] = incomingCredentialTransport{
-		Provider: req.Provider, State: req.State, UpdatedAt: time.Now().UTC(),
+		Provider: req.Provider, State: req.State, Endpoint: req.Endpoint, UpdatedAt: time.Now().UTC(),
 	}
 	d.credentialMu.Unlock()
 	return nil
@@ -1030,6 +1134,9 @@ func (d *Daemon) credentialClaimTransportReady(workspace *Workspace) bool {
 	if workspace == nil || workspace.CredentialClaim == nil {
 		return true
 	}
+	if workspace.CredentialClaim.ProviderSource == "local" {
+		return true
+	}
 	if workspace.RemoteHost != "" {
 		return d.remotes.credentialTransportStatusForHost(workspace.RemoteHost).State == "ready"
 	}
@@ -1038,16 +1145,18 @@ func (d *Daemon) credentialClaimTransportReady(workspace *Workspace) bool {
 
 func (d *Daemon) credentialTransportStatus(workspaces []*Workspace) credentialTransportView {
 	outbound := d.remotes.credentialTransportStatus()
-	inboundReady, inboundExpected := false, false
+	inboundReady := false
+	inboundUnavailable := false
 	for _, workspace := range workspaces {
-		if workspace.RemoteHost == "" && workspace.CredentialClaim != nil {
-			inboundExpected = true
+		if workspace.RemoteHost == "" && workspace.CredentialClaim != nil && workspace.CredentialClaim.ProviderSource != "local" {
 			if d.incomingCredentialTransportReady(workspace.CredentialClaim.OwnerNodeID) {
 				inboundReady = true
+			} else {
+				inboundUnavailable = true
 			}
 		}
 	}
-	if inboundExpected && !inboundReady {
+	if inboundUnavailable {
 		return credentialTransportView{State: "degraded", LastError: "claim owner control session is unavailable"}
 	}
 	if inboundReady && outbound.State == "idle" {
@@ -1057,11 +1166,11 @@ func (d *Daemon) credentialTransportStatus(workspaces []*Workspace) credentialTr
 }
 
 func degradeCredentialStatus(status *workspaceCredentialStatus, workspace *Workspace) {
+	if workspace != nil && workspace.CredentialClaim != nil && workspace.CredentialClaim.ProviderSource == "local" {
+		return
+	}
 	status.State = "degraded"
 	for name, capability := range status.Capabilities {
-		if name == credentialCapabilityPIVB && workspace != nil && workspace.PIVBProvider != nil && workspace.PIVBProvider.Source == "local" {
-			continue
-		}
 		capability.State = "unavailable"
 		capability.Available = false
 		capability.Detail = "credential transport is unavailable; reconciliation will retry"

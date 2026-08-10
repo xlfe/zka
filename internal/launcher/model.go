@@ -113,12 +113,16 @@ func sortRemoteWorkspaces(workspaces []*zka.Workspace) []*zka.Workspace {
 	return result
 }
 
-func createArgs(name string) []string {
+func createArgs(name string, useCredentials ...bool) []string {
 	name = strings.TrimSpace(name)
-	if name == "" {
-		return []string{"kitty"}
+	args := []string{"kitty"}
+	if name != "" {
+		args = append(args, "--name", name)
 	}
-	return []string{"kitty", "--name", name}
+	if len(useCredentials) != 0 && !useCredentials[0] {
+		args = append(args, "--no-credentials")
+	}
+	return args
 }
 
 func attachArgs(host string, workspace *zka.Workspace) []string {

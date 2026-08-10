@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -85,6 +86,38 @@ func TestMissingCredentialSSHSourceDegradesAfterProviderRestart(t *testing.T) {
 	if status.State != "ready" || !status.Capabilities[credentialCapabilitySSH].Available {
 		t.Fatalf("configured identity agent degraded: %#v", status)
 	}
+
+	d.sshAgent = sshAgentInfo{}
+	workspace.RemoteHost = ""
+	workspace.CredentialClaim.ProviderSource = "local"
+	status.State = "ready"
+	status.Capabilities[credentialCapabilitySSH] = credentialCapabilityView{State: "ready", Available: true}
+	d.degradeMissingCredentialSSHSource(&status, workspace)
+	if status.State != "degraded" || status.Capabilities[credentialCapabilitySSH].Available ||
+		!strings.Contains(status.Capabilities[credentialCapabilitySSH].Detail, "reactivate local") {
+		t.Fatalf("missing local source status = %#v", status)
+	}
+}
+
+func TestCredentialTransportStatusRequiresEveryInboundProvider(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	one := Host{ID: "first-provider"}
+	two := Host{ID: "second-provider"}
+	readyCredentialTransport(t, d, one)
+	workspaces := []*Workspace{
+		{ID: "one", CredentialClaim: &CredentialClaim{ProviderSource: "remote", OwnerNodeID: one.ID}},
+		{ID: "two", CredentialClaim: &CredentialClaim{ProviderSource: "remote", OwnerNodeID: two.ID}},
+	}
+	if status := d.credentialTransportStatus(workspaces); status.State != "degraded" {
+		t.Fatalf("one missing inbound provider status = %#v", status)
+	}
+	readyCredentialTransport(t, d, two)
+	if status := d.credentialTransportStatus(workspaces); status.State != "ready" {
+		t.Fatalf("all inbound providers ready status = %#v", status)
+	}
 }
 
 func readyCredentialAttachment(t *testing.T, d *Daemon, workspace *Workspace, id, node string) *Attachment {
@@ -123,10 +156,10 @@ func TestCredentialStatusReportsPaneEnvironmentMigrationAndClaimGaps(t *testing.
 	}
 
 	unclaimed := credentialStatusFromWorkspace(workspace)
-	if got, want := strings.Join(unclaimed.RecreatePaneIDs, ","), "legacy"; got != want {
+	if got, want := strings.Join(unclaimed.RecreatePaneIDs, ","), "local"; got != want {
 		t.Fatalf("unclaimed recreation panes = %q, want %q", got, want)
 	}
-	if !strings.Contains(unclaimed.RecreationDetail, "v0.8.0") || !strings.Contains(unclaimed.RecreationDetail, "ssh-add -l") || !strings.Contains(unclaimed.RecreationDetail, "gpg --list-secret-keys") || len(unclaimed.Capabilities) != 0 {
+	if !strings.Contains(unclaimed.RecreationDetail, "version 0") || !strings.Contains(unclaimed.RecreationDetail, "automatic") || len(unclaimed.Capabilities) != 0 {
 		t.Fatalf("unclaimed recreation status = %#v", unclaimed)
 	}
 
@@ -138,10 +171,10 @@ func TestCredentialStatusReportsPaneEnvironmentMigrationAndClaimGaps(t *testing.
 		},
 	}
 	claimed := credentialStatusFromWorkspace(workspace)
-	if got, want := strings.Join(claimed.RecreatePaneIDs, ","), "legacy,local"; got != want {
+	if got, want := strings.Join(claimed.RecreatePaneIDs, ","), "local"; got != want {
 		t.Fatalf("claimed recreation panes = %q, want %q", got, want)
 	}
-	if !strings.Contains(claimed.RecreationDetail, "version 0") || !strings.Contains(claimed.RecreationDetail, "version 2") || !strings.Contains(claimed.RecreationDetail, "gpg --list-secret-keys") {
+	if !strings.Contains(claimed.RecreationDetail, "version 0") || !strings.Contains(claimed.RecreationDetail, "transfer is blocked") {
 		t.Fatalf("claimed recreation detail = %q", claimed.RecreationDetail)
 	}
 	if detail := claimed.Capabilities[credentialCapabilitySSH].Detail; !strings.Contains(detail, "SSH_AUTH_SOCK") {
@@ -163,7 +196,7 @@ func TestCredentialStatusReportsPaneEnvironmentMigrationAndClaimGaps(t *testing.
 				test.capability: {State: "ready", Available: true},
 			}
 			status := credentialStatusFromWorkspace(workspace)
-			if got := strings.Join(status.RecreatePaneIDs, ","); got != "legacy,local" {
+			if got := strings.Join(status.RecreatePaneIDs, ","); got != "local" {
 				t.Fatalf("recreation panes = %q", got)
 			}
 			if detail := status.Capabilities[test.capability].Detail; !strings.Contains(detail, test.endpoint) {
@@ -188,23 +221,21 @@ func TestCredentialStatusDegradesAndRecoversWithTransport(t *testing.T) {
 	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": sshCredentialBundle()}
 	workspace := createTestWorkspace(t, d, 1)
 	attachment := readyCredentialAttachment(t, d, workspace, "provider-attachment", "provider")
-	if err := d.setIncomingCredentialTransport(credentialTransportSessionRequest{Provider: attachment.Node, State: "ready"}); err != nil {
-		t.Fatal(err)
-	}
+	endpoint := readyCredentialTransport(t, d, attachment.Node)
 	if _, err := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
-		Workspace: workspace.ID, Attachment: attachment.ID, Bundle: "work",
+		Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: "work",
 		Manifest: credentialBundleManifest{Bundle: "work", SSH: true},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.setIncomingCredentialTransport(credentialTransportSessionRequest{Provider: attachment.Node, State: "disconnected"}); err != nil {
+	if err := d.setIncomingCredentialTransport(credentialTransportSessionRequest{Provider: attachment.Node, State: "disconnected", Endpoint: endpoint}); err != nil {
 		t.Fatal(err)
 	}
 	status := d.allCredentialStatuses()
 	if status.Transport.State != "degraded" || len(status.Workspaces) != 1 || status.Workspaces[0].State != "degraded" || status.Workspaces[0].Capabilities[credentialCapabilitySSH].Available {
 		t.Fatalf("disconnected status = %#v", status)
 	}
-	if err := d.setIncomingCredentialTransport(credentialTransportSessionRequest{Provider: attachment.Node, State: "ready"}); err != nil {
+	if err := d.setIncomingCredentialTransport(credentialTransportSessionRequest{Provider: attachment.Node, State: "ready", Endpoint: endpoint}); err != nil {
 		t.Fatal(err)
 	}
 	status = d.allCredentialStatuses()
@@ -228,14 +259,14 @@ func TestFailedCredentialPreparationRetainsPriorClaim(t *testing.T) {
 	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"ssh": sshCredentialBundle(), "openpgp": openpgp}
 	workspace := createTestWorkspace(t, d, 1)
 	attachment := readyCredentialAttachment(t, d, workspace, "provider-attachment", "provider")
-	_ = d.setIncomingCredentialTransport(credentialTransportSessionRequest{Provider: attachment.Node, State: "ready"})
+	readyCredentialTransport(t, d, attachment.Node)
 	if _, err := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
-		Workspace: workspace.ID, Attachment: attachment.ID, Bundle: "ssh", Manifest: credentialBundleManifest{Bundle: "ssh", SSH: true},
+		Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: "ssh", Manifest: credentialBundleManifest{Bundle: "ssh", SSH: true},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	_, err = d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
-		Workspace: workspace.ID, Attachment: attachment.ID, Bundle: "openpgp",
+		Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: "openpgp",
 		Manifest: credentialBundleManifest{Bundle: "openpgp", OpenPGP: &credentialOpenPGPManifest{Fingerprints: []string{testFingerprint}, PublicKeys: "invalid"}},
 	})
 	if err == nil {
@@ -250,6 +281,49 @@ func TestFailedCredentialPreparationRetainsPriorClaim(t *testing.T) {
 	}
 }
 
+func TestActivateLocalIfUnclaimedDoesNotMutateExistingProviderSources(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{
+		"work": sshCredentialBundle(), "personal": sshCredentialBundle(),
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	workPath := filepath.Join(d.paths.RuntimeDir, "work-agent.sock")
+	workAgent, err := listenUnix(workPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = workAgent.Close() })
+	go serveCredentialTestByte(workAgent, 'W')
+	personalPath := filepath.Join(d.paths.RuntimeDir, "personal-agent.sock")
+	personalAgent, err := listenUnix(personalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = personalAgent.Close() })
+	go serveCredentialTestByte(personalAgent, 'P')
+
+	bound, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, workPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := credentialTestRoundTrip(t, agentRelaySocketPath(d.paths.AgentDir, workspace.ID), 'a'); got != 'W' {
+		t.Fatalf("initial provider reply = %q", got)
+	}
+	untouched, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "personal", true, personalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if untouched.Bundle != "work" || untouched.Generation != bound.Generation {
+		t.Fatalf("if-unclaimed status = %#v, want original work binding", untouched)
+	}
+	if got := credentialTestRoundTrip(t, agentRelaySocketPath(d.paths.AgentDir, workspace.ID), 'b'); got != 'W' {
+		t.Fatalf("if-unclaimed changed provider reply to %q", got)
+	}
+}
+
 func TestConcurrentCredentialClaimsAreSerialized(t *testing.T) {
 	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
@@ -258,7 +332,7 @@ func TestConcurrentCredentialClaimsAreSerialized(t *testing.T) {
 	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"one": sshCredentialBundle(), "two": sshCredentialBundle()}
 	workspace := createTestWorkspace(t, d, 1)
 	attachment := readyCredentialAttachment(t, d, workspace, "provider-attachment", "provider")
-	_ = d.setIncomingCredentialTransport(credentialTransportSessionRequest{Provider: attachment.Node, State: "ready"})
+	readyCredentialTransport(t, d, attachment.Node)
 	var wg sync.WaitGroup
 	errorsByBundle := make(chan error, 2)
 	for _, bundle := range []string{"one", "two"} {
@@ -266,7 +340,7 @@ func TestConcurrentCredentialClaimsAreSerialized(t *testing.T) {
 		go func(bundle string) {
 			defer wg.Done()
 			_, claimErr := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
-				Workspace: workspace.ID, Attachment: attachment.ID, Bundle: bundle,
+				Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: bundle,
 				Manifest: credentialBundleManifest{Bundle: bundle, SSH: true},
 			})
 			errorsByBundle <- claimErr
@@ -285,5 +359,40 @@ func TestConcurrentCredentialClaimsAreSerialized(t *testing.T) {
 	}
 	if status.Generation != 2 || status.Bundle != "one" && status.Bundle != "two" {
 		t.Fatalf("serialized claim = %#v", status)
+	}
+}
+
+func TestCredentialGenerationRemainsMonotonicAcrossRelease(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": sshCredentialBundle()}
+	workspace := createTestWorkspace(t, d, 1)
+	attachment := readyCredentialAttachment(t, d, workspace, "provider-attachment", "provider")
+	readyCredentialTransport(t, d, attachment.Node)
+	request := workspaceCredentialRequest{
+		Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: "work",
+		Manifest: credentialBundleManifest{Bundle: "work", SSH: true},
+	}
+	first, err := d.claimWorkspaceCredentials(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.releaseWorkspaceCredentials(workspace.ID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := d.claimWorkspaceCredentials(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Generation <= first.Generation {
+		t.Fatalf("generation after release = %d, want > %d", second.Generation, first.Generation)
+	}
+	d.mu.Lock()
+	storedGeneration := d.state.Workspaces[workspace.ID].CredentialGeneration
+	d.mu.Unlock()
+	if storedGeneration != second.Generation {
+		t.Fatalf("stored credential generation = %d, want %d", storedGeneration, second.Generation)
 	}
 }

@@ -140,12 +140,16 @@ func TestRemoteAttachAndCreateCanClaimCredentialBundle(t *testing.T) {
 		t.Fatalf("remote attach args = %#v, want %#v", got, want)
 	}
 	if got, want := remoteCreateArgs("devbox.example", " api ", true, "work"),
-		[]string{"workspace", "create", "devbox.example:api", "--attach", "--claim-credentials", "--credential-bundle", "work"}; !reflect.DeepEqual(got, want) {
+		[]string{"workspace", "create", "devbox.example:api", "--attach", "--credential-bundle", "work"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("remote create args = %#v, want %#v", got, want)
 	}
 	if got, want := remoteAttachArgs("devbox.example", workspace, false, ""),
 		[]string{"workspace", "attach", "devbox.example:aaaa"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("plain remote attach args = %#v, want %#v", got, want)
+	}
+	if got, want := remoteCreateArgs("devbox.example", "api", false, "work"),
+		[]string{"workspace", "create", "devbox.example:api", "--attach", "--no-credentials"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("remote create opt-out args = %#v, want %#v", got, want)
 	}
 }
 
@@ -181,7 +185,7 @@ func TestRemoteWorkspaceCredentialOwnershipAndActions(t *testing.T) {
 	if got, want := workspaceCredentialSummary(workspace, workspace.RemoteHost, "local-node"), "Credentials: unclaimed"; got != want {
 		t.Fatalf("origin summary = %q, want %q", got, want)
 	}
-	workspace.CredentialClaim = &zka.CredentialClaim{Bundle: "work", OwnerAttachmentID: "local", OwnerNodeID: "local-node", Capabilities: map[string]zka.CredentialCapabilityStatus{"ssh-agent": {State: "ready", Available: true}}}
+	workspace.CredentialClaim = &zka.CredentialClaim{Bundle: "work", OwnerNodeID: "local-node", Capabilities: map[string]zka.CredentialCapabilityStatus{"ssh-agent": {State: "ready", Available: true}}}
 	if got, want := workspaceCredentialSummary(workspace, workspace.RemoteHost, "local-node"), "Credentials: work (ssh-agent ready) · this machine"; got != want {
 		t.Fatalf("local summary = %q, want %q", got, want)
 	}
@@ -189,7 +193,6 @@ func TestRemoteWorkspaceCredentialOwnershipAndActions(t *testing.T) {
 		[]string{"workspace", "credentials", "release", "devbox.example:0123456789abcdef"}) || status != "Releasing credentials from" {
 		t.Fatalf("release action = %#v, %q", args, status)
 	}
-	workspace.CredentialClaim.OwnerAttachmentID = "other"
 	workspace.CredentialClaim.OwnerNodeID = "other-node"
 	if got, want := workspaceCredentialSummary(workspace, workspace.RemoteHost, "local-node"), "Credentials: work (ssh-agent ready) · desktop"; got != want {
 		t.Fatalf("other summary = %q, want %q", got, want)
@@ -204,7 +207,7 @@ func TestDetachedRemoteWorkspaceCanAttachAndClaimCredentialsInOneAction(t *testi
 	const localNode = "local-node"
 	workspace := &zka.Workspace{
 		ID: "0123456789abcdef", Name: "api", RemoteHost: "devbox.example",
-		CredentialClaim: &zka.CredentialClaim{Bundle: "work", OwnerAttachmentID: "other", OwnerNodeID: "other-node"},
+		CredentialClaim: &zka.CredentialClaim{Bundle: "work", OwnerNodeID: "other-node"},
 		Attachments: map[string]*zka.Attachment{
 			"local": {
 				ID: "local", Node: zka.Host{ID: localNode, Name: "laptop"},
@@ -248,7 +251,7 @@ func TestOriginWorkspaceCanAttachAndReleaseCredentialsInOneAction(t *testing.T) 
 	const originNode = "origin-node"
 	workspace := &zka.Workspace{
 		ID: "0123456789abcdef", Name: "api",
-		CredentialClaim: &zka.CredentialClaim{Bundle: "work", OwnerAttachmentID: "machine-a", OwnerNodeID: "machine-a-node", Capabilities: map[string]zka.CredentialCapabilityStatus{"openpgp": {State: "ready", Available: true}}},
+		CredentialClaim: &zka.CredentialClaim{Bundle: "work", OwnerNodeID: "machine-a-node", Capabilities: map[string]zka.CredentialCapabilityStatus{"openpgp": {State: "ready", Available: true}}},
 		Attachments: map[string]*zka.Attachment{
 			"origin": {
 				ID: "origin", Node: zka.Host{ID: originNode, Name: "devbox"},

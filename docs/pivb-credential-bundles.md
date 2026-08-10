@@ -113,7 +113,7 @@ its listener is published. JSON form remains available for inspecting
 
 ## Remote claim lifecycle
 
-On the attachment/card host, the existing claim command builds the PIVB
+On the provider/card host, the claim command builds the PIVB
 manifest from its local pivbd and sends it over the authenticated ZKA control
 session:
 
@@ -123,9 +123,9 @@ zka workspace credentials claim --bundle work devbox:example-project
 
 The origin queries its card-free PIVB policy and checks the provider, issuer,
 alias targets, and enrolled serial/key ID before changing route state. It then
-atomically replaces any local route with the attachment route. Each mint is constrained to
+atomically replaces any local route with the provider-node route. Each mint is constrained to
 the claim's alias allowlist and pinned card. ZKA injects authenticated origin,
-workspace, bundle, generation, provider node, provider attachment, and operation
+workspace, bundle, generation, provider node, and operation
 IDs. Provider-side pivbd then revalidates alias, target, audience, enrollment,
 and pinned card identity before signing. Origin-side pivbd independently checks
 the returned JWT claims, SPKI, signature, lifetime, local enrollment, and the
@@ -137,7 +137,9 @@ fixed-alias agent session can use the new provider on its next subject-token
 request. Existing Google access tokens are unaffected and remain valid until
 their own expiry.
 
-Explicit release or owner-attachment detach removes the remote route:
+Explicit release removes the remote route. Detaching a Kitty view does not
+change the provider because credential ownership is node-scoped, not
+attachment-scoped:
 
 ```fish
 zka workspace credentials release devbox:example-project

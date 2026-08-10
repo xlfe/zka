@@ -36,6 +36,118 @@ func TestSchemaSixMigrationWritesRollbackBackup(t *testing.T) {
 	}
 }
 
+func TestSchemaEightCredentialClaimsMigrateToNodeOwnership(t *testing.T) {
+	paths := testPaths(testRoot(t))
+	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := newStateData()
+	state.SchemaVersion = 8
+	state.Node = Host{ID: "origin", Name: "origin"}
+	state.Workspaces["remote"] = &Workspace{
+		ID: "remote", Name: "remote", Origin: state.Node,
+		Panes: map[string]*Pane{}, Attachments: map[string]*Attachment{},
+		CredentialClaim: &CredentialClaim{
+			Bundle: "work", OwnerNodeID: "provider", OwnerAttachmentID: "view", Generation: 4, State: "ready",
+			Capabilities: map[string]CredentialCapabilityStatus{credentialCapabilitySSH: {State: "ready", Available: true}},
+		},
+		PIVBProvider: &WorkspacePIVBProvider{
+			Source: "attachment", Bundle: "work", OwnerNodeID: "provider", OwnerAttachmentID: "view", Generation: 4, State: "ready",
+			Manifest: CredentialPIVBManifest{ProtocolVersion: pivbForwardProtocolVersion, Card: CredentialPIVBCard{Serial: 7, KeyID: "kid"}},
+		},
+	}
+	state.Workspaces["local"] = &Workspace{
+		ID: "local", Name: "local", Origin: state.Node,
+		Panes: map[string]*Pane{}, Attachments: map[string]*Attachment{},
+		PIVBProvider: &WorkspacePIVBProvider{
+			Source: "local", Bundle: "work", OwnerNodeID: "origin", Generation: 2, State: "ready",
+			Manifest: CredentialPIVBManifest{ProtocolVersion: pivbForwardProtocolVersion, Card: CredentialPIVBCard{Serial: 8, KeyID: "local-kid"}},
+		},
+	}
+	state.Remotes["devbox"] = &RemoteCache{Host: "devbox", Workspaces: map[string]*Workspace{
+		"remote": state.Workspaces["remote"].Clone(),
+	}}
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.StateFile, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := NewStore(paths).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := loaded.Workspaces["remote"]
+	if remote.CredentialClaim.ProviderSource != "remote" || remote.CredentialClaim.OwnerAttachmentID != "" ||
+		remote.CredentialClaim.PIVB == nil || remote.PIVBProvider != nil || remote.CredentialGeneration != 4 {
+		t.Fatalf("remote v8 binding = %#v, legacy=%#v", remote.CredentialClaim, remote.PIVBProvider)
+	}
+	local := loaded.Workspaces["local"]
+	if local.CredentialClaim == nil || local.CredentialClaim.ProviderSource != "local" || local.CredentialClaim.OwnerNodeID != "origin" || local.PIVBProvider != nil || local.CredentialGeneration != 2 {
+		t.Fatalf("local v8 binding = %#v, legacy=%#v", local.CredentialClaim, local.PIVBProvider)
+	}
+	cached := loaded.Remotes["devbox"].Workspaces["remote"]
+	if cached.CredentialClaim.ProviderSource != "remote" || cached.CredentialClaim.OwnerAttachmentID != "" || cached.CredentialClaim.PIVB == nil || cached.CredentialGeneration != 4 {
+		t.Fatalf("cached remote v8 binding = %#v", cached.CredentialClaim)
+	}
+	if backup, err := os.ReadFile(paths.StateFile + ".v8.backup"); err != nil || string(backup) != string(encoded) {
+		t.Fatalf("v8 migration backup missing or wrong: %v", err)
+	}
+}
+
+func TestSchemaEightSplitProviderConflictFailsClosedAndRemainsInspectable(t *testing.T) {
+	paths := testPaths(testRoot(t))
+	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := newStateData()
+	state.SchemaVersion = 8
+	state.Node = Host{ID: "origin", Name: "origin"}
+	state.Workspaces["conflict"] = &Workspace{
+		ID: "conflict", Name: "conflict", Origin: state.Node,
+		Panes: map[string]*Pane{}, Attachments: map[string]*Attachment{},
+		CredentialClaim: &CredentialClaim{
+			Bundle: "work", OwnerNodeID: "remote-provider", Generation: 4, State: "ready",
+			Capabilities: map[string]CredentialCapabilityStatus{credentialCapabilitySSH: {State: "ready", Available: true}},
+		},
+		PIVBProvider: &WorkspacePIVBProvider{
+			Source: "local", Bundle: "work", OwnerNodeID: "origin", Generation: 5, State: "ready",
+			Manifest: CredentialPIVBManifest{Card: CredentialPIVBCard{Serial: 42, KeyID: "legacy-key"}},
+		},
+	}
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.StateFile, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := NewStore(paths).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := loaded.Workspaces["conflict"]
+	if workspace.CredentialClaim == nil || workspace.CredentialClaim.State != "migration_conflict" || workspace.PIVBProvider == nil {
+		t.Fatalf("split-provider migration = claim=%#v legacy=%#v", workspace.CredentialClaim, workspace.PIVBProvider)
+	}
+	for _, capability := range workspace.CredentialClaim.Capabilities {
+		if capability.Available || capability.State != "unavailable" {
+			t.Fatalf("conflicting capability remained available: %#v", capability)
+		}
+	}
+	if workspace.CredentialGeneration != 5 {
+		t.Fatalf("credential generation = %d, want 5", workspace.CredentialGeneration)
+	}
+	var detail strings.Builder
+	writeWorkspaceDetail(&detail, workspace)
+	if output := detail.String(); !strings.Contains(output, "credential_migration_conflict=legacy_pivb") || !strings.Contains(output, "serial=42") || !strings.Contains(output, "key=legacy-key") {
+		t.Fatalf("inspect detail omitted retained legacy provider: %s", output)
+	}
+}
+
 // wedgedV5State reproduces the shape of the real outage: schema 5, a workspace
 // whose desired topology contains a fabricated "Recovered" tab with no
 // enabled_layouts and no layout_state, and an attachment stuck one generation

@@ -249,14 +249,18 @@ func currentPaneCredentialEnvironmentDoctorCheck(paths Paths) (doctorCheck, bool
 	workspaceID := os.Getenv("ZKA_WORKSPACE_ID")
 	rawVersion := os.Getenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION")
 	if rawVersion == "" || rawVersion == "0" {
-		return doctorCheck{Name: name, OK: true, Detail: fmt.Sprintf("pane %s inherits the local SSH_AUTH_SOCK and GNUPGHOME", shortID(paneID))}, false
+		detail := fmt.Sprintf("pane %s uses version 0 direct credentials and is awaiting managed-environment migration", shortID(paneID))
+		if home, homeErr := credentialOpenPGPHome(paths, workspaceID); homeErr == nil {
+			detail += fmt.Sprintf("; managed SSH_AUTH_SOCK=%s; managed GNUPGHOME=%s", agentRelaySocketPath(paths.AgentDir, workspaceID), home)
+		}
+		return doctorCheck{Name: name, Detail: detail}, true
 	}
 	version, err := strconv.Atoi(rawVersion)
 	if err != nil || version < 0 {
 		return doctorCheck{Name: name, Detail: fmt.Sprintf("pane %s has invalid credential environment version %q", shortID(paneID), rawVersion)}, true
 	}
-	if version == credentialEnvironmentVersion {
-		return doctorCheck{Name: name, OK: true, Detail: fmt.Sprintf("pane %s uses managed remote credential environment v%d", shortID(paneID), version)}, false
+	if version == legacyCredentialEnvironmentVersion || version == 3 || version == credentialEnvironmentVersion {
+		return doctorCheck{Name: name, OK: true, Detail: fmt.Sprintf("pane %s uses managed credential environment v%d", shortID(paneID), version)}, false
 	}
 	if version > credentialEnvironmentVersion {
 		return doctorCheck{Name: name, Detail: fmt.Sprintf("pane %s uses credential environment v%d, newer than this zka supports", shortID(paneID), version)}, true

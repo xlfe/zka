@@ -11,7 +11,9 @@ import (
 )
 
 const (
-	stateSchemaVersion = 8
+	stateSchemaVersion = 9
+	// 13 makes credential ownership workspace- and node-scoped, independently
+	// of Kitty attachments, and gives every pane one stable managed endpoint.
 	// 12 adds workspace-scoped, provider-mutable PIVB credential routing.
 	// 11 combines credential target heartbeat/snapshot reconciliation. There is
 	// no compatibility shim: every CLI and daemon on a node must be upgraded
@@ -19,7 +21,8 @@ const (
 	// 10 replaces the workspace-agent API with credential bundles. There is no
 	// compatibility shim: every CLI and daemon on a node must be upgraded
 	// together.
-	daemonProtocolVersion = 12
+	daemonProtocolVersion = 13
+	// 13 replaces attachment-owned claims with node-owned credential bindings.
 	// 12 adds the PIVB credential manifest and stream capability.
 	// 11 binds both peer node IDs into the SSH control handshake and requires a
 	// credential-provider acknowledgement before a claim can be created.
@@ -33,7 +36,7 @@ const (
 	// remote pane, and sends the source pane instead. An origin that predates
 	// this would quietly place every remote pane in the home directory, so the
 	// version check turns that into an explicit upgrade prompt.
-	remoteProtocolVersion = 12
+	remoteProtocolVersion = 13
 	remoteProtocolName    = "zka.workspace"
 	remoteProtocolMax     = 1 << 20
 )
@@ -154,6 +157,8 @@ type Pane struct {
 	Notifications                map[string]NotificationRecord `json:"notifications,omitempty"`
 	BackendCreated               bool                          `json:"backend_created"`
 	CredentialEnvironmentVersion int                           `json:"credential_environment_version,omitempty"`
+	CredentialMigrationState     string                        `json:"credential_migration_state,omitempty"`
+	CredentialMigrationError     string                        `json:"credential_migration_error,omitempty"`
 	BackendReady                 bool                          `json:"backend_ready"`
 	BackendStart                 bool                          `json:"backend_starting,omitempty"`
 	BackendDead                  bool                          `json:"backend_dead,omitempty"`
@@ -296,30 +301,32 @@ type Workspace struct {
 	Name string `json:"name"`
 	// CreationKey deduplicates replays of the same birth request after a
 	// dropped SSH response; see createWorkspaceRequest.CreationKey.
-	CreationKey         string                 `json:"creation_key,omitempty"`
-	Origin              Host                   `json:"origin"`
-	RemoteHost          string                 `json:"remote_host,omitempty"`
-	Revision            uint64                 `json:"revision"`
-	Shell               []string               `json:"shell"`
-	Panes               map[string]*Pane       `json:"panes"`
-	Topology            DesiredTopology        `json:"topology"`
-	Manifest            Manifest               `json:"manifest"`
-	Attachments         map[string]*Attachment `json:"attachments"`
-	PrimaryAttachmentID string                 `json:"primary_attachment_id,omitempty"`
-	CredentialClaim     *CredentialClaim       `json:"credential_claim,omitempty"`
-	PIVBProvider        *WorkspacePIVBProvider `json:"pivb_provider,omitempty"`
-	PendingRevocations  []string               `json:"pending_revocations,omitempty"`
-	Attention           AgentState             `json:"attention"`
-	RestoreFocusPaneID  string                 `json:"restore_focus_pane_id,omitempty"`
-	DeletionPending     bool                   `json:"deletion_pending,omitempty"`
-	DeletionError       string                 `json:"deletion_error,omitempty"`
-	CreatedAt           time.Time              `json:"created_at"`
-	UpdatedAt           time.Time              `json:"updated_at"`
+	CreationKey          string                 `json:"creation_key,omitempty"`
+	Origin               Host                   `json:"origin"`
+	RemoteHost           string                 `json:"remote_host,omitempty"`
+	Revision             uint64                 `json:"revision"`
+	Shell                []string               `json:"shell"`
+	Panes                map[string]*Pane       `json:"panes"`
+	Topology             DesiredTopology        `json:"topology"`
+	Manifest             Manifest               `json:"manifest"`
+	Attachments          map[string]*Attachment `json:"attachments"`
+	PrimaryAttachmentID  string                 `json:"primary_attachment_id,omitempty"`
+	CredentialClaim      *CredentialClaim       `json:"credential_claim,omitempty"`
+	CredentialGeneration uint64                 `json:"credential_generation,omitempty"`
+	PIVBProvider         *WorkspacePIVBProvider `json:"pivb_provider,omitempty"`
+	PendingRevocations   []string               `json:"pending_revocations,omitempty"`
+	Attention            AgentState             `json:"attention"`
+	RestoreFocusPaneID   string                 `json:"restore_focus_pane_id,omitempty"`
+	DeletionPending      bool                   `json:"deletion_pending,omitempty"`
+	DeletionError        string                 `json:"deletion_error,omitempty"`
+	CreatedAt            time.Time              `json:"created_at"`
+	UpdatedAt            time.Time              `json:"updated_at"`
 }
 
 type CredentialClaim struct {
+	ProviderSource    string                                `json:"provider_source"` // local or remote
 	Bundle            string                                `json:"bundle"`
-	OwnerAttachmentID string                                `json:"owner_attachment_id"`
+	OwnerAttachmentID string                                `json:"owner_attachment_id,omitempty"` // v8 migration only
 	OwnerNodeID       string                                `json:"owner_node_id"`
 	Generation        uint64                                `json:"generation"`
 	State             string                                `json:"state"`
@@ -347,9 +354,9 @@ type CredentialPIVBManifest struct {
 	Card             CredentialPIVBCard             `json:"card"`
 }
 
-// WorkspacePIVBProvider owns the stable workspace PIVB route independently
-// from any individual agent session. Provider and generation may change while
-// the route socket and fixed agent alias remain stable.
+// WorkspacePIVBProvider is the schema-v8 split PIVB binding retained only so a
+// migration conflict can be diagnosed and recovered. New state uses the PIVB
+// capability on CredentialClaim.
 type WorkspacePIVBProvider struct {
 	Source            string                 `json:"source"` // local or attachment
 	Bundle            string                 `json:"bundle"`

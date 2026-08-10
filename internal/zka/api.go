@@ -157,9 +157,11 @@ func (a API) ReleaseWorkspaceCredentials(ctx context.Context, workspace string) 
 	return out, err
 }
 
-func (a API) ActivateLocalPIVB(ctx context.Context, workspace, bundle string, ifUnclaimed bool) (workspaceCredentialStatus, error) {
+func (a API) ActivateLocalCredentials(ctx context.Context, workspace, bundle string, ifUnclaimed bool) (workspaceCredentialStatus, error) {
 	var out workspaceCredentialStatus
-	err := a.client.Call(ctx, "credentials_activate_local", workspaceCredentialRequest{Workspace: workspace, Bundle: bundle, IfUnclaimed: ifUnclaimed}, &out)
+	err := a.client.Call(ctx, "credentials_activate_local", workspaceCredentialRequest{
+		Workspace: workspace, Bundle: bundle, IfUnclaimed: ifUnclaimed, CallerSSHAuthSock: os.Getenv("SSH_AUTH_SOCK"),
+	}, &out)
 	return out, err
 }
 
@@ -181,12 +183,6 @@ func (a API) CredentialStatus(ctx context.Context, workspace string) (credential
 
 func (a API) setCredentialTransport(ctx context.Context, req credentialTransportSessionRequest) error {
 	return a.client.Call(ctx, "credentials_transport_session", req, nil)
-}
-
-func (a API) credentialTargetSnapshot(ctx context.Context, provider Host) ([]*Workspace, error) {
-	var out []*Workspace
-	err := a.client.Call(ctx, "credentials_target_snapshot", credentialTransportSessionRequest{Provider: provider, State: "ready"}, &out)
-	return out, err
 }
 
 func (a API) UpdateManifest(ctx context.Context, req manifestUpdateRequest) (*Workspace, error) {

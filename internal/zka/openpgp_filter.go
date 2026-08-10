@@ -187,7 +187,7 @@ func (f *openPGPFilter) serve(ctx context.Context) error {
 				}
 				continue
 			}
-			f.description = "Remote OpenPGP request from " + f.daemon.credentialNoticeContext(f.host, f.hello, f.allowed[f.selectedGrip], f.selectedFor)
+			f.description = "Workspace OpenPGP request from " + f.daemon.credentialNoticeContext(f.host, f.hello, f.allowed[f.selectedGrip], f.selectedFor)
 			if err := f.forwardSimple("SETKEYDESC " + assuanEscapeDescription(f.description)); err != nil {
 				return err
 			}
@@ -794,7 +794,11 @@ func openPGPKeygripCardBacked(socket, grip string) bool {
 func (d *Daemon) credentialNoticeContext(host string, hello credentialStreamHello, fingerprint, operation string) string {
 	workspaceName := shortID(hello.Workspace)
 	d.mu.Lock()
-	if remote := d.state.Remotes[host]; remote != nil {
+	if host == "" {
+		if workspace := d.state.Workspaces[hello.Workspace]; workspace != nil && workspace.Name != "" {
+			workspaceName = workspace.Name
+		}
+	} else if remote := d.state.Remotes[host]; remote != nil {
 		if workspace := remote.Workspaces[hello.Workspace]; workspace != nil && workspace.Name != "" {
 			workspaceName = workspace.Name
 		}

@@ -424,7 +424,7 @@ OpenPGP fingerprints:
 ```nix
 # Shared by laptop (provider) and devbox (origin).
 services.zka.credentials = {
-  defaultBundle = "work"; # selection only; it does not claim automatically
+  defaultBundle = "work"; # bound automatically only when creating a workspace
   bundles.work = {
     sshAgent.enable = true;
     openpgp.enable = true;
@@ -447,7 +447,7 @@ services.zka.credentials.bundles.work.openpgp.signingKeys = [
 > provider. Anyone who followed those instructions can have affected panes:
 > local Git push and SSH fail because `SSH_AUTH_SOCK` names an absent relay,
 > while GPG sees an empty managed keyring with agent autostart disabled. Upgrade
-> to v0.8.2 on the whole fleet and follow the migration steps below.
+> to this release on the whole fleet and follow the migration steps below.
 
 Pin the two zka nodes before claiming credentials. `zka doctor` prints the
 local `node=` value. On `laptop`, bind the outbound SSH alias to `devbox`'s
@@ -488,39 +488,48 @@ suitable provider agent, extra socket, and pinentry, leave it false there too.
 The setting is deliberately opt-in because the user agent is shared with every
 other smart-card consumer in that session.
 
-Attach, then claim the bundle explicitly:
+New workspaces default to the credential bundle of the machine creating them.
+For a local create, the origin node binds its local bundle. For a remote create,
+the machine driving zka binds its bundle on the remote origin before attaching:
+
+```fish
+zka kitty --name local-project
+zka workspace create devbox:new-project --attach
+zka workspace create devbox:public-project --attach --no-credentials
+```
+
+`defaultBundle` supplies the creation default and the name used when `--bundle`
+is omitted. `--credential-bundle` overrides it; `--no-credentials` creates an
+unclaimed workspace whose managed endpoints fail closed. It does not restore
+ambient `SSH_AUTH_SOCK` or `GNUPGHOME` inside the pane.
+
+Attaching an existing workspace never changes its provider automatically. Use
+an explicit claim when the attaching machine should take over the whole bundle:
 
 ```fish
 zka workspace attach devbox:example-project
-zka workspace credentials claim --bundle work devbox:example-project
+zka workspace attach devbox:example-project --claim-credentials --credential-bundle work
 zka workspace credentials status --json devbox:example-project
 ```
 
-Or combine creation/attachment with the claim:
-
-```fish
-zka workspace attach devbox:example-project --claim-credentials --credential-bundle work
-zka workspace create devbox:new-project --attach --claim-credentials --credential-bundle work
-```
-
-`defaultBundle` only supplies the name when `--bundle` is omitted. A claim is
-workspace-wide and ends on explicit release, workspace deletion, or detaching
-its owner attachment:
+A binding is workspace-wide and owned by the provider node, not by a Kitty
+attachment or SSH process. Detaching a view therefore leaves credentials bound.
+The binding ends on explicit release or workspace deletion:
 
 ```fish
 zka workspace credentials release devbox:example-project
 ```
 
-A transient control disconnect retains the durable claim but removes the
-origin endpoints and reports the capabilities as degraded. Reconnection
-re-resolves provider sockets and idempotently republishes authorized endpoints.
+A transient control disconnect retains both the durable binding and the stable
+origin endpoints, reports remote capabilities as degraded, and fails new
+operations closed. Reconnection replaces only the private provider transport;
+panes and zmx backends keep using the same paths.
 
-PIVB routing is owned by the workspace independently of SSH/OpenPGP pane
-environments. A remote claim atomically replaces an active local PIVB provider.
-Release or owner-attachment detach removes that remote route and deliberately
-leaves the stable workspace socket unavailable; it never falls back to a local
-card. A trusted local launcher may explicitly and idempotently activate the
-origin card when the workspace is unclaimed:
+PIVB, SSH-agent, and OpenPGP move as one bundle. A remote claim atomically
+replaces an active local provider. Release leaves every stable workspace
+endpoint unavailable; it never falls back to a local card. A trusted local
+launcher may explicitly and idempotently activate the origin bundle when the
+workspace is unclaimed:
 
 ```fish
 zka workspace credentials activate-local --if-unclaimed --bundle work example-project
@@ -536,9 +545,10 @@ The bare `endpoint` command exits nonzero for an unclaimed or degraded route;
 use `endpoint --json` when inspecting route state rather than launching an
 agent session.
 
-The endpoint path stays fixed for the workspace. Provider changes replace the
-listener behind it, so an already-running fixed-alias sandbox can use a newly
-claimed provider without receiving a new socket or broader authority. The
+The endpoint path and daemon-owned listener stay fixed for the workspace.
+Provider changes replace the route behind it, so an already-running fixed-alias
+sandbox can use a newly claimed provider without receiving a new socket or
+broader authority. The
 claim pins the live slot-9c serial, JWK key ID, and SPKI; a different card
 requires a new explicit claim or local activation. Before takeover, the origin
 also checks the remote provider, issuer, alias targets, and serial/key ID against
@@ -549,22 +559,17 @@ the signed token and local enrollment. See
 PIVB service, timeout, and smart-card lease contract.
 
 The credential environment is fixed when the zmx backend is created, not when a
-view attaches or a claim changes. A pane created locally inherits the origin's
-ordinary `SSH_AUTH_SOCK` and `GNUPGHOME`; it needs no local claim, and same-node
-claims remain unsupported. A pane created through `remote-attach` instead gets
-the stable workspace paths and fails closed until a remote provider claims the
-workspace. Attaching later never pretends to rewrite either environment.
+view attaches or a provider changes. Every new local or remote pane receives the
+same stable workspace `SSH_AUTH_SOCK` and `GNUPGHOME`. An unclaimed or
+disconnected route fails closed; a local binding routes those paths to the
+origin provider, and an explicit remote claim transfers them without recreating
+the pane, zmx backend, sandbox, or attachment.
 
-That immutability works in both directions. A locally created pane must be
-recreated through the remote attachment before it can consume a later claim. A
-remotely created pane retains managed paths when viewed at the origin and may
-need local recreation after release to regain ordinary origin credentials.
-Credential status reports the affected pane IDs for SSH, OpenPGP, or combined
-bundles. If the provider daemon restarts without an explicit
+If a remote provider daemon restarts without an explicit
 `ssh.identityAgent`, SSH becomes degraded until the bundle is re-claimed rather
 than silently switching agents.
 
-Remote projection intentionally uses the union of capabilities in every
+Endpoint projection intentionally uses the union of capabilities in every
 configured bundle, not only the currently claimed bundle. This pre-creates
 stable paths so a later claim can activate them without replacing the backend.
 For example, an SSH-only claim can still have an empty, fail-closed `GNUPGHOME`
@@ -578,7 +583,7 @@ keyring data loss.
 
 ### Migrating from v0.8.0
 
-After upgrading and restarting zka across the fleet, inventory legacy pane
+After upgrading and restarting zka across the fleet, inventory pane
 environments:
 
 ```fish
@@ -586,40 +591,22 @@ zka doctor
 zka workspace credentials status --json
 ```
 
-Environment version 2 cannot distinguish a broken locally created pane from a
-healthy remotely created pane. Both are reported, but do not blindly recreate
-long-lived sessions. Run each probe enabled by the bundle inside the listed
-pane:
+Environment versions 2 and 3 already contain stable workspace paths and remain
+valid. Version 0 panes contain the regressed direct local environment. zkad
+prepares the workspace's existing binding, or its local `defaultBundle` when it
+is unclaimed, verifies daemon listeners and `zmx run <name> -d`, then recreates
+each version 0 backend with environment version 4. This terminates programs in
+that pane; durable migration status makes a daemon interruption retryable. The
+replacement is launched by zkad and therefore inherits the daemon service's
+environment, not arbitrary session variables from the old shell. If a pane
+depends on session-specific environment such as direnv exports or custom PATH
+entries, recreate the workspace from that shell instead of relying on automatic
+migration.
 
-```fish
-ssh-add -l
-gpg --list-secret-keys
-```
-
-Recreate panes where the local credential probe fails. A pane created remotely
-and still reaching its claimed provider is already healthy. On an unclaimed
-workspace, `pane_recreation_detail` describes the v0.8.0 repair; on a claimed
-workspace it instead explains which panes cannot be proven to consume the
-claim. Recreation terminates that pane's live backend process, so it is never
-automatic.
-
-For a pane that cannot be recreated immediately, repair the current fish shell
-and programs started from it with the real local provider environment:
-
-```fish
-set -e GNUPGHOME
-set -gx SSH_AUTH_SOCK /run/user/(id -u)/gnupg/S.gpg-agent.ssh
-```
-
-Replace the second path with `services.zka.ssh.identityAgent`. If it is not
-configured, read `SSH_AUTH_SOCK` in a normal non-zka terminal and use that
-value. Leave `ZKA_CREDENTIAL_ENVIRONMENT_VERSION` intact so doctor and status
-continue to identify the backend until it is recreated.
-
-Inside a version-2 pane, doctor reports only the origin-side workspace relay and
-managed GnuPG home. Provider agent and extra-socket paths remain memory-only and
-are never printed by this migration check. This new failed check makes `zka
-doctor` return exit status 1, including when invoked by a script.
+If no default or explicit binding exists, or the installed zmx lacks detached
+run support, the pane is left running and `credentials status` reports the
+blocking reason. Provider transfer is refused while version 0 migration is
+pending. Schema migration writes a one-time `.v8.backup` beside the state file.
 
 For each OpenPGP private-key operation, the provider must have an interactive
 session, must not report a positive screen lock, and must successfully deliver a
@@ -661,7 +648,7 @@ or substitute for OpenSSH host/user authentication.
 | --- | --- | --- |
 | Network | zka opens no TCP listener. Remote control, topology, and credential streams travel inside authenticated, encrypted OpenSSH sessions; incompatible protocols fail closed. | SSH configuration, host keys, authorized client keys, and the remote Unix account remain part of the trusted computing base. |
 | Local user | Runtime/state directories are mode `0700`, files and Unix sockets are `0600`, and the systemd unit uses `UMask=0077` and `NoNewPrivileges=true`. | Any process already running as that Unix user can read user-owned state and can connect to a credential socket whose path it can reach. Per-workspace sockets are routing boundaries, not same-UID isolation. |
-| Workspace | Remote provider credential access requires an explicit durable claim owned by a ready attachment. Disconnect removes listeners; reconnect republishes only the current bundle/generation. Locally created panes inherit origin credentials without a claim. | A claimed origin is trusted to request the granted operations. A compromised origin process is not confined to the visible pane that motivated the claim. |
+| Workspace | Creation binds the driver's default bundle unless explicitly disabled. Later attachment never claims implicitly. Bindings are provider-node-owned; detach does not release them. Daemon-owned endpoints remain stable and fail closed while a remote transport is unavailable. | A claimed origin is trusted to request the granted operations. A compromised origin process is not confined to the visible pane that motivated the claim. |
 | Provider identity | The outbound alias is pinned to an expected target node ID, and the origin accepts credential listeners only from configured provider node IDs. Optional source CIDRs can narrow fixed-host deployments. | The provider node ID is asserted inside an authenticated SSH session but is not yet bound to the particular client public key. Another key authorized for the same account could assert a configured ID. Public-key binding through sshd authentication metadata remains future work. |
 
 ### Socket resolution policy
