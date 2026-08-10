@@ -981,7 +981,9 @@ func TestHookRelayBlockingChildProcess(t *testing.T) {
 			os.Exit(128 + int(syscall.SIGINT))
 		}
 	}
-	select {}
+	for {
+		time.Sleep(time.Hour)
+	}
 }
 
 func TestHookRelaySupervisorProcess(t *testing.T) {
