@@ -9,7 +9,7 @@ import (
 )
 
 func TestCodexHookMapsUserPromptToHiddenPane(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,14 +41,14 @@ func TestCodexHookWithoutManagedPaneIsNoop(t *testing.T) {
 	t.Setenv("ZKA_WORKSPACE_ID", "")
 	t.Setenv("ZKA_PANE_ID", "")
 	var output bytes.Buffer
-	code, err := runHook([]string{"codex"}, testPaths(t.TempDir()), strings.NewReader(`{"hook_event_name":"Stop"}`), &output)
+	code, err := runHook([]string{"codex"}, testPaths(testRoot(t)), strings.NewReader(`{"hook_event_name":"Stop"}`), &output)
 	if err != nil || code != 0 || output.String() != "{}\n" {
 		t.Fatalf("hook = %d, %v, %q", code, err, output.String())
 	}
 }
 
 func TestClaudeHookMapsInteractiveLifecycle(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestClaudeHookMapsInteractiveLifecycle(t *testing.T) {
 }
 
 func TestClaudeHookSubagentsOnlyPropagateAttention(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestClaudeHookIgnoresUnsupportedEventsAndTools(t *testing.T) {
 }
 
 func TestManagedHookMalformedAndOversizedInputIsNoop(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +223,7 @@ func TestManagedHookDoesNotRequireRuntimeForUnmanagedShell(t *testing.T) {
 
 func TestHookRejectsUnknownAgent(t *testing.T) {
 	var output bytes.Buffer
-	code, err := runHook([]string{"other"}, testPaths(t.TempDir()), strings.NewReader(`{}`), &output)
+	code, err := runHook([]string{"other"}, testPaths(testRoot(t)), strings.NewReader(`{}`), &output)
 	if code != 2 || err == nil || !strings.Contains(err.Error(), "codex|claude") {
 		t.Fatalf("runHook = %d, %v, %q", code, err, output.String())
 	}

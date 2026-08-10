@@ -55,7 +55,7 @@ func TestFocusSwayWindowUsesKittyProcessID(t *testing.T) {
 func TestFocusSwayWindowSkipsNonSwaySession(t *testing.T) {
 	t.Setenv("SWAYSOCK", "")
 	t.Setenv("I3SOCK", "")
-	runtimeDir := t.TempDir()
+	runtimeDir := testRoot(t)
 	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 	if err := os.WriteFile(filepath.Join(runtimeDir, "sway-ipc.1000.41.sock"), nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -72,7 +72,7 @@ func TestFocusSwayWindowSkipsNonSwaySession(t *testing.T) {
 func TestFocusSwayWindowDiscoversSocketCreatedAfterDaemonStart(t *testing.T) {
 	t.Setenv("SWAYSOCK", "")
 	t.Setenv("I3SOCK", "")
-	runtimeDir := t.TempDir()
+	runtimeDir := testRoot(t)
 	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 	socket := filepath.Join(runtimeDir, "sway-ipc.1000.42.sock")
 	listener, err := net.Listen("unix", socket)
@@ -97,7 +97,7 @@ func TestFocusSwayWindowDiscoversSocketCreatedAfterDaemonStart(t *testing.T) {
 func TestFocusSwayWindowExecRunnerReceivesDiscoveredSocket(t *testing.T) {
 	t.Setenv("SWAYSOCK", "")
 	t.Setenv("I3SOCK", "")
-	runtimeDir := t.TempDir()
+	runtimeDir := testRoot(t)
 	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 	socket := filepath.Join(runtimeDir, "sway-ipc.1000.43.sock")
 	listener, err := net.Listen("unix", socket)
@@ -203,7 +203,7 @@ func TestRunSwayCommandFallsBackFromStaleSwayToI3(t *testing.T) {
 }
 
 func TestRunSwayCommandRuntimeFallbackIsNewestFirstAndCrossPhaseDeduplicated(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir := testRoot(t)
 	hintPath := listenSwayTestSocket(t, runtimeDir, "sway-ipc.1000.10.sock", time.Unix(30, 0))
 	olderLive := listenSwayTestSocket(t, runtimeDir, "sway-ipc.1000.11.sock", time.Unix(10, 0))
 	newerDead := listenSwayTestSocket(t, runtimeDir, "sway-ipc.1000.12.sock", time.Unix(20, 0))
@@ -272,7 +272,7 @@ func TestRunSwayCommandBoundsEveryAttemptWithoutCallerDeadline(t *testing.T) {
 }
 
 func TestRunSwayCommandFirstRuntimeCandidateGetsPrimaryBudget(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir := testRoot(t)
 	runtimeSocket := listenSwayTestSocket(t, runtimeDir, "sway-ipc.1000.19.sock", time.Now())
 	values := map[string]string{"XDG_RUNTIME_DIR": runtimeDir}
 	var remaining time.Duration
@@ -318,7 +318,7 @@ func TestRunSwayCommandPreservesSuccessAtAttemptDeadline(t *testing.T) {
 }
 
 func TestRunSwayCommandHungFallbackDoesNotStarveRuntimeCandidate(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir := testRoot(t)
 	runtimeSocket := listenSwayTestSocket(t, runtimeDir, "sway-ipc.1000.20.sock", time.Now())
 	values := map[string]string{
 		"SWAYSOCK": "/run/user/1234/stale.sock", "I3SOCK": "/run/user/1234/hung.sock",
@@ -350,7 +350,7 @@ func TestRunSwayCommandHungFallbackDoesNotStarveRuntimeCandidate(t *testing.T) {
 }
 
 func TestRunSwayCommandDoesNotCacheRecoveredSocket(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir := testRoot(t)
 	runtimeSocket := listenSwayTestSocket(t, runtimeDir, "sway-ipc.1000.30.sock", time.Now())
 	values := map[string]string{"SWAYSOCK": "/run/user/1234/stale.sock", "XDG_RUNTIME_DIR": runtimeDir}
 	scans := 0
@@ -380,7 +380,7 @@ func TestRunSwayCommandDoesNotCacheRecoveredSocket(t *testing.T) {
 }
 
 func TestRunSwayCommandReportsAllFailedCandidates(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir := testRoot(t)
 	runtimeSocket := listenSwayTestSocket(t, runtimeDir, "sway-ipc.1000.40.sock", time.Now())
 	values := map[string]string{"SWAYSOCK": "/run/user/1234/stale.sock", "XDG_RUNTIME_DIR": runtimeDir}
 	runner := &fakeRunner{handler: func(context.Context, string, ...string) (string, string, error) {
@@ -430,7 +430,7 @@ func TestProbeSwayIPCReportsMissingSocket(t *testing.T) {
 func TestProbeSwayIPCRuntimeRecoveryWithoutHintsIsNotDoctorWarning(t *testing.T) {
 	t.Setenv("SWAYSOCK", "")
 	t.Setenv("I3SOCK", "")
-	runtimeDir := t.TempDir()
+	runtimeDir := testRoot(t)
 	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 	liveSocket := listenSwayTestSocket(t, runtimeDir, "sway-ipc.1000.60.sock", time.Unix(10, 0))
 	deadSocket := listenSwayTestSocket(t, runtimeDir, "sway-ipc.1000.61.sock", time.Unix(20, 0))
@@ -454,7 +454,7 @@ func TestProbeSwayIPCRuntimeRecoveryWithoutHintsIsNotDoctorWarning(t *testing.T)
 func TestDaemonSwayIPCRoundTripUsesDaemonRunner(t *testing.T) {
 	t.Setenv("SWAYSOCK", "")
 	t.Setenv("I3SOCK", "")
-	runtimeDir := t.TempDir()
+	runtimeDir := testRoot(t)
 	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 	socketPath := filepath.Join(runtimeDir, "sway-ipc.1000.45.sock")
 	listener, err := net.Listen("unix", socketPath)
@@ -464,7 +464,7 @@ func TestDaemonSwayIPCRoundTripUsesDaemonRunner(t *testing.T) {
 	defer listener.Close()
 
 	runner := &fakeRunner{}
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,7 +488,7 @@ func TestDaemonSwayIPCRoundTripUsesDaemonRunner(t *testing.T) {
 }
 
 func TestDaemonSwayIPCRoundTripCarriesFailedHintMetadata(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir := testRoot(t)
 	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 	staleHint := filepath.Join(runtimeDir, "sway-ipc.1000.50.sock")
 	t.Setenv("SWAYSOCK", staleHint)
@@ -504,7 +504,7 @@ func TestDaemonSwayIPCRoundTripCarriesFailedHintMetadata(t *testing.T) {
 		}
 		return "", "", fmt.Errorf("unexpected socket %s", args[1])
 	}}
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}

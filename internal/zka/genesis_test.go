@@ -158,7 +158,7 @@ func TestTemplateGenesisRejectsUnmaterializableTemplates(t *testing.T) {
 }
 
 func TestCreateWorkspaceGenesisInstallsTopologyAndManifest(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestCreateWorkspaceGenesisInstallsTopologyAndManifest(t *testing.T) {
 }
 
 func TestCreateWorkspaceGenesisDefaultsPaneCWDToHome(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func TestCreateWorkspaceGenesisRejectsInvalidRequestsAtomically(t *testing.T) {
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+			d, err := newTestDaemon(t, testRoot(t), quietRunner())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -260,7 +260,7 @@ func TestCreateWorkspaceGenesisRejectsInvalidRequestsAtomically(t *testing.T) {
 }
 
 func TestCreateWorkspaceTrimsStoredName(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestCreateWorkspaceTrimsStoredName(t *testing.T) {
 }
 
 func TestGenesisWorkspaceSurvivesDaemonRestartUnchanged(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	runner := newLifecycleRunner()
 	first, err := newTestDaemonAtPaths(t, paths, runner)
 	if err != nil {
@@ -315,7 +315,7 @@ func TestGenesisWorkspaceSurvivesDaemonRestartUnchanged(t *testing.T) {
 // workspace reproduces the same structural digest, so the generation never
 // moves and the attachment goes Ready at generation 1.
 func TestGenesisTopologyConvergesOnFirstCapture(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +376,7 @@ func TestGenesisTopologyConvergesOnFirstCapture(t *testing.T) {
 }
 
 func TestCreateWorkspaceCreationKeyReplaySafety(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +411,7 @@ func TestCreateWorkspaceCreationKeyReplaySafety(t *testing.T) {
 }
 
 func TestGenesisWorkspaceCanBeRolledBackAndKilled(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

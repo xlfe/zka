@@ -101,7 +101,7 @@ func TestBuildAttentionSnapshotSuppressesOnlyTheAcknowledgedEvent(t *testing.T) 
 }
 
 func TestAttentionPausePersistsAcrossDaemonRestart(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	d, err := newTestDaemon(t, root, quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -121,7 +121,7 @@ func TestAttentionPausePersistsAcrossDaemonRestart(t *testing.T) {
 }
 
 func TestAttentionWatchSendsInitialSnapshotAndBroadcastsUpdates(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestAttentionWatchSendsInitialSnapshotAndBroadcastsUpdates(t *testing.T) {
 }
 
 func TestAttentionModeAPIIsPersistentAndIdempotent(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

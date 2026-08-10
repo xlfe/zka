@@ -80,7 +80,7 @@ func TestStructuralDigestTracksStructure(t *testing.T) {
 // old digest it bumped the generation, which demoted every peer and triggered a
 // full rebuild in each of them.
 func TestSplitGeometryChangeDoesNotAdvanceGeneration(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestSplitGeometryChangeDoesNotAdvanceGeneration(t *testing.T) {
 // it forever. Without this, one unreproducible node destroyed the session on a
 // timer indefinitely.
 func TestUnconvergedAttachmentAdoptsObservedTopology(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestUnconvergedAttachmentAdoptsObservedTopology(t *testing.T) {
 // Adoption is bounded by the pane set: a capture that has lost a live pane must
 // never become the desired state.
 func TestAdoptionRefusesToChangeThePaneSet(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestAdoptionRefusesToChangeThePaneSet(t *testing.T) {
 // timer. Treating "not converged yet" as terminal, and terminal as retryable,
 // is what turned a cosmetic mismatch into an endless rebuild loop.
 func TestFatalReconcileStopsFallbackRearming(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestUnknownReconcileErrorIsRetriedNotFatal(t *testing.T) {
 // renderable: promoting a pane while leaving it out of Roots made the workspace
 // permanently unattachable.
 func TestFailedTopologyInstallLeavesWorkspaceRenderable(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +300,7 @@ func TestFailedTopologyInstallLeavesWorkspaceRenderable(t *testing.T) {
 // The stored digest must always describe the stored tree. Rewriting Roots after
 // the digest was computed could persist a target unreachable by construction.
 func TestStoredDigestAlwaysDescribesStoredRoots(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

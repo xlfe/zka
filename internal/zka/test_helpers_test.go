@@ -116,6 +116,42 @@ func fakeDesktop(t testing.TB, d *Daemon) *fakeNotifier {
 	return notifier
 }
 
+// testSocketReserve is the longest suffix the daemon appends to a test root
+// before binding: RuntimeDir, the hook relay root, a 32-character session id
+// and ".sock". Every other runtime socket is shorter than this one.
+const testSocketReserve = len("/run/hook-relays/") + 32 + len(".sock")
+
+// testRoot returns a scratch directory short enough that every Unix socket the
+// daemon binds underneath it stays inside the sockaddr_un ceiling.
+//
+// t.TempDir bakes the test name into the path, so a descriptive test name under
+// an ordinary TMPDIR already overflows before the test body runs: under Nix's
+// /build the daemon and hook relay sockets reached 105 and 128 bytes against a
+// 103-byte limit. Any test that binds a socket needs this instead of t.TempDir.
+func testRoot(t testing.TB) string {
+	t.Helper()
+	bases := []string{""}
+	if os.TempDir() != "/tmp" {
+		bases = append(bases, "/tmp")
+	}
+	var rejected string
+	for _, base := range bases {
+		root, err := os.MkdirTemp(base, "zka-t-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(root)+testSocketReserve <= safeUnixSocketPath {
+			t.Cleanup(func() { _ = os.RemoveAll(root) })
+			return root
+		}
+		_ = os.RemoveAll(root)
+		rejected = root
+	}
+	t.Fatalf("no temporary directory is short enough for a Unix socket: %q leaves %d bytes for a %d-byte suffix; point TMPDIR at a shorter path",
+		rejected, safeUnixSocketPath-len(rejected), testSocketReserve)
+	return ""
+}
+
 func testPaths(root string) Paths {
 	state := filepath.Join(root, "state")
 	runtime := filepath.Join(root, "run")

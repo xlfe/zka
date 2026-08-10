@@ -10,7 +10,7 @@ import (
 )
 
 func TestSchemaSixMigrationWritesRollbackBackup(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func wedgedV5State() StateData {
 // The upgrade must leave the wedged workspace in a state that converges, and it
 // must not need the user to intervene.
 func TestWedgedStateRecoversOnUpgrade(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestWedgedStateRecoversOnUpgrade(t *testing.T) {
 // The wedged attachment must converge on its first pass after the upgrade, with
 // no window destroyed along the way.
 func TestWedgedAttachmentConvergesWithoutDestroyingWindows(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}

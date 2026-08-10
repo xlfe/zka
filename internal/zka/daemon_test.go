@@ -11,7 +11,7 @@ import (
 )
 
 func TestCredentialClaimIsReleasedWhenOwnerAttachmentDetaches(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	configPath := filepath.Join(root, "config.json")
 	if err := os.WriteFile(configPath, []byte(`{"credentials":{"bundles":{"work":{"ssh_agent":{"enable":true}}}}}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -78,7 +78,7 @@ func readyView(paneID string, id int64) map[string]RuntimeView {
 }
 
 func TestWorkspaceAndPaneStateTransitions(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestWorkspaceAndPaneStateTransitions(t *testing.T) {
 }
 
 func TestProcessFailureBecomesPaneAndWorkspaceError(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestProcessFailureBecomesPaneAndWorkspaceError(t *testing.T) {
 }
 
 func TestMarkSeenAcknowledgesErrorWithoutErasingDiagnosticState(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	d, err := newTestDaemon(t, root, quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -176,7 +176,7 @@ func TestMarkSeenAcknowledgesErrorWithoutErasingDiagnosticState(t *testing.T) {
 }
 
 func TestPreparePaneAllocatesAndNeverRestartsMissingBackend(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestPreparePaneAllocatesAndNeverRestartsMissingBackend(t *testing.T) {
 }
 
 func TestPaneAllocationKeyMakesRemoteRetryIdempotent(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestPaneAllocationKeyMakesRemoteRetryIdempotent(t *testing.T) {
 }
 
 func TestTwoPhaseMoveCommitsOnlyReadyDestination(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +272,7 @@ func TestTwoPhaseMoveCommitsOnlyReadyDestination(t *testing.T) {
 }
 
 func TestManifestDoesNotBecomeReadyBeforeZMXClient(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +303,7 @@ func TestManifestDoesNotBecomeReadyBeforeZMXClient(t *testing.T) {
 }
 
 func TestRemoteReplicaManifestDoesNotBecomeReadyBeforeZMXClient(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestRemoteReplicaManifestDoesNotBecomeReadyBeforeZMXClient(t *testing.T) {
 }
 
 func TestWaitForAttachmentReadyWaitsForRemoteClients(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestWaitForAttachmentReadyWaitsForRemoteClients(t *testing.T) {
 }
 
 func TestLateCaptureCannotOverwriteDetachedWorkspaceManifest(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +447,7 @@ func TestLateCaptureCannotOverwriteDetachedWorkspaceManifest(t *testing.T) {
 }
 
 func TestReopeningDetachedWorkspaceRestoresPrimaryRole(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +470,7 @@ func TestReopeningDetachedWorkspaceRestoresPrimaryRole(t *testing.T) {
 }
 
 func TestManifestRejectsForegroundAndUnknownPaneIndirectly(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +491,7 @@ func TestManifestRejectsForegroundAndUnknownPaneIndirectly(t *testing.T) {
 }
 
 func TestDaemonRestartInvalidatesActiveAgentEvidence(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	d, err := newTestDaemon(t, root, quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -515,7 +515,7 @@ func TestDaemonRestartInvalidatesActiveAgentEvidence(t *testing.T) {
 }
 
 func TestDaemonCloseWaitsForWorkersAndRemovesSockets(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,7 +553,7 @@ func TestRemoveStaleSocketRefusesRegularFile(t *testing.T) {
 }
 
 func TestUnknownEventIsRejected(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -565,7 +565,7 @@ func TestUnknownEventIsRejected(t *testing.T) {
 }
 
 func TestUnknownPaneErrorPrefixIsStableForRelayClassification(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

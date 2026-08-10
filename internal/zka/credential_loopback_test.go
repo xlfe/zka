@@ -33,14 +33,9 @@ func TestCredentialLoopbackSignsAndVerifiesGitCommit(t *testing.T) {
 		t.Fatalf("git is required for the credential loopback test: %v", err)
 	}
 
-	// Assuan uses Unix sockets with a small platform path limit. Keep the test
-	// root short even in Nix builders, where testing.T.TempDir includes the full
-	// test name beneath /build.
-	root, err := os.MkdirTemp("", "zka-cred-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	// Assuan uses Unix sockets with a small platform path limit, so this test
+	// needs testRoot rather than t.TempDir.
+	root := testRoot(t)
 	runtimeDir := filepath.Join(root, "runtime")
 	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
 		t.Fatal(err)

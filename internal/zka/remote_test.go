@@ -20,7 +20,7 @@ const (
 )
 
 func TestRemoteControlHelloAndWorkspaceSnapshot(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestRemoteControlHelloAndWorkspaceSnapshot(t *testing.T) {
 }
 
 func TestRemoteControlRejectsVersionMismatch(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestRemoteControlRejectsVersionMismatch(t *testing.T) {
 }
 
 func TestRemoteControlRenamesAndKillsAuthoritativeWorkspace(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestSSHHostAliasIsSafeForKittyShellCommand(t *testing.T) {
 }
 
 func TestRemoteControlCreatesWorkspaceIdempotently(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestRemoteControlCreatesWorkspaceIdempotently(t *testing.T) {
 }
 
 func TestRemoteCreateResponseIsCachedOnDestination(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestRemoteCreateResponseIsCachedOnDestination(t *testing.T) {
 }
 
 func TestRemoteCachePreservesLocalRuntimeMapping(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +292,7 @@ func TestRemoteCachePreservesLocalRuntimeMapping(t *testing.T) {
 }
 
 func TestRemoteCacheKeepsDetachedAttachmentDetached(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +329,7 @@ func TestRemoteCacheKeepsDetachedAttachmentDetached(t *testing.T) {
 
 func TestRemoteSnapshotEvictsMissingWorkspaceAndClosesLocalView(t *testing.T) {
 	runner := quietRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +368,7 @@ func TestRemoteSnapshotEvictsMissingWorkspaceAndClosesLocalView(t *testing.T) {
 }
 
 func TestForgetDetachedRemoteWorkspaceCleansOnlyLocalState(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +439,7 @@ func TestForgetDetachedRemoteWorkspaceCleansOnlyLocalState(t *testing.T) {
 func TestForgetRemoteWorkspaceRequiresEveryLocalAttachmentDetached(t *testing.T) {
 	for _, status := range []AttachmentStatus{AttachmentPreparing, AttachmentReady, AttachmentUnhealthy} {
 		t.Run(string(status), func(t *testing.T) {
-			d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+			d, err := newTestDaemon(t, testRoot(t), quietRunner())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -469,7 +469,7 @@ func TestForgetRemoteWorkspaceRequiresEveryLocalAttachmentDetached(t *testing.T)
 }
 
 func TestForgetRemoteWorkspaceRestoresStateWhenPersistenceFails(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	d, err := newTestDaemon(t, root, quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -499,7 +499,7 @@ func TestForgetRemoteWorkspaceRestoresStateWhenPersistenceFails(t *testing.T) {
 }
 
 func TestRemoteCacheRejectsAuthoritativeLocalWorkspaceCollision(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -519,7 +519,7 @@ func TestRemoteCacheRejectsAuthoritativeLocalWorkspaceCollision(t *testing.T) {
 }
 
 func TestRemoteSnapshotRejectsCollisionBeforeCachingAnyEntry(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -542,7 +542,7 @@ func TestRemoteSnapshotRejectsCollisionBeforeCachingAnyEntry(t *testing.T) {
 }
 
 func TestRemoteDeletionCannotRemoveAuthoritativeLocalSessions(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +562,7 @@ func TestRemoteDeletionCannotRemoveAuthoritativeLocalSessions(t *testing.T) {
 }
 
 func TestRemoteCacheRejectsCrossHostWorkspaceCollision(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,7 +588,7 @@ func TestRemoteCacheRejectsCrossHostWorkspaceCollision(t *testing.T) {
 }
 
 func TestRemoteCacheRejectsMalformedWorkspaceID(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,7 +605,7 @@ func TestRemoteCacheRejectsMalformedWorkspaceID(t *testing.T) {
 
 func TestUnreachableSSHControlReturnsWithoutMutatingWorkspace(t *testing.T) {
 	t.Setenv("ZKA_SSH_COMMAND", "/definitely/missing/zka-ssh")
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,7 +623,7 @@ func TestUnreachableSSHControlReturnsWithoutMutatingWorkspace(t *testing.T) {
 func TestInitialSSHExit255ReturnsDiagnostic(t *testing.T) {
 	t.Setenv("GO_WANT_ZKA_SSH_HELPER", "exit255")
 	t.Setenv("SSH_AUTH_SOCK", "/run/user/1234/agent-a.socket")
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -661,7 +661,7 @@ func TestInitialSSHExit255ReturnsDiagnostic(t *testing.T) {
 
 func TestRemoteCallDeadlineReturnsDaemonErrorInsteadOfSocketTimeout(t *testing.T) {
 	t.Setenv("GO_WANT_ZKA_SSH_HELPER", "hang")
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +688,7 @@ func TestRemoteCallDeadlineReturnsDaemonErrorInsteadOfSocketTimeout(t *testing.T
 
 func TestEstablishedSSHExit255RetriesAndPreservesLastFailure(t *testing.T) {
 	t.Setenv("GO_WANT_ZKA_SSH_HELPER", "hello-exit255")
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -812,7 +812,7 @@ func TestClientHeartbeatFreshness(t *testing.T) {
 }
 
 func TestRemotePaneReadinessComesFromOriginClientHeartbeat(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -847,7 +847,7 @@ func TestRemotePaneReadinessComesFromOriginClientHeartbeat(t *testing.T) {
 }
 
 func TestRemoteDeadPaneIsReadyWhilePlaceholderClientIsAlive(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

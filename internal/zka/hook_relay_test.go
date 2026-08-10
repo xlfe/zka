@@ -32,16 +32,6 @@ func newRecordingHookRelayUpstream() *recordingHookRelayUpstream {
 	return &recordingHookRelayUpstream{seen: make(chan Event, 256)}
 }
 
-func shortHookRelayTestPaths(t *testing.T) Paths {
-	t.Helper()
-	root, err := os.MkdirTemp("", "zka-r-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	return testPaths(root)
-}
-
 func (u *recordingHookRelayUpstream) Event(_ context.Context, event Event) (*Workspace, error) {
 	u.mu.Lock()
 	u.events = append(u.events, event)
@@ -58,7 +48,7 @@ func (u *recordingHookRelayUpstream) Events() []Event {
 
 func startTestHookRelay(t *testing.T, upstream hookRelayUpstream) (*hookRelayServer, string) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "relay.sock")
+	path := filepath.Join(testRoot(t), "relay.sock")
 	listener, err := listenUnixExclusive(path)
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +154,7 @@ func (u *forwardingGateUpstream) Kinds() []string {
 }
 
 func TestHookRelayFIFOEndsInLastAcceptedStateUnderSaturation(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +376,7 @@ func TestHookRelayTokenBucketIsBoundedAndRefills(t *testing.T) {
 
 func TestHookRelayCriticalBucketIsReservedAndBounded(t *testing.T) {
 	upstream := newRecordingHookRelayUpstream()
-	path := filepath.Join(t.TempDir(), "relay.sock")
+	path := filepath.Join(testRoot(t), "relay.sock")
 	listener, err := listenUnixExclusive(path)
 	if err != nil {
 		t.Fatal(err)
@@ -478,7 +468,7 @@ func (l *transientAcceptListener) Accept() (net.Conn, error) {
 
 func TestHookRelayRetriesTransientAcceptError(t *testing.T) {
 	upstream := newRecordingHookRelayUpstream()
-	path := filepath.Join(t.TempDir(), "relay.sock")
+	path := filepath.Join(testRoot(t), "relay.sock")
 	owned, err := listenUnixExclusive(path)
 	if err != nil {
 		t.Fatal(err)
@@ -568,13 +558,13 @@ func TestRelayHookOmitsInvalidTurnIDWithoutDroppingEvent(t *testing.T) {
 }
 
 func TestRelayedCodexAndClaudeWithoutIdentityTouchOnlyBoundPane(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
 	workspace := createTestWorkspace(t, d, 2)
 	panes := workspace.SortedPanes()
-	listener, err := listenUnixExclusive(filepath.Join(t.TempDir(), "relay.sock"))
+	listener, err := listenUnixExclusive(filepath.Join(testRoot(t), "relay.sock"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -615,7 +605,7 @@ func TestRelayedCodexAndClaudeWithoutIdentityTouchOnlyBoundPane(t *testing.T) {
 }
 
 func TestHookRelayMissingDaemonRemainsBestEffort(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	path := filepath.Join(root, "relay.sock")
 	listener, err := listenUnixExclusive(path)
 	if err != nil {
@@ -637,7 +627,7 @@ func TestHookRelayMissingDaemonRemainsBestEffort(t *testing.T) {
 }
 
 func TestHookRelaySessionPermissionsLivenessDoctorAndSweep(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	logger := log.New(io.Discard, "", 0)
 	session, err := createHookRelaySession(paths, logger)
 	if err != nil {
@@ -711,7 +701,7 @@ func TestHookRelaySessionPermissionsLivenessDoctorAndSweep(t *testing.T) {
 }
 
 func TestHookRelaySweepPreservesReplacementSocketInode(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	logger := log.New(io.Discard, "", 0)
 	session, err := createHookRelaySession(paths, logger)
 	if err != nil {
@@ -782,7 +772,7 @@ func TestHookRelaySweepRemovesUnverifiableSessionMetadata(t *testing.T) {
 		{"truncated record", func(path string) error { return os.WriteFile(path, []byte("{"), 0o600) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			paths := shortHookRelayTestPaths(t)
+			paths := testPaths(testRoot(t))
 			var journal syncBuffer
 			logger := log.New(&journal, "", 0)
 			session, err := createHookRelaySession(paths, logger)
@@ -854,7 +844,7 @@ func TestHookRelaySessionLockRetriesDoctorRace(t *testing.T) {
 }
 
 func TestHookRelayDoctorTreatsYoungIncompleteSessionAsStarting(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	root := hookRelayRoot(paths)
 	if err := prepareHookRelayRoot(root); err != nil {
 		t.Fatal(err)
@@ -896,13 +886,9 @@ func TestHookRelaySupervisorChildProcess(t *testing.T) {
 }
 
 func TestRelayCommandDefaultsIdentityPreservesLauncherEnvironmentAndReaps(t *testing.T) {
-	// Keep this root deliberately short: the relay is also testing the real
-	// sockaddr_un path ceiling, and t.TempDir includes the long test name.
-	root, err := os.MkdirTemp("", "zka-r-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	// The relay binds under this root, so it has to clear the real sockaddr_un
+	// ceiling rather than merely exist.
+	root := testRoot(t)
 	resultPath := filepath.Join(root, "child.json")
 	controlSocket := filepath.Join(root, "control.sock")
 	t.Setenv("ZKA_RUNTIME_DIR", filepath.Join(root, "run"))
@@ -941,11 +927,7 @@ func TestRelayCommandDefaultsIdentityPreservesLauncherEnvironmentAndReaps(t *tes
 }
 
 func TestRelayCommandStartsOutsideManagedPaneWithExplicitIdentity(t *testing.T) {
-	root, err := os.MkdirTemp("", "zka-r-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := testRoot(t)
 	resultPath := filepath.Join(root, "child.json")
 	t.Setenv("ZKA_RUNTIME_DIR", filepath.Join(root, "run"))
 	t.Setenv("ZKA_STATE_DIR", filepath.Join(root, "state"))
@@ -1019,11 +1001,7 @@ func TestHookRelaySupervisorProcess(t *testing.T) {
 func TestHookRelaySupervisorCleansUpOnSignals(t *testing.T) {
 	for _, signal := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT} {
 		t.Run(signal.String(), func(t *testing.T) {
-			root, err := os.MkdirTemp("", "zka-r-")
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = os.RemoveAll(root) })
+			root := testRoot(t)
 			ready := filepath.Join(root, "ready")
 			cmd := exec.Command(os.Args[0], "-test.run=^TestHookRelaySupervisorProcess$")
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -1088,11 +1066,7 @@ func TestHookRelaySupervisorCleansUpOnSignals(t *testing.T) {
 }
 
 func TestHookRelayPIDOnlySIGINTDoesNotArmKillTimer(t *testing.T) {
-	root, err := os.MkdirTemp("", "zka-r-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := testRoot(t)
 	ready := filepath.Join(root, "ready")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestHookRelaySupervisorProcess$")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -1190,7 +1164,7 @@ func TestHookRelaySignalPolicyAvoidsDoubleAndCrossSignalEscalation(t *testing.T)
 }
 
 func TestExclusiveUnixListenerRejectsCollision(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "relay.sock")
+	path := filepath.Join(testRoot(t), "relay.sock")
 	if err := os.WriteFile(path, []byte("do not replace"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1204,7 +1178,7 @@ func TestExclusiveUnixListenerRejectsCollision(t *testing.T) {
 }
 
 func TestOwnedUnixListenerDoesNotRemoveReplacementInode(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "relay.sock")
+	path := filepath.Join(testRoot(t), "relay.sock")
 	listener, err := listenUnixExclusive(path)
 	if err != nil {
 		t.Fatal(err)

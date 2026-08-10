@@ -12,7 +12,7 @@ import (
 // reconciliation. The reconciler yields to admission instead, and reports a
 // retryable condition rather than parking the attachment in an error state.
 func TestReconcileYieldsToProposedPaneWithoutTouchingIt(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestReconcileYieldsToProposedPaneWithoutTouchingIt(t *testing.T) {
 // A converged workspace must be completely silent: no Kitty mutation of any
 // kind. This is the property that makes the reconciler safe to run on a timer.
 func TestConvergedTopologyIssuesNoKittyMutations(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestBackoffScheduleGrowsAndCaps(t *testing.T) {
 // A repeatedly failing endpoint must be rate limited rather than retried on
 // every trigger.
 func TestFailingReconcileBacksOffInsteadOfSpinning(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestFailingReconcileBacksOffInsteadOfSpinning(t *testing.T) {
 // Completing a reconcile must not shorten a settle window that something else
 // deliberately installed.
 func TestReconcileCompletionDoesNotShortenCaptureSuppression(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

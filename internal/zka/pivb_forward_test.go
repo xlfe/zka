@@ -38,8 +38,7 @@ func testPIVBCard(t *testing.T) CredentialPIVBCard {
 
 func serveFakePIVB(t *testing.T, handler http.Handler) string {
 	t.Helper()
-	directory := shortPIVBTestDir(t)
-	socket := filepath.Join(directory, "forward.sock")
+	socket := filepath.Join(testRoot(t), "forward.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -54,16 +53,6 @@ func serveFakePIVB(t *testing.T, handler http.Handler) string {
 		_ = listener.Close()
 	})
 	return socket
-}
-
-func shortPIVBTestDir(t *testing.T) string {
-	t.Helper()
-	directory, err := os.MkdirTemp("/tmp", "zka-pivb-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(directory) })
-	return directory
 }
 
 func TestPIVBBundleConfigRequiresAliasAllowlist(t *testing.T) {
@@ -523,7 +512,7 @@ func TestPIVBProxyCancelsLocalMintWhenClientDisconnects(t *testing.T) {
 }
 
 func TestLocalPIVBListenerRejectsConnectionAcceptedBeforeTakeover(t *testing.T) {
-	d, err := newTestDaemon(t, shortPIVBTestDir(t), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -611,7 +600,7 @@ func TestActivateLocalPIVBIsWorkspaceScopedAndCannotReplaceRemote(t *testing.T) 
 			EnrolledKeys: []pivbEnrolledKey{{Serial: card.Serial, KeyID: card.KeyID}},
 		})
 	})
-	d, err := newTestDaemon(t, shortPIVBTestDir(t), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -714,7 +703,7 @@ func TestLocalPIVBListenerFailureIsPersistedAsDegraded(t *testing.T) {
 			Aliases: map[string]CredentialPIVBAlias{"ro": {Target: "ro@example.iam.gserviceaccount.com"}},
 		})
 	})
-	d, err := newTestDaemon(t, shortPIVBTestDir(t), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

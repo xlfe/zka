@@ -10,11 +10,7 @@ import (
 )
 
 func TestCredentialTargetCachesPublishedOpenPGPSocketPathPerGeneration(t *testing.T) {
-	root, err := os.MkdirTemp("", "zka-target-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := testRoot(t)
 	paths := testPaths(root)
 	socketDir := filepath.Join(root, "gpg-sockets")
 	if err := os.MkdirAll(socketDir, 0o700); err != nil {

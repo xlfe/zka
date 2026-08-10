@@ -181,7 +181,7 @@ func TestCredentialStatusReportsPaneEnvironmentMigrationAndClaimGaps(t *testing.
 }
 
 func TestCredentialStatusDegradesAndRecoversWithTransport(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestFailedCredentialPreparationRetainsPriorClaim(t *testing.T) {
 	runner.handler = func(context.Context, string, ...string) (string, string, error) {
 		return "", "", errors.New("gpg unavailable")
 	}
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestFailedCredentialPreparationRetainsPriorClaim(t *testing.T) {
 }
 
 func TestConcurrentCredentialClaimsAreSerialized(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

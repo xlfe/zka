@@ -16,7 +16,7 @@ import (
 // every ~30 seconds from then on.
 func TestBackendReconcileNeverFabricatesTopologyForProposedPane(t *testing.T) {
 	runner := newLifecycleRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestBackendReconcileNeverFabricatesTopologyForProposedPane(t *testing.T) {
 // capture supplies rather than invented blanks.
 func TestPaneAdmissionCommitsFromRealCapture(t *testing.T) {
 	runner := newLifecycleRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestPaneAdmissionCommitsFromRealCapture(t *testing.T) {
 // which wedges every later capture.
 func TestProposedPaneWithLiveWindowIsNeverRetired(t *testing.T) {
 	runner := newLifecycleRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestProposedPaneWithLiveWindowIsNeverRetired(t *testing.T) {
 // leaked.
 func TestProposedPaneMissingFromKittyIsRetired(t *testing.T) {
 	runner := newLifecycleRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestProposedPaneMissingFromKittyIsRetired(t *testing.T) {
 // Absence evidence may only come from a successful listing. A Kitty remote
 // control outage must never be able to destroy a pane.
 func TestAdmissionRecordsAbsenceOnlyFromSuccessfulListings(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestAdmissionRecordsAbsenceOnlyFromSuccessfulListings(t *testing.T) {
 // An idle endpoint must cost nothing: no proposed pane means no Kitty command
 // at all. This is the contract the idle-update-storm fix established.
 func TestAdmissionIsSilentWithoutProposedPanes(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +266,7 @@ func TestAdmissionIsSilentWithoutProposedPanes(t *testing.T) {
 // Retried allocation for the same Kitty window must be idempotent, but a
 // restarted Kitty reusing window id 1 must not collide with an admitted pane.
 func TestLocalPaneAllocationIsIdempotentPerKittyWindow(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

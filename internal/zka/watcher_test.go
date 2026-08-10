@@ -29,7 +29,7 @@ func TestWatcherBurstDebouncesToOneAuthoritativeCapture(t *testing.T) {
 		}
 		return "", "", nil
 	}}
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestWatcherCloseRemovesPaneAndKillsItsZMXSession(t *testing.T) {
 		}
 		return "", "", nil
 	}}
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestWatcherDetachCloseEventsDoNotDeleteReattachedWorkspace(t *testing.T) {
 		}
 		return "", "", nil
 	}}
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}

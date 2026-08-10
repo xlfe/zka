@@ -29,7 +29,7 @@ func acquireTestCardLease(t *testing.T, socket, operation string) (net.Conn, <-c
 }
 
 func TestCardLeaseSocketSerializesClientsUntilHolderCloses(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -11,7 +11,7 @@ import (
 )
 
 func TestPaneHostPropagatesExitAndReportsError(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	d, err := newTestDaemon(t, root, quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func TestProcessExitCodeForSignal(t *testing.T) {
 // a scratch dir, a removed git worktree. exec fails outright when Dir does not
 // exist, so an unusable directory must be dropped rather than kill the pane.
 func TestPaneHostStartsWhenTheRecordedDirectoryIsGone(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	d, err := newTestDaemon(t, root, quietRunner())
 	if err != nil {
 		t.Fatal(err)

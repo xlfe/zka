@@ -16,7 +16,7 @@ import (
 // tab could never match and the workspace rebuilt itself every 30 seconds
 // forever. Fabricating topology is now banned outright.
 func TestStateLoadProposesLivePaneMissingFromManifestWithoutFabricatingTopology(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestStateLoadProposesLivePaneMissingFromManifestWithoutFabricatingTopology(
 }
 
 func TestPartialCaptureCannotHideActivePane(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestPartialCaptureCannotHideActivePane(t *testing.T) {
 }
 
 func TestMirrorCaptureCommitsPendingPaneToCanonicalTopology(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestMirrorCaptureCommitsPendingPaneToCanonicalTopology(t *testing.T) {
 }
 
 func TestReadyAttachmentRequiresVerifiedTopologyDigest(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestTopologyDigestIgnoresRuntimeLayoutAndFocusIDs(t *testing.T) {
 }
 
 func TestConcurrentMirrorAddsAreRebasedWithoutDroppingEitherPane(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +333,7 @@ func TestConcurrentMirrorAddsAreRebasedWithoutDroppingEitherPane(t *testing.T) {
 }
 
 func TestConcurrentPresentationEditsDoNotDisturbStructure(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +406,7 @@ func TestConcurrentPresentationEditsDoNotDisturbStructure(t *testing.T) {
 }
 
 func TestStaleCaptureCannotOmitPaneFromVerifiedBaseline(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +471,7 @@ func TestStaleCaptureCannotOmitPaneFromVerifiedBaseline(t *testing.T) {
 }
 
 func TestReconcileVerificationIsFencedByTopologyGeneration(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

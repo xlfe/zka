@@ -29,7 +29,7 @@ func (b *synchronizedBuffer) String() string {
 
 func TestKittyStateProjectionUsesOnlyReadyLocalAttachments(t *testing.T) {
 	runner := quietRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestKittyStateProjectionUsesOnlyReadyLocalAttachments(t *testing.T) {
 
 func TestKittyStateProjectionDoesNothingWithoutLocalAttachment(t *testing.T) {
 	runner := quietRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestKittyStateProjectionDoesNothingWithoutLocalAttachment(t *testing.T) {
 }
 
 func TestEndpointLookupIgnoresNonLocalAttachments(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestEndpointLookupIgnoresNonLocalAttachments(t *testing.T) {
 
 func TestRemoteSnapshotIdempotenceAndSingleLocalPaneUpdate(t *testing.T) {
 	runner := quietRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestRemoteSnapshotIdempotenceAndSingleLocalPaneUpdate(t *testing.T) {
 }
 
 func TestRemoteStreamDoesNotReplayInitialSnapshotAsWorkspaceEvents(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func TestRemoteStreamDoesNotReplayInitialSnapshotAsWorkspaceEvents(t *testing.T)
 }
 
 func TestUnchangedManifestCaptureDoesNotAdvanceSemanticTimestamps(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +335,7 @@ func TestUnchangedManifestCaptureDoesNotAdvanceSemanticTimestamps(t *testing.T) 
 }
 
 func TestUnchangedMirrorCaptureDoesNotAdvanceSemanticTimestamps(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

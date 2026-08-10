@@ -95,7 +95,7 @@ func viewsForPanes(paneIDs ...string) map[string]RuntimeView {
 
 func TestBackendReconcileKeepsPartialWorkspaceAndMarksDeadPane(t *testing.T) {
 	runner := newLifecycleRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestBackendReconcileKeepsPartialWorkspaceAndMarksDeadPane(t *testing.T) {
 
 func TestBackendReconcileDeletesWorkspaceWhenAllBackendsAreDead(t *testing.T) {
 	runner := newLifecycleRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestBackendReconcileDeletesWorkspaceWhenAllBackendsAreDead(t *testing.T) {
 }
 
 func TestBackendReconcileDoesNotDeleteUnstartedWorkspace(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), newLifecycleRunner())
+	d, err := newTestDaemon(t, testRoot(t), newLifecycleRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestBackendReconcileDoesNotDeleteUnstartedWorkspace(t *testing.T) {
 }
 
 func TestBackendReconcileDeletesExpiredUnstartedWorkspace(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), newLifecycleRunner())
+	d, err := newTestDaemon(t, testRoot(t), newLifecycleRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +247,7 @@ func backdatePanes(t *testing.T, d *Daemon, workspaceID string, moment time.Time
 
 func TestBackendReconcileKeepsColdAttachableWorkspace(t *testing.T) {
 	runner := newLifecycleRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +267,7 @@ func TestBackendReconcileKeepsColdAttachableWorkspace(t *testing.T) {
 }
 
 func TestBackendReconcileKeepsColdAttachableWorkspaceAcrossRestart(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	runner := newLifecycleRunner()
 	first, err := newTestDaemonAtPaths(t, paths, runner)
 	if err != nil {
@@ -294,7 +294,7 @@ func TestBackendReconcileKeepsColdAttachableWorkspaceAcrossRestart(t *testing.T)
 
 func TestBackendReconcileKeepsColdWorkspaceAfterFailedAttach(t *testing.T) {
 	runner := newLifecycleRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +322,7 @@ func TestBackendReconcileKeepsColdWorkspaceAfterFailedAttach(t *testing.T) {
 
 func TestRegisterAttachmentRearmsBackendStartupGrace(t *testing.T) {
 	runner := newLifecycleRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +379,7 @@ func readyWorkspaceAttachment(t *testing.T, d *Daemon, workspace *Workspace, id 
 }
 
 func TestRenameWorkspaceKeepsStableIdentityAndBackends(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +405,7 @@ func TestRenameWorkspaceKeepsStableIdentityAndBackends(t *testing.T) {
 }
 
 func TestMirrorPaneClosureKillsOnlyClosedBackend(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	d, err := newTestDaemon(t, root, newLifecycleRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -450,7 +450,7 @@ func TestMirrorPaneClosureKillsOnlyClosedBackend(t *testing.T) {
 }
 
 func TestStalePaneClosureDoesNotSignalZMX(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +475,7 @@ func TestStalePaneClosureDoesNotSignalZMX(t *testing.T) {
 }
 
 func TestWorkspaceKillRemovesStateSessionsAndViews(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	d, err := newTestDaemon(t, root, quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -509,7 +509,7 @@ func TestWorkspaceKillRemovesStateSessionsAndViews(t *testing.T) {
 }
 
 func TestKillFailurePersistsAndRestartResumesCleanup(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	d, err := newTestDaemon(t, root, quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -543,7 +543,7 @@ func TestKillFailurePersistsAndRestartResumesCleanup(t *testing.T) {
 }
 
 func TestPaneRemovalFailurePersistsAndRestartResumesCleanup(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	d, err := newTestDaemon(t, root, quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -581,7 +581,7 @@ func TestPaneRemovalFailurePersistsAndRestartResumesCleanup(t *testing.T) {
 }
 
 func TestFinalPaneClosureDeletesWorkspace(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,7 +600,7 @@ func TestFinalPaneClosureDeletesWorkspace(t *testing.T) {
 }
 
 func TestDeletionPendingRejectsMutations(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -620,7 +620,7 @@ func TestDeletionPendingRejectsMutations(t *testing.T) {
 }
 
 func TestRollbackDeleteRejectsAttachmentsAndStartedBackends(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -644,7 +644,7 @@ func TestRollbackDeleteRejectsAttachmentsAndStartedBackends(t *testing.T) {
 }
 
 func TestV2ResetDoesNotKillLegacyZMXSessions(t *testing.T) {
-	root := t.TempDir()
+	root := testRoot(t)
 	paths := testPaths(root)
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -669,7 +669,7 @@ func TestV2ResetDoesNotKillLegacyZMXSessions(t *testing.T) {
 }
 
 func TestConfirmedQuitDeletesButDetachPreserves(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -722,7 +722,7 @@ func cachedRemoteWorkspaceWithLocalView(t *testing.T, d *Daemon) *Workspace {
 
 func TestConfirmedQuitOnRemoteWorkspaceDetachesNotKills(t *testing.T) {
 	t.Setenv("ZKA_SSH_COMMAND", "/definitely/missing/zka-ssh")
-	d, journal, err := newTestDaemonWithLog(t, t.TempDir(), quietRunner())
+	d, journal, err := newTestDaemonWithLog(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -762,7 +762,7 @@ func TestConfirmedQuitOnRemoteWorkspaceDetachesNotKills(t *testing.T) {
 
 func TestRemoteCloseBurstWithoutQuitDetachesNotKills(t *testing.T) {
 	t.Setenv("ZKA_SSH_COMMAND", "/definitely/missing/zka-ssh")
-	d, journal, err := newTestDaemonWithLog(t, t.TempDir(), quietRunner())
+	d, journal, err := newTestDaemonWithLog(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

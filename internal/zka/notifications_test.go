@@ -40,7 +40,7 @@ func setPaneForNotificationWithDetail(t *testing.T, d *Daemon, workspace *Worksp
 func TestDesktopActionFocusesPaneAndMarksSeen(t *testing.T) {
 	t.Setenv("SWAYSOCK", "/run/user/1234/stale-sway-ipc.sock")
 	t.Setenv("I3SOCK", "")
-	runtimeDir := t.TempDir()
+	runtimeDir := testRoot(t)
 	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 	swaySocket := listenSwayTestSocket(t, runtimeDir, "sway-ipc.1000.4242.sock", time.Now())
 	runner := quietRunner()
@@ -51,7 +51,7 @@ func TestDesktopActionFocusesPaneAndMarksSeen(t *testing.T) {
 		}
 		return quietHandler(ctx, name, args...)
 	}
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestDesktopActionFocusesPaneAndMarksSeen(t *testing.T) {
 
 // A click that arrives after the pane is gone must not panic or fabricate work.
 func TestDesktopActionOnUnknownWorkspaceIsQuiet(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestNtfyEvidenceIsOptIn(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			runner := quietRunner()
-			d, err := newTestDaemon(t, t.TempDir(), runner)
+			d, err := newTestDaemon(t, testRoot(t), runner)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -149,7 +149,7 @@ func TestNtfyEvidenceIsOptIn(t *testing.T) {
 
 func TestNtfyPayloadLeadsWithHumanContextInsteadOfIdentifiers(t *testing.T) {
 	runner := quietRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestImportantDetachedStatesUseNtfy(t *testing.T) {
 		{StateError, "-p 5", "rotating_light"},
 	} {
 		runner := quietRunner()
-		d, err := newTestDaemon(t, t.TempDir(), runner)
+		d, err := newTestDaemon(t, testRoot(t), runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -211,7 +211,7 @@ func TestImportantDetachedStatesUseNtfy(t *testing.T) {
 }
 
 func TestNotificationDedupeIsPerPane(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestNotificationDedupeIsPerPane(t *testing.T) {
 
 func TestAttentionPauseDefersCurrentNotificationsUntilResume(t *testing.T) {
 	runner := quietRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestAttentionPauseDefersCurrentNotificationsUntilResume(t *testing.T) {
 
 func TestAttentionResolvedWhilePausedDoesNotNotifyOnResume(t *testing.T) {
 	runner := quietRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestAttentionResolvedWhilePausedDoesNotNotifyOnResume(t *testing.T) {
 func TestNotificationChannelsCanBeDisabledIndependently(t *testing.T) {
 	t.Run("ntfy", func(t *testing.T) {
 		runner := quietRunner()
-		d, err := newTestDaemon(t, t.TempDir(), runner)
+		d, err := newTestDaemon(t, testRoot(t), runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -307,7 +307,7 @@ func TestNotificationChannelsCanBeDisabledIndependently(t *testing.T) {
 	})
 	t.Run("desktop", func(t *testing.T) {
 		runner := quietRunner()
-		d, err := newTestDaemon(t, t.TempDir(), runner)
+		d, err := newTestDaemon(t, testRoot(t), runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -337,7 +337,7 @@ func TestNotificationChannelsCanBeDisabledIndependently(t *testing.T) {
 
 func TestStatesExcludedFromAttentionDoNotNotify(t *testing.T) {
 	runner := quietRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func TestStatesExcludedFromAttentionDoNotNotify(t *testing.T) {
 
 func TestRemoteMirrorUsesKittyNotificationButNeverDuplicatesNtfy(t *testing.T) {
 	runner := quietRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +388,7 @@ func TestNtfyFailureIsRetriedAndRecorded(t *testing.T) {
 		}
 		return "", "", nil
 	}}
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,7 @@ func TestWaitJoinsAsynchronousTransition(t *testing.T) {
 		}
 		return "", "", nil
 	}}
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,7 +12,7 @@ import (
 )
 
 func TestCurrentPaneCredentialEnvironmentDoctorCheck(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	t.Setenv("ZKA_PANE_ID", "")
 	t.Setenv("ZKA_WORKSPACE_ID", "")
 	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "")
@@ -42,7 +42,7 @@ func TestCurrentPaneCredentialEnvironmentDoctorCheck(t *testing.T) {
 }
 
 func TestDoctorLegacyPaneSkipsContaminatedProviderChecks(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestCredentialEnvironmentInventoryDoctorCheck(t *testing.T) {
 }
 
 func TestDoctorOriginReportsCredentialChecks(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func TestSwayIPCDoctorCheck(t *testing.T) {
 }
 
 func TestDoctorHeadlessSkipsViewLayerChecks(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

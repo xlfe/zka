@@ -51,7 +51,7 @@ func paneRecord(t *testing.T, d *Daemon, workspaceID, paneID, channel string) (N
 // desktop channel. Its absence is why a transport that never worked went
 // unnoticed for the life of the project.
 func TestDesktopFailureIsRetriedLoggedAndRecorded(t *testing.T) {
-	d, journal, err := newTestDaemonWithLog(t, t.TempDir(), quietRunner())
+	d, journal, err := newTestDaemonWithLog(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestDesktopAndNtfyShareOneRetryPolicy(t *testing.T) {
 				}
 				return "", "", nil
 			}}
-			d, err := newTestDaemon(t, t.TempDir(), runner)
+			d, err := newTestDaemon(t, testRoot(t), runner)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -141,7 +141,7 @@ func TestDesktopAndNtfyShareOneRetryPolicy(t *testing.T) {
 // A reservation taken while the daemon is closing used to stay in the ledger
 // forever with neither SentAt nor LastError: never delivered, never retried.
 func TestClosedDaemonRecordsUndeliveredNotification(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestNotificationRetryBackoffDoublesToCeiling(t *testing.T) {
 
 // A failure that heals must actually redeliver, and say so.
 func TestFailedNotificationIsRetriedAndRecovers(t *testing.T) {
-	d, journal, err := newTestDaemonWithLog(t, t.TempDir(), quietRunner())
+	d, journal, err := newTestDaemonWithLog(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestFailedNotificationIsRetriedAndRecovers(t *testing.T) {
 
 // A permanently broken channel must stop, or it becomes its own kind of noise.
 func TestNotificationRetryBudgetIsBounded(t *testing.T) {
-	d, journal, err := newTestDaemonWithLog(t, t.TempDir(), quietRunner())
+	d, journal, err := newTestDaemonWithLog(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +302,7 @@ func TestNotificationRetryBudgetIsBounded(t *testing.T) {
 
 // Retrying a pane the user has already dealt with would notify about stale news.
 func TestRetryIgnoresResolvedPanes(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +336,7 @@ func TestRetryIgnoresResolvedPanes(t *testing.T) {
 
 // A paused queue must not be redelivered behind the user's back.
 func TestRetryRespectsAttentionPause(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

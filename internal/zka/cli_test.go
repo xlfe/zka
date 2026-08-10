@@ -16,7 +16,7 @@ func TestLocalAndRemotePaneBackendCommandsSelectCredentialEnvironment(t *testing
 	t.Setenv("SSH_AUTH_SOCK", "/tmp/local-agent.sock")
 	t.Setenv("GNUPGHOME", "/tmp/local-gnupg")
 	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "2")
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	var cfg Config
 	cfg.ZMX.Command = "zmx"
 	var sshBundle, openPGPBundle CredentialBundleConfig
@@ -106,7 +106,7 @@ func testEnvironmentContains(environment []string, name string) bool {
 }
 
 func TestWorkspaceCredentialsStatusCLIReportsUnclaimedByDefault(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestWorkspaceCreateSurfacesTemplateErrorsBeforeAnyRPC(t *testing.T) {
 }
 
 func TestWorkspaceCreateLocalCreatesDormantWorkspace(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +326,7 @@ func TestDeadPaneMessageWaitsForCtrlC(t *testing.T) {
 }
 
 func TestFinishLocalPaneAttachDoesNotTombstoneCleanExit(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestAttachmentIDIsStablePerNodeWorkspace(t *testing.T) {
 }
 
 func TestRunKittyReportsPrelaunchFailureWithoutPanic(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +432,7 @@ func TestFocusableLocalAttachmentKeepsUnhealthyAttachedPaneInExistingKitty(t *te
 
 func TestWorkspaceAttachRefusesRequestedPaneAfterZMXReconcileMarksItDead(t *testing.T) {
 	runner := newLifecycleRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +465,7 @@ func TestWorkspaceAttachRefusesRequestedPaneAfterZMXReconcileMarksItDead(t *test
 }
 
 func TestWorkspaceRenameAndKillCLI(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +495,7 @@ func TestWorkspaceRenameAndKillCLI(t *testing.T) {
 
 func TestWorkspaceForgetCLIUsesOnlyTheLocalRemoteCache(t *testing.T) {
 	runner := quietRunner()
-	d, err := newTestDaemon(t, t.TempDir(), runner)
+	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -566,7 +566,7 @@ func TestWorkspaceForgetCLIValidatesCachedReference(t *testing.T) {
 }
 
 func TestWorkspaceReconcileHeadlessReconcilesBackends(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}

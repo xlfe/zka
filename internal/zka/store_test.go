@@ -8,7 +8,7 @@ import (
 )
 
 func TestStoreRoundTripAndPermissions(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	store := NewStore(paths)
 	state := newStateData()
 	state.Node = Host{ID: "node", Name: "devbox.example"}
@@ -38,7 +38,7 @@ func TestStoreRoundTripAndPermissions(t *testing.T) {
 }
 
 func TestStoreResetsUndeployedV1Schema(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestStoreResetsUndeployedV1Schema(t *testing.T) {
 }
 
 func TestStoreResetsV2StateAndGeneratedFiles(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	if err := os.MkdirAll(paths.GeneratedDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestStoreResetsV2StateAndGeneratedFiles(t *testing.T) {
 }
 
 func TestStoreRejectsFutureSchema(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestStoreRejectsFutureSchema(t *testing.T) {
 }
 
 func TestStoreMarksOldPanesAsMissingCredentialEnvironment(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestStoreMarksOldPanesAsMissingCredentialEnvironment(t *testing.T) {
 }
 
 func TestGeneratedSessionIsAtomicAndPrivate(t *testing.T) {
-	paths := testPaths(t.TempDir())
+	paths := testPaths(testRoot(t))
 	path, err := NewStore(paths).WriteSession("0123456789", "attachment", "launch\n")
 	if err != nil {
 		t.Fatal(err)

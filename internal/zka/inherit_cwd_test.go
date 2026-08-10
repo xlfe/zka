@@ -28,7 +28,7 @@ func sourcePaneWithLiveShell(t *testing.T, d *Daemon, workspaceID, paneID, live 
 // Opening a new tab from a pane whose shell has moved must land in the shell's
 // current directory, not the directory that pane was created in.
 func TestAllocatePaneInheritsLiveCWDFromSourcePane(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestAllocatePaneInheritsLiveCWDFromSourcePane(t *testing.T) {
 // Without a usable live directory the caller's own cwd must survive untouched,
 // which is what keeps every pre-existing caller behaving as before.
 func TestAllocatePaneKeepsRequestedCWDWhenInheritanceFails(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestAllocatePaneKeepsRequestedCWDWhenInheritanceFails(t *testing.T) {
 // origin's table. Reading /proc for them locally would at best miss and at
 // worst point at an unrelated local process.
 func TestInheritedCWDIsNotResolvedOnAReplica(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestInheritedCWDIsNotResolvedOnAReplica(t *testing.T) {
 // Resolution stats directories and reads /proc. Doing that under the global
 // mutex is the shape that caused a previous update storm, so it is pinned.
 func TestInheritedCWDResolvesOutsideTheDaemonLock(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestInheritedCWDResolvesOutsideTheDaemonLock(t *testing.T) {
 }
 
 func TestPreparePaneInheritsLiveCWDForANewPane(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestPreparePaneInheritsLiveCWDForANewPane(t *testing.T) {
 // An existing pane already has a directory. Preparing it again -- which happens
 // on every restore -- must not move it.
 func TestPreparePaneIgnoresInheritHintForAnExistingPane(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +265,7 @@ func TestManagedKittyAliasesCarryTheSourceWindowPlaceholder(t *testing.T) {
 // The inherit hint is the only cwd signal a remote pane has, so losing it here
 // would silently put every remote pane in the wrong directory.
 func TestRemoteAllocatePaneCarriesTheInheritHint(t *testing.T) {
-	d, err := newTestDaemon(t, t.TempDir(), quietRunner())
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
