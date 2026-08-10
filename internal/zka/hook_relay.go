@@ -812,7 +812,8 @@ func hookRelayRecordedSocketOwned(dir, socket string) (bool, error) {
 		return false, err
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || uint64(stat.Dev) != record.Device || uint64(stat.Ino) != record.Inode {
+	if info.Mode()&os.ModeSocket == 0 || !ok ||
+		uint64(stat.Dev) != record.Device || uint64(stat.Ino) != record.Inode {
 		return false, errors.New("socket path no longer names the recorded inode")
 	}
 	return true, nil

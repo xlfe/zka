@@ -737,6 +737,29 @@ func TestHookRelaySweepPreservesReplacementSocketInode(t *testing.T) {
 	if err := os.WriteFile(session.socket, []byte("replacement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Model immediate inode reuse deterministically. A stale ownership record
+	// can have the same device/inode pair as a replacement regular file, but
+	// that must never make the replacement eligible for socket cleanup.
+	info, err := os.Lstat(session.socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("inspect replacement inode")
+	}
+	record := hookRelaySocketRecord{
+		Version: hookRelayProtocolVersion,
+		Device:  uint64(stat.Dev),
+		Inode:   uint64(stat.Ino),
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(session.dir, "socket.json"), append(encoded, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	old := time.Now().Add(-2 * hookRelayStaleGrace)
 	if err := os.Chtimes(session.dir, old, old); err != nil {
 		t.Fatal(err)
