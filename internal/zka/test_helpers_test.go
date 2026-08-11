@@ -36,6 +36,12 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) (stri
 	return "", "", nil
 }
 
+func (f *fakeRunner) RunConfigured(ctx context.Context, name string, args []string, _ commandOptions) (string, string, error) {
+	return f.Run(ctx, name, args...)
+}
+
+var _ configuredCommandRunner = (*fakeRunner)(nil)
+
 func (f *fakeRunner) Calls() []runnerCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()

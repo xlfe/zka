@@ -19,15 +19,16 @@ import (
 )
 
 type Daemon struct {
-	mu                    sync.Mutex
-	lifeMu                sync.Mutex
-	attentionMu           sync.Mutex
-	captureMu             sync.Mutex
-	topologyMu            sync.Mutex
-	cleanupMu             sync.Mutex
-	credentialMu          sync.Mutex
-	credentialMigrationMu sync.Mutex
-	wg                    sync.WaitGroup
+	mu                       sync.Mutex
+	lifeMu                   sync.Mutex
+	attentionMu              sync.Mutex
+	captureMu                sync.Mutex
+	topologyMu               sync.Mutex
+	cleanupMu                sync.Mutex
+	credentialMu             sync.Mutex
+	credentialSessionStateMu sync.Mutex
+	credentialMigrationMu    sync.Mutex
+	wg                       sync.WaitGroup
 
 	paths    Paths
 	store    *Store
@@ -39,6 +40,12 @@ type Daemon struct {
 	desktop  DesktopNotifier
 	logger   *log.Logger
 	sshAgent sshAgentInfo
+
+	providerEnvironment       []string
+	providerEnvironmentIssues []string
+	credentialSessionGate     chan struct{}
+	credentialSessionOwner    credentialSessionOwner
+	credentialSessionProbe    func(map[string]string) error
 
 	ctx                   context.Context
 	cancel                context.CancelFunc
@@ -94,6 +101,8 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 	if err != nil {
 		return nil, err
 	}
+	providerEnvironment, providerEnvironmentIssues := sanitizeProviderEnvironment(paths, os.Environ())
+	providerSSHSocket := environmentValue(providerEnvironment, "SSH_AUTH_SOCK")
 	store := NewStore(paths)
 	state, err := store.Load()
 	if err != nil {
@@ -154,36 +163,41 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 			Runner:  runner,
 			Command: cfg.Kitty.KittenCommand,
 		},
-		logger:               logger,
-		sshAgent:             newSSHAgentInfo(cfg, os.Getenv("SSH_AUTH_SOCK")),
-		ctx:                  ctx,
-		cancel:               cancel,
-		events:               make(chan WatcherEvent, 128),
-		capturing:            map[string]bool{},
-		captureAgain:         map[string]bool{},
-		admitting:            map[string]bool{},
-		admitAgain:           map[string]bool{},
-		reconciling:          map[string]bool{},
-		reconcileAgain:       map[string]bool{},
-		deferredReconcile:    map[string]bool{},
-		captureHold:          map[string]int{},
-		captureHoldUntil:     map[string]time.Time{},
-		backoff:              map[string]*endpointBackoff{},
-		cleaning:             map[string]bool{},
-		cleanups:             map[string]*sync.Mutex{},
-		deleted:              map[string]string{},
-		conns:                map[net.Conn]struct{}{},
-		attentionSubs:        map[chan struct{}]struct{}{},
-		credentialSSHSources: map[string]string{},
-		credentialOpenPGP:    map[string]*credentialOpenPGPManifest{},
-		credentialActive:     map[string]int{},
-		credentialNotices:    map[string]credentialNoticeState{},
-		credentialTransports: map[string]incomingCredentialTransport{},
-		credentialClaims:     map[string]*sync.Mutex{},
-		credentialRoutes:     map[string]*credentialRouteListener{},
-		credentialRoutePaths: map[string]string{},
-		cardLease:            newSmartCardLease(),
+		logger:                    logger,
+		sshAgent:                  newSSHAgentInfo(cfg, providerSSHSocket),
+		providerEnvironment:       append([]string(nil), providerEnvironment...),
+		providerEnvironmentIssues: append([]string(nil), providerEnvironmentIssues...),
+		credentialSessionGate:     make(chan struct{}, 1),
+		credentialSessionProbe:    probeGraphicalCredentialSession,
+		ctx:                       ctx,
+		cancel:                    cancel,
+		events:                    make(chan WatcherEvent, 128),
+		capturing:                 map[string]bool{},
+		captureAgain:              map[string]bool{},
+		admitting:                 map[string]bool{},
+		admitAgain:                map[string]bool{},
+		reconciling:               map[string]bool{},
+		reconcileAgain:            map[string]bool{},
+		deferredReconcile:         map[string]bool{},
+		captureHold:               map[string]int{},
+		captureHoldUntil:          map[string]time.Time{},
+		backoff:                   map[string]*endpointBackoff{},
+		cleaning:                  map[string]bool{},
+		cleanups:                  map[string]*sync.Mutex{},
+		deleted:                   map[string]string{},
+		conns:                     map[net.Conn]struct{}{},
+		attentionSubs:             map[chan struct{}]struct{}{},
+		credentialSSHSources:      map[string]string{},
+		credentialOpenPGP:         map[string]*credentialOpenPGPManifest{},
+		credentialActive:          map[string]int{},
+		credentialNotices:         map[string]credentialNoticeState{},
+		credentialTransports:      map[string]incomingCredentialTransport{},
+		credentialClaims:          map[string]*sync.Mutex{},
+		credentialRoutes:          map[string]*credentialRouteListener{},
+		credentialRoutePaths:      map[string]string{},
+		cardLease:                 newSmartCardLease(),
 	}
+	d.credentialSessionGate <- struct{}{}
 	store.SetOnSave(d.signalAttention)
 	// Constructor injection rather than a setter: d exists by this point, so
 	// there is no window in which the notifier can receive a button press
@@ -399,9 +413,21 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 	}
 	callCtx, cancel := context.WithDeadline(ctx, callDeadline)
 	defer cancel()
+	if operationNeedsLocalPeer(req.Op) {
+		callCtx = contextWithLocalPeer(callCtx, conn)
+	}
 	data, err := d.dispatch(callCtx, req.Op, req.Payload)
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	d.writeResponse(conn, data, err)
+}
+
+func operationNeedsLocalPeer(op string) bool {
+	switch op {
+	case "credential_session_refresh", "credential_provider_diagnostics", "credentials_activate_local", "remote_call":
+		return true
+	default:
+		return false
+	}
 }
 
 func (d *Daemon) writeResponse(w io.Writer, data any, callErr error) {
@@ -695,7 +721,15 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
-		return d.activateLocalCredentialBundle(ctx, req.Workspace, req.Bundle, req.IfUnclaimed, req.CallerSSHAuthSock)
+		return d.activateLocalCredentialBundle(ctx, req.Workspace, req.Bundle, req.IfUnclaimed, d.callerSSHSocket(ctx, req.CallerSSHAuthSock))
+	case "credential_session_refresh":
+		var req credentialSessionRefreshRequest
+		if err := decodePayload(raw, &req); err != nil {
+			return nil, err
+		}
+		return d.refreshCredentialSession(ctx, req), nil
+	case "credential_provider_diagnostics":
+		return d.credentialProviderDiagnostics(ctx), nil
 	case "credentials_endpoint":
 		var req workspaceCredentialRequest
 		if err := decodePayload(raw, &req); err != nil {
@@ -784,11 +818,12 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 			return nil, err
 		}
 		if req.Op == "credentials_claim" {
+			req.CallerSSHAuthSock = d.callerSSHSocket(ctx, req.CallerSSHAuthSock)
 			var claim workspaceCredentialRequest
 			if err := decodePayload(req.Payload, &claim); err != nil {
 				return nil, err
 			}
-			manifest, err := buildCredentialBundleManifestForSocket(ctx, d.config, claim.Bundle, d.runner, d.credentialSSHSocketForCaller(req.CallerSSHAuthSock))
+			manifest, err := buildCredentialBundleManifestForSocket(ctx, d.config, claim.Bundle, d.providerRunner(), d.credentialSSHSocketForCaller(req.CallerSSHAuthSock))
 			if err != nil {
 				return nil, err
 			}
@@ -804,8 +839,20 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		}
 		return result, withSSHAgentMismatchHint(err, d.sshAgent, req.CallerSSHAuthSock)
 	default:
-		return nil, fmt.Errorf("unknown operation %q", op)
+		return nil, unknownDaemonOperationError(op)
 	}
+}
+
+func (d *Daemon) callerSSHSocket(ctx context.Context, legacy string) string {
+	peer := localPeerFromContext(ctx)
+	if peer.Err != nil {
+		return legacy
+	}
+	socket := peer.Environment["SSH_AUTH_SOCK"]
+	if pathWithin(d.paths.AgentDir, socket) {
+		return ""
+	}
+	return socket
 }
 
 func (d *Daemon) createWorkspace(req createWorkspaceRequest) (*Workspace, error) {

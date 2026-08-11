@@ -165,6 +165,22 @@ func (a API) ActivateLocalCredentials(ctx context.Context, workspace, bundle str
 	return out, err
 }
 
+func (a API) RefreshCredentialSession(ctx context.Context, req credentialSessionRefreshRequest) (credentialSessionRefreshResponse, error) {
+	var out credentialSessionRefreshResponse
+	client := a.client
+	client.Timeout = 10 * time.Second
+	err := client.Call(ctx, "credential_session_refresh", req, &out)
+	return out, err
+}
+
+func (a API) CredentialProviderDiagnostics(ctx context.Context) (credentialProviderDiagnosticsResponse, error) {
+	var out credentialProviderDiagnosticsResponse
+	client := a.client
+	client.Timeout = 10 * time.Second
+	err := client.Call(ctx, "credential_provider_diagnostics", nil, &out)
+	return out, err
+}
+
 func (a API) PIVBEndpoint(ctx context.Context, workspace string) (pivbEndpointResponse, error) {
 	var out pivbEndpointResponse
 	err := a.client.Call(ctx, "credentials_endpoint", workspaceCredentialRequest{Workspace: workspace}, &out)

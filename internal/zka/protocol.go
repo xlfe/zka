@@ -22,6 +22,14 @@ const (
 // the client-side socket/context deadline closes the connection.
 const daemonResponseGrace = 100 * time.Millisecond
 
+func unknownDaemonOperationError(op string) error {
+	return fmt.Errorf("unknown operation %q", op)
+}
+
+func isUnknownDaemonOperation(err error, op string) bool {
+	return err != nil && err.Error() == unknownDaemonOperationError(op).Error()
+}
+
 type request struct {
 	Version          int             `json:"version"`
 	Op               string          `json:"op"`

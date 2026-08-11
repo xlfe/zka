@@ -250,14 +250,15 @@ func runKitty(args []string, paths Paths, stdout, stderr io.Writer) (int, error)
 	if err != nil {
 		return 2, err
 	}
+	api := NewAPI(paths)
+	refreshCredentialSessionForCLI(api, bundle, "create", "", stderr)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	api := NewAPI(paths)
 	workspace, err := api.CreateWorkspace(ctx, createWorkspaceRequest{Name: *name, Shell: cfg.Shell.Command, Panes: specs})
 	if err != nil {
 		return 1, err
 	}
-	if err := bindCreatedWorkspaceCredentials(ctx, api, cfg, "", workspace, bundle); err != nil {
+	if err := bindCreatedWorkspaceCredentials(ctx, api, "", workspace, bundle); err != nil {
 		return 1, fmt.Errorf("workspace %s created but credentials were not activated; retry with: zka workspace credentials activate-local --bundle %s %s: %w", workspace.Name, bundle, workspace.ID, err)
 	}
 	session, err := GenerateManagedSession(template, workspace)
@@ -367,8 +368,6 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 	if len(args) == 0 {
 		return 2, fmt.Errorf("workspace credentials requires claim, activate-local, endpoint, release, or status")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	api := NewAPI(paths)
 	switch args[0] {
 	case "claim":
@@ -390,9 +389,10 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		if *bundleName == "" {
 			return 2, fmt.Errorf("--bundle is required because credentials.default_bundle is not set")
 		}
-		refreshCredentialStartupTTY(ctx, cfg, *bundleName, ExecRunner{})
+		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		host, _ := splitWorkspaceRef(fs.Arg(0))
-		workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
+		workspace, err := resolveWorkspace(resolveCtx, api, fs.Arg(0))
+		resolveCancel()
 		if err != nil {
 			return 1, err
 		}
@@ -402,6 +402,9 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		if host == "" {
 			return 1, fmt.Errorf("workspace %q is authoritative here; use credentials activate-local", workspace.Name)
 		}
+		refreshCredentialSessionForCLI(api, *bundleName, "claim", workspace.ID, stderr)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 		var status workspaceCredentialStatus
 		err = api.RemoteCall(ctx, host, "credentials_claim", workspaceCredentialRequest{
 			Workspace: workspace.ID, Bundle: *bundleName,
@@ -433,13 +436,20 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		if *bundleName == "" {
 			return 2, fmt.Errorf("--bundle is required because credentials.default_bundle is not set")
 		}
-		workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
+		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		workspace, err := resolveWorkspace(resolveCtx, api, fs.Arg(0))
+		resolveCancel()
 		if err != nil {
 			return 1, err
 		}
 		if workspace.RemoteHost != "" {
 			return 1, fmt.Errorf("activate-local must run on workspace origin %s", workspace.Origin.Name)
 		}
+		if !*ifUnclaimed || workspace.CredentialClaim == nil {
+			refreshCredentialSessionForCLI(api, *bundleName, "activate-local", workspace.ID, stderr)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 		status, err := api.ActivateLocalCredentials(ctx, workspace.ID, *bundleName, *ifUnclaimed)
 		if err != nil {
 			return 1, err
@@ -455,6 +465,8 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		if fs.NArg() != 1 {
 			return 2, fmt.Errorf("workspace credentials endpoint requires one workspace reference")
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 		workspace, err := resolveWorkspace(ctx, api, fs.Arg(0))
 		if err != nil {
 			return 1, err
@@ -484,6 +496,8 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		if fs.NArg() > 1 || args[0] == "release" && fs.NArg() != 1 {
 			return 2, fmt.Errorf("workspace credentials %s accepts %s workspace reference", args[0], map[bool]string{true: "one", false: "at most one"}[args[0] == "release"])
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 		if fs.NArg() == 0 {
 			status, err := api.CredentialStatus(ctx, "")
 			if err != nil {
@@ -641,8 +655,6 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 		Name: name, Panes: plan.Panes, Topology: plan.Topology,
 		FocusPane: plan.FocusPane, CreationKey: key,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	api := NewAPI(paths)
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -652,6 +664,11 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 	if err != nil {
 		return 2, err
 	}
+	// Even for a remote workspace, the credentials originate at this node. The
+	// local daemon owns both the provider and the peer-derived graphical session.
+	refreshCredentialSessionForCLI(api, bundle, "create", "", stderr)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	var workspace *Workspace
 	if host == "" {
 		workspace, err = api.CreateWorkspace(ctx, request)
@@ -669,7 +686,7 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 		}
 		return 1, err
 	}
-	if err := bindCreatedWorkspaceCredentials(ctx, api, cfg, host, workspace, bundle); err != nil {
+	if err := bindCreatedWorkspaceCredentials(ctx, api, host, workspace, bundle); err != nil {
 		ref := workspace.ID
 		retry := "zka workspace credentials activate-local"
 		if host != "" {
@@ -720,11 +737,10 @@ func creationCredentialBundle(cfg Config, explicit string, noCredentials, compat
 	return bundle, nil
 }
 
-func bindCreatedWorkspaceCredentials(ctx context.Context, api API, cfg Config, host string, workspace *Workspace, bundle string) error {
+func bindCreatedWorkspaceCredentials(ctx context.Context, api API, host string, workspace *Workspace, bundle string) error {
 	if workspace == nil || bundle == "" {
 		return nil
 	}
-	refreshCredentialStartupTTY(ctx, cfg, bundle, ExecRunner{})
 	if host == "" {
 		_, err := api.ActivateLocalCredentials(ctx, workspace.ID, bundle, true)
 		return err
@@ -937,7 +953,7 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 			return 1, err
 		}
 		if *claimCredentials {
-			if err := claimAttachedWorkspaceCredentials(api, host, workspace, *credentialBundle); err != nil {
+			if err := claimAttachedWorkspaceCredentials(api, host, workspace, *credentialBundle, stderr); err != nil {
 				return 1, err
 			}
 		}
@@ -1020,7 +1036,7 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 		return 1, err
 	}
 	if *claimCredentials {
-		if err := claimAttachedWorkspaceCredentials(api, host, workspace, *credentialBundle); err != nil {
+		if err := claimAttachedWorkspaceCredentials(api, host, workspace, *credentialBundle, stderr); err != nil {
 			return 1, err
 		}
 	}
@@ -1028,9 +1044,7 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	return 0, nil
 }
 
-func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspace, bundleName string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspace, bundleName string, stderr io.Writer) error {
 	cfg, err := LoadConfig()
 	if err != nil {
 		return err
@@ -1041,7 +1055,9 @@ func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspac
 	if bundleName == "" {
 		return fmt.Errorf("workspace %s attached but no credential bundle was selected", workspace.Name)
 	}
-	refreshCredentialStartupTTY(ctx, cfg, bundleName, ExecRunner{})
+	refreshCredentialSessionForCLI(api, bundleName, "attach-claim", workspace.ID, stderr)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	var status workspaceCredentialStatus
 	if err := api.RemoteCall(ctx, host, "credentials_claim", workspaceCredentialRequest{
 		Workspace: workspace.ID, Bundle: bundleName,
@@ -1049,6 +1065,28 @@ func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspac
 		return fmt.Errorf("workspace %s attached but credential bundle %s was not claimed: %w", workspace.Name, bundleName, err)
 	}
 	return nil
+}
+
+func refreshCredentialSessionForCLI(api API, bundle, action, workspace string, stderr io.Writer) {
+	if strings.TrimSpace(bundle) == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	response, err := api.RefreshCredentialSession(ctx, credentialSessionRefreshRequest{
+		Bundle: bundle, Action: action, Workspace: workspace,
+	})
+	if err != nil {
+		if isUnknownDaemonOperation(err, "credential_session_refresh") {
+			fmt.Fprintln(stderr, "zka: warning: zkad does not support graphical pinentry refresh; upgrade and restart the local daemon")
+			return
+		}
+		fmt.Fprintf(stderr, "zka: warning: graphical pinentry session was not refreshed: %v\n", err)
+		return
+	}
+	if response.State == "warning" {
+		fmt.Fprintf(stderr, "zka: warning: graphical pinentry session was not refreshed: %s\n", response.Detail)
+	}
 }
 
 func attachmentUsable(attachment *Attachment) bool {

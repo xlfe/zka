@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -151,6 +152,66 @@ func TestOpenPGPFilterEnforcesKeygripsOptionsAndDefaultDeny(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+func TestOpenPGPFilterOpensFreshUpstreamForEachDownstream(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "agent-extra.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan struct{}, 2)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for index := 0; index < 2; index++ {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			accepted <- struct{}{}
+			_, _ = conn.Write([]byte("OK fake agent\n"))
+			go func() {
+				_, _ = io.Copy(io.Discard, conn)
+				_ = conn.Close()
+			}()
+		}
+	}()
+	runner := &fakeRunner{handler: func(_ context.Context, _ string, args ...string) (string, string, error) {
+		if strings.Join(args, " ") == "--list-dirs agent-extra-socket" {
+			return socket + "\n", "", nil
+		}
+		return "", "", errors.New("unexpected command")
+	}}
+	d := &Daemon{config: defaultConfig(), runner: runner, providerEnvironment: []string{"PATH=/usr/bin"}}
+	manifest := &credentialOpenPGPManifest{AllowedKeygrips: map[string]string{testAllowedGrip: "fingerprint"}}
+
+	for index := 0; index < 2; index++ {
+		client, downstream := net.Pipe()
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- d.filterOpenPGPStream(context.Background(), "origin", credentialStreamHello{}, manifest, downstream)
+		}()
+		greeting, readErr := bufio.NewReader(client).ReadString('\n')
+		if readErr != nil || greeting != "OK fake agent\n" {
+			t.Fatalf("greeting %d = %q, %v", index, greeting, readErr)
+		}
+		_ = client.Close()
+		<-errCh
+	}
+	for index := 0; index < 2; index++ {
+		select {
+		case <-accepted:
+		case <-time.After(time.Second):
+			t.Fatalf("upstream connection %d was pooled or not opened", index+1)
+		}
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("fake agent did not accept both connections")
 	}
 }
 

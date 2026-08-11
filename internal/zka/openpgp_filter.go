@@ -61,7 +61,7 @@ func (d *Daemon) filterOpenPGPStream(ctx context.Context, host string, hello cre
 	if manifest == nil || len(manifest.AllowedKeygrips) == 0 {
 		return fmt.Errorf("OpenPGP provider manifest is unavailable")
 	}
-	extraSocket, _, err := d.runner.Run(ctx, d.config.Credentials.GnuPG.GPGConfCommand, "--list-dirs", "agent-extra-socket")
+	extraSocket, _, err := d.providerRunner().Run(ctx, d.config.Credentials.GnuPG.GPGConfCommand, "--list-dirs", "agent-extra-socket")
 	if err != nil {
 		return err
 	}
@@ -72,6 +72,11 @@ func (d *Daemon) filterOpenPGPStream(ctx context.Context, host string, hello cre
 	if d.credentialInteractive != nil {
 		filter.interactive = d.credentialInteractive
 	}
+	// Deliberately open one upstream restricted connection per downstream
+	// connection. gpg-agent copies startup_env when a restricted connection is
+	// accepted, so a refresh can affect only connections opened afterwards;
+	// pooling here would make an explicit credential transfer keep stale
+	// pinentry routing.
 	upstream, greeting, err := filter.dialUpstream()
 	if err != nil {
 		return err
@@ -237,6 +242,9 @@ func (f *openPGPFilter) handleOption(argument string) error {
 	}
 	switch name {
 	case "display", "ttyname", "ttytype", "xauthority", "putenv", "lc-ctype", "lc-messages", "pinentry-mode":
+		// The upstream extra socket is restricted: forwarding any session
+		// OPTION returns FORBIDDEN and kills the filtered connection. A fresh
+		// upstream connection instead inherits zkad's refreshed startup_env.
 		return writeAssuanLine(f.downstream, "OK")
 	case "agent-awareness", "allow-pinentry-notify":
 		line := "OPTION " + argument

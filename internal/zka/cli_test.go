@@ -3,9 +3,11 @@ package zka
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,6 +196,47 @@ func TestWorkspaceCreateDispatchAndUsage(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "\n  create ") || !strings.Contains(stdout.String(), "--claim-credentials") {
 		t.Fatalf("workspace usage does not advertise create and credential claiming: %q", stdout.String())
+	}
+}
+
+func TestCredentialSessionRefreshWarnsAndContinuesWithOldDaemon(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "zkad.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		var req request
+		if decodeErr := json.NewDecoder(conn).Decode(&req); decodeErr != nil {
+			serverErr <- decodeErr
+			return
+		}
+		if req.Op != "credential_session_refresh" {
+			serverErr <- errors.New("unexpected operation " + req.Op)
+			return
+		}
+		serverErr <- json.NewEncoder(conn).Encode(response{
+			Version: daemonProtocolVersion,
+			OK:      false,
+			Error:   `unknown operation "credential_session_refresh"`,
+		})
+	}()
+
+	var stderr bytes.Buffer
+	refreshCredentialSessionForCLI(NewAPI(Paths{Socket: path}), "work", "claim", "workspace", &stderr)
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "does not support graphical pinentry refresh") {
+		t.Fatalf("warning = %q", stderr.String())
 	}
 }
 

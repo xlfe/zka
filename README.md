@@ -488,6 +488,44 @@ suitable provider agent, extra socket, and pinentry, leave it false there too.
 The setting is deliberately opt-in because the user agent is shared with every
 other smart-card consumer in that session.
 
+The pinentry itself should be graphical (GTK, Qt, GNOME, or another
+display/session-bus implementation). zka does not bind pinentry to the pane's
+terminal: before workspace creation or an explicit credential claim, the CLI
+asks the local zkad to refresh the provider agent from the CLI peer's live
+graphical session. It queries GnuPG's current `std_env_names`, carries
+`LC_CTYPE` and `LC_MESSAGES` separately, and deliberately drops `GPG_TTY`,
+`TERM`, and `INSIDE_EMACS`. The refresh runs without a controlling terminal and
+has one eight-second budget across discovery, environment query, and
+`UPDATESTARTUPTTY`. Failure is printed as a warning and does not turn a
+credential claim into an availability failure.
+
+The peer environment comes from the same-UID Unix client process, guarded by
+`SO_PEERPIDFD`; this requires Linux 6.5 or newer. A relative
+`WAYLAND_DISPLAY` is checked against that peer's `XDG_RUNTIME_DIR`. zka assumes
+the provider gpg-agent belongs to the same user session and therefore resolves
+the same per-user runtime directory when pinentry starts. A reachable peer
+session wins over zkad's captured startup session, which is only a fallback for
+stale or incomplete callers. X11 candidates must use an empty, `unix`, or
+`localhost` display host and must resolve to a live local X socket; remote
+display hostnames are never installed into the provider agent.
+
+`UPDATESTARTUPTTY` replaces the user gpg-agent's startup environment globally,
+so this affects every restricted consumer of that agent, not only zka. The
+filtered OpenPGP route relies on this: restricted agent connections copy the
+startup environment when they open and reject attempts to override it with
+session `OPTION`s. To undo a bad refresh, first run the action again from the
+correct graphical session. A code rollback alone does not restore the replaced
+agent state; restart it if necessary:
+
+```fish
+gpgconf --kill gpg-agent
+```
+
+On a headless node, zka skips the refresh. `zka doctor` fails
+`pinentry-session` when that node is configured or currently active as an
+OpenPGP provider, or when its selected SSH source is gpg-agent, because a
+graphical prompt can never be delivered there.
+
 New workspaces default to the credential bundle of the machine creating them.
 For a local create, the origin node binds its local bundle. For a remote create,
 the machine driving zka binds its bundle on the remote origin before attaching:
@@ -502,6 +540,12 @@ zka workspace create devbox:public-project --attach --no-credentials
 is omitted. `--credential-bundle` overrides it; `--no-credentials` creates an
 unclaimed workspace whose managed endpoints fail closed. It does not restore
 ambient `SSH_AUTH_SOCK` or `GNUPGHOME` inside the pane.
+
+For remote creation the graphical-session refresh still targets the local
+daemon, because that machine owns both the provider and the CLI peer; only the
+prepared credential bundle is claimed by the remote workspace. Attaching an
+existing workspace without an explicit claim performs no refresh and does not
+change its provider.
 
 Attaching an existing workspace never changes its provider automatically. Use
 an explicit claim when the attaching machine should take over the whole bundle:
@@ -689,6 +733,12 @@ The OpenPGP capability has a narrower protocol boundary. Its filter:
 - swallows remote display, terminal, locale, and pinentry-mode options so the
   origin cannot choose or relabel the provider's prompt; and
 - bounds lines, responses, inquiries, and each private-key operation.
+
+The swallowed session options must not be forwarded: the upstream socket is
+restricted and GnuPG answers those options with `FORBIDDEN`, terminating the
+connection. zka instead opens a fresh upstream connection for each downstream
+client, so it receives the provider agent's most recently refreshed startup
+environment.
 
 Before signing or decryption, zka requires a session bus, fails immediately on
 a positively reported freedesktop/GNOME screensaver or logind lock, and requires
@@ -1123,8 +1173,10 @@ and keygrips are shortened here):
 ok    credentials-config work=ssh-agent+openpgp+pivb; default=work
 ok    daemon           /run/user/1000/zka/zkad.sock; node=0123456789abcdef0123456789abcdef
 ok    current-pane-credentials not running inside a zka pane
+ok    provider-environment reachable graphical session from local CLI session
 ok    credentials-provider configured provider sockets are reachable
 ok    openpgp-keys     work=11112222…99990000/A1B2C3D4:card
+ok    pinentry-session provider agent has a reachable graphical startup environment; last refreshed by create for 89abcdef at 2026-08-11T12:00:00Z
 ok    credentials-claim example-project=work@fedcba98[openpgp:ready,pivb:ready,ssh-agent:ready]
 ok    credentials-transport ready
 ok    credential-environment no panes require credential-environment recreation
@@ -1140,6 +1192,13 @@ FAIL  credentials-provider openpgp: dial unix /run/user/1000/gnupg/S.gpg-agent.e
 FAIL  credentials-transport degraded: provider control session is unavailable
 ```
 
+An agent launched from an interactive login may retain `GPG_TTY` or `TERM`
+until zka performs its first graphical refresh; `pinentry-session` reports that
+pre-refresh state as `WARN`. If terminal routing reappears after zkad records a
+successful refresh, the same check reports `FAIL`. The `zkad-ssh-agent`,
+`caller-ssh-agent`, and `ssh-agent-match` rows remain present even when the
+newer daemon-side provider diagnostic is unavailable.
+
 A stale compositor hint also warns without breaking Focus actions:
 
 ```text
@@ -1152,12 +1211,14 @@ programs still see the stale environment value until the Sway session imports
 its current `SWAYSOCK`; import it into the systemd user manager at every Sway
 start rather than treating zka's warning as the durable repair.
 
-Inside a legacy v0.8.0 pane, the targeted diagnosis precedes contaminated
-provider checks and prints only origin-owned paths:
+Inside a legacy v0.8.0 pane, the targeted diagnosis prints only origin-owned
+paths. Provider checks now run inside zkad's sanitized environment, so they do
+not inherit the pane's managed `GNUPGHOME` or `SSH_AUTH_SOCK`:
 
 ```text
 FAIL  current-pane-credentials pane 01234567 uses legacy credential environment v2 and must be triaged for recreation; origin SSH_AUTH_SOCK=/run/user/1000/zka/agents/abcdef….sock; origin GNUPGHOME=…/credentials/abcdef…/gnupg
-ok    credentials-provider skipped: the current pane has an outdated managed credential environment; recreate it before testing provider credentials
+ok    provider-environment reachable graphical session from local CLI session
+ok    credentials-provider configured provider sockets are reachable
 FAIL  credential-environment example-project=01234567 (v0.8.0 credential environment detected; run the bundle's credential probe inside each pane (for SSH, ssh-add -l; for OpenPGP, gpg --list-secret-keys) and recreate only panes where local credentials fail; remotely created panes may already be healthy)
 ```
 

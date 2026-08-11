@@ -106,14 +106,47 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		managedHookDoctorCheck("codex-hooks", "/etc/codex/requirements.toml", "hook codex", cfg.Integrations.CodexManagedHooks),
 		managedHookDoctorCheck("claude-hooks", "/etc/claude-code/managed-settings.d/50-zka.json", "hook claude", cfg.Integrations.ClaudeManagedHooks),
 	)
-	if providerChecksUnsafe {
-		const detail = "skipped: the current pane has an outdated managed credential environment; recreate it before testing provider credentials"
+	diagnostics, diagnosticsErr := api.CredentialProviderDiagnostics(ctx)
+	daemonSSHAgent := diagnostics.SSHAgent
+	var daemonSSHAgentErr error
+	if diagnosticsErr == nil {
 		checks = append(checks,
-			doctorCheck{Name: "credentials-provider", OK: true, Detail: detail},
-			doctorCheck{Name: "openpgp-keys", OK: true, Detail: detail},
+			diagnostics.ProviderEnvironment,
+			diagnostics.CredentialsProvider,
+			diagnostics.OpenPGPKeys,
+			diagnostics.PinentrySession,
 		)
 	} else {
-		checks = append(checks, credentialsProviderDoctorCheck(ctx, cfg, ExecRunner{}), openPGPKeysDoctorCheck(ctx, cfg, ExecRunner{}))
+		daemonSSHAgent, daemonSSHAgentErr = api.SSHAgent(ctx)
+		legacyDaemon := isUnknownDaemonOperation(diagnosticsErr, "credential_provider_diagnostics")
+		detail := "daemon-side provider diagnostics failed: " + diagnosticsErr.Error()
+		if legacyDaemon {
+			detail = "zkad does not support daemon-side provider diagnostics; upgrade and restart the local daemon"
+		}
+		checks = append(checks,
+			doctorCheck{Name: "provider-environment", OK: legacyDaemon, Warning: legacyDaemon, Detail: detail},
+		)
+		if providerChecksUnsafe {
+			const unsafeDetail = "skipped: the current pane has an outdated managed credential environment; recreate it before testing provider credentials"
+			checks = append(checks,
+				doctorCheck{Name: "credentials-provider", OK: true, Detail: unsafeDetail},
+				doctorCheck{Name: "openpgp-keys", OK: true, Detail: unsafeDetail},
+			)
+		} else {
+			checks = append(checks, credentialsProviderDoctorCheck(ctx, cfg, ExecRunner{}), openPGPKeysDoctorCheck(ctx, cfg, ExecRunner{}))
+		}
+		checks = append(checks, doctorCheck{Name: "pinentry-session", OK: legacyDaemon, Warning: legacyDaemon, Detail: detail})
+	}
+	if configHasSSHAgentBundle(cfg) {
+		sshAddCommand := filepath.Join(filepath.Dir(cfg.SSH.Command), "ssh-add")
+		inspect := func(ctx context.Context, socket string) ([]string, error) {
+			return inspectSSHAgent(ctx, sshAddCommand, socket)
+		}
+		if daemonSSHAgentErr != nil {
+			checks = append(checks, doctorSSHAgentChecksWithoutDaemon(ctx, daemonSSHAgentErr, os.Getenv("SSH_AUTH_SOCK"), inspect)...)
+		} else {
+			checks = append(checks, doctorSSHAgentChecks(ctx, daemonSSHAgent, os.Getenv("SSH_AUTH_SOCK"), inspect)...)
+		}
 	}
 	var credentialStatus credentialStatusResponse
 	var credentialStatusErr error
@@ -285,6 +318,15 @@ func configHasOpenPGPBundle(cfg Config) bool {
 	return false
 }
 
+func configHasSSHAgentBundle(cfg Config) bool {
+	for _, bundle := range cfg.Credentials.Bundles {
+		if bundle.SSHAgent.Enable {
+			return true
+		}
+	}
+	return false
+}
+
 func configHasOpenPGPProviderKeys(cfg Config) bool {
 	for _, bundle := range cfg.Credentials.Bundles {
 		if bundle.OpenPGP.Enable && len(bundle.OpenPGP.SigningKeys) != 0 {
@@ -321,6 +363,10 @@ func credentialsConfigDoctorCheck(cfg Config) doctorCheck {
 }
 
 func credentialsProviderDoctorCheck(ctx context.Context, cfg Config, runner CommandRunner) doctorCheck {
+	return credentialsProviderDoctorCheckWithAgent(ctx, cfg, runner, newSSHAgentInfo(cfg, os.Getenv("SSH_AUTH_SOCK")))
+}
+
+func credentialsProviderDoctorCheckWithAgent(ctx context.Context, cfg Config, runner CommandRunner, agent sshAgentInfo) doctorCheck {
 	const name = "credentials-provider"
 	if len(cfg.Credentials.Bundles) == 0 {
 		return doctorCheck{Name: name, OK: true, Detail: "no provider capabilities configured"}
@@ -333,8 +379,7 @@ func credentialsProviderDoctorCheck(ctx context.Context, cfg Config, runner Comm
 		pivbRequired = pivbRequired || bundle.PIVB.Enable
 	}
 	if sshRequired {
-		info := newSSHAgentInfo(cfg, os.Getenv("SSH_AUTH_SOCK"))
-		conn, err := dialAgentSocket(info.EffectiveSocket)
+		conn, err := dialAgentSocket(agent.EffectiveSocket)
 		if err != nil {
 			problems = append(problems, "ssh-agent: "+err.Error())
 		} else {
@@ -661,6 +706,16 @@ func doctorSSHAgentChecks(ctx context.Context, daemonAgent sshAgentInfo, callerS
 		match.Detail = fmt.Sprintf("zkad uses %s; caller uses %s; agents expose different identities", displaySSHAgentSocket(daemonAgent.EffectiveSocket), displaySSHAgentSocket(callerSocket))
 	}
 	return append(checks, match)
+}
+
+func doctorSSHAgentChecksWithoutDaemon(ctx context.Context, daemonErr error, callerSocket string, inspect sshAgentInspector) []doctorCheck {
+	callerFingerprints, callerErr := inspect(ctx, callerSocket)
+	callerDetail := sshAgentDetail(callerSocket, callerFingerprints, callerErr)
+	return []doctorCheck{
+		{Name: "zkad-ssh-agent", Detail: "query zkad SSH agent: " + daemonErr.Error()},
+		{Name: "caller-ssh-agent", OK: callerErr == nil, Detail: callerDetail},
+		{Name: "ssh-agent-match", Detail: fmt.Sprintf("cannot compare agents: zkad SSH agent is unavailable; caller uses %s", displaySSHAgentSocket(callerSocket))},
+	}
 }
 
 func inspectSSHAgent(ctx context.Context, sshAddCommand, socket string) ([]string, error) {

@@ -185,10 +185,11 @@ func (d *Daemon) credentialOpenPGPRoutePath(ctx context.Context, workspaceID str
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
 	defer cancel()
-	if err := ensureGPGSocketDirectory(callCtx, d.config.Credentials.GnuPG.GPGConfCommand, home, d.runner); err != nil {
+	providerRunner := d.providerRunner()
+	if err := ensureGPGSocketDirectory(callCtx, d.config.Credentials.GnuPG.GPGConfCommand, home, providerRunner); err != nil {
 		return "", err
 	}
-	path, _, err := d.runner.Run(callCtx, d.config.Credentials.GnuPG.GPGConfCommand, "--homedir", home, "--list-dirs", "agent-socket")
+	path, _, err := providerRunner.Run(callCtx, d.config.Credentials.GnuPG.GPGConfCommand, "--homedir", home, "--list-dirs", "agent-socket")
 	if err != nil {
 		return "", err
 	}
@@ -306,7 +307,7 @@ func (d *Daemon) serveLocalCredentialRoute(ctx context.Context, client net.Conn,
 			if !ok {
 				return
 			}
-			resolved, err := buildOpenPGPManifest(ctx, d.config, bundle.OpenPGP.SigningKeys, d.runner)
+			resolved, err := buildOpenPGPManifest(ctx, d.config, bundle.OpenPGP.SigningKeys, d.providerRunner())
 			if err != nil {
 				return
 			}

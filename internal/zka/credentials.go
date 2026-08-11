@@ -154,20 +154,6 @@ func buildCredentialBundleManifestForSocket(ctx context.Context, cfg Config, bun
 	return manifest, nil
 }
 
-func refreshCredentialStartupTTY(ctx context.Context, cfg Config, bundleName string, runner CommandRunner) {
-	bundle, ok := cfg.credentialBundle(bundleName)
-	if !ok || !bundle.OpenPGP.Enable {
-		return
-	}
-	if runner == nil {
-		runner = ExecRunner{}
-	}
-	// This must execute in the claiming CLI's environment, not zkad's systemd
-	// environment. The provider filter strips every remote display/TTY OPTION,
-	// so the locally captured startup session remains authoritative.
-	_, _, _ = runner.Run(ctx, cfg.Credentials.GnuPG.GPGConnectAgentCommand, "updatestartuptty", "/bye")
-}
-
 func buildOpenPGPManifest(ctx context.Context, cfg Config, fingerprints []string, runner CommandRunner) (*credentialOpenPGPManifest, error) {
 	if runner == nil {
 		runner = ExecRunner{}
@@ -942,7 +928,7 @@ func (d *Daemon) openPGPManifestForClaim(ctx context.Context, host string, hello
 	if !sameStringSet(bundle.OpenPGP.SigningKeys, claimedKeys) {
 		return nil, fmt.Errorf("OpenPGP provider keys changed; release and re-claim the credential bundle")
 	}
-	resolved, err := buildOpenPGPManifest(ctx, d.config, bundle.OpenPGP.SigningKeys, d.runner)
+	resolved, err := buildOpenPGPManifest(ctx, d.config, bundle.OpenPGP.SigningKeys, d.providerRunner())
 	if err != nil {
 		return nil, err
 	}

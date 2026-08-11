@@ -38,7 +38,7 @@ func TestCurrentPaneCredentialEnvironmentDoctorCheck(t *testing.T) {
 	}
 }
 
-func TestDoctorLegacyPaneSkipsContaminatedProviderChecks(t *testing.T) {
+func TestDoctorLegacyPaneUsesDaemonSideProviderChecks(t *testing.T) {
 	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +67,7 @@ func TestDoctorLegacyPaneSkipsContaminatedProviderChecks(t *testing.T) {
 	if err != nil || code != 1 {
 		t.Fatalf("doctor code=%d err=%v stderr=%s", code, err, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "credentials-provider skipped: the current pane") || strings.Contains(stdout.String(), "/provider/socket/must-not-be-probed") {
+	if !strings.Contains(stdout.String(), "provider-environment") || strings.Contains(stdout.String(), "credentials-provider skipped: the current pane") || strings.Contains(stdout.String(), "/provider/socket/must-not-be-probed") {
 		t.Fatalf("legacy doctor output = %s", stdout.String())
 	}
 }
@@ -139,6 +139,27 @@ func TestDoctorSSHAgentChecksCompareFingerprints(t *testing.T) {
 	same := doctorSSHAgentChecks(context.Background(), daemon, "/same", inspect)
 	if len(same) != 3 || !same[2].OK || !bytes.Contains([]byte(same[2].Detail), []byte("same identities")) {
 		t.Fatalf("same-identity checks = %#v", same)
+	}
+}
+
+func TestDoctorSSHAgentChecksRemainStableWithoutDaemonDiagnostics(t *testing.T) {
+	inspect := func(_ context.Context, socket string) ([]string, error) {
+		if socket == "/caller" {
+			return []string{"SHA256:caller"}, nil
+		}
+		return nil, errors.New("unexpected socket")
+	}
+	checks := doctorSSHAgentChecksWithoutDaemon(context.Background(), errors.New("daemon unavailable"), "/caller", inspect)
+	if len(checks) != 3 {
+		t.Fatalf("checks = %#v", checks)
+	}
+	for index, name := range []string{"zkad-ssh-agent", "caller-ssh-agent", "ssh-agent-match"} {
+		if checks[index].Name != name {
+			t.Fatalf("check %d = %#v", index, checks[index])
+		}
+	}
+	if checks[0].OK || !checks[1].OK || checks[2].OK {
+		t.Fatalf("checks = %#v", checks)
 	}
 }
 

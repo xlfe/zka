@@ -35,7 +35,7 @@ func (d *Daemon) activateLocalCredentialBundle(ctx context.Context, workspaceRef
 	d.mu.Unlock()
 
 	socket := d.credentialSSHSocketForCaller(callerSSHAuthSock)
-	manifest, err := buildCredentialBundleManifestForSocket(ctx, d.config, bundleName, d.runner, socket)
+	manifest, err := buildCredentialBundleManifestForSocket(ctx, d.config, bundleName, d.providerRunner(), socket)
 	if err != nil {
 		return workspaceCredentialStatus{}, err
 	}

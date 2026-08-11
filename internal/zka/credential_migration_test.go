@@ -47,11 +47,11 @@ func (r *credentialMigrationRunner) Run(_ context.Context, name string, args ...
 	}
 }
 
-func (r *credentialMigrationRunner) RunConfigured(_ context.Context, name string, args []string, environment []string, directory string) (string, string, error) {
+func (r *credentialMigrationRunner) RunConfigured(_ context.Context, name string, args []string, options commandOptions) (string, string, error) {
 	r.mu.Lock()
 	r.calls = append(r.calls, runnerCall{Name: name, Args: append([]string(nil), args...)})
-	r.environment = append([]string(nil), environment...)
-	r.directory = directory
+	r.environment = append([]string(nil), options.Environment...)
+	r.directory = options.Directory
 	if r.startErr != nil {
 		err := r.startErr
 		r.mu.Unlock()
@@ -67,6 +67,8 @@ func (r *credentialMigrationRunner) RunConfigured(_ context.Context, name string
 	}
 	return "", "", nil
 }
+
+var _ configuredCommandRunner = (*credentialMigrationRunner)(nil)
 
 func TestVersionZeroPaneMigrationBindsLocalDefaultBeforeDetachedRestart(t *testing.T) {
 	runner := &credentialMigrationRunner{active: map[string]bool{}}
