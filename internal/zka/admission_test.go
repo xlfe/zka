@@ -191,6 +191,10 @@ func TestProposedPaneMissingFromKittyIsRetired(t *testing.T) {
 		t.Fatal(err)
 	}
 	admitEndpoint(t, d, workspace.ID, allocated.Pane.ID, attachment.Endpoint)
+	runner.setSession(allocated.Pane.Backend.Ref, true)
+	runner.mu.Lock()
+	runner.failKill = true
+	runner.mu.Unlock()
 
 	d.mu.Lock()
 	pane := d.state.Workspaces[workspace.ID].Panes[allocated.Pane.ID]
@@ -202,10 +206,26 @@ func TestProposedPaneMissingFromKittyIsRetired(t *testing.T) {
 	if _, err := d.reconcileBackends(context.Background(), workspace.ID); err != nil {
 		t.Fatal(err)
 	}
+	waitFor(t, func() bool {
+		for _, call := range runner.Calls() {
+			if len(call.Args) >= 2 && call.Args[0] == "kill" && call.Args[1] == allocated.Pane.Backend.Ref {
+				return true
+			}
+		}
+		return false
+	})
 	got, _ := d.getWorkspace(workspace.ID)
 	if pane := got.Panes[allocated.Pane.ID]; pane == nil || !pane.Retiring() {
 		t.Fatalf("pane phase = %#v, want retiring", pane)
 	}
+
+	runner.mu.Lock()
+	runner.failKill = false
+	runner.mu.Unlock()
+	waitFor(t, func() bool {
+		got, getErr := d.getWorkspace(workspace.ID)
+		return getErr == nil && got.Panes[allocated.Pane.ID] == nil
+	})
 }
 
 // Absence evidence may only come from a successful listing. A Kitty remote
