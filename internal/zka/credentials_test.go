@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -278,6 +280,90 @@ func TestFailedCredentialPreparationRetainsPriorClaim(t *testing.T) {
 	}
 	if status.Bundle != "ssh" || status.Generation != 1 || !status.Capabilities[credentialCapabilitySSH].Available {
 		t.Fatalf("prior claim was not retained: %#v", status)
+	}
+}
+
+func TestPrepareOpenPGPTargetDefersImportFailureToFingerprintValidation(t *testing.T) {
+	const (
+		importStdout = "gpg: imported 1\n"
+		importStderr = "gpg: no gpg-agent running in this session\ngpg: can't connect to the gpg-agent: End of file\n"
+	)
+	tests := []struct {
+		name        string
+		listing     string
+		wantSuccess bool
+	}{
+		{
+			name:        "valid fingerprint",
+			listing:     "fpr:::::::::" + testFingerprint + ":\n",
+			wantSuccess: true,
+		},
+		{
+			name: "missing fingerprint",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := testRoot(t)
+			paths := testPaths(root)
+			cfg := defaultConfig()
+			agentSocket := filepath.Join(root, "agent.sock")
+			runner := &fakeRunner{handler: func(_ context.Context, name string, args ...string) (string, string, error) {
+				joined := strings.Join(args, " ")
+				switch {
+				case name == cfg.Credentials.GnuPG.GPGConfCommand && strings.HasSuffix(joined, "--list-dirs socketdir"):
+					return root, "", nil
+				case name == cfg.Credentials.GnuPG.Command && strings.Contains(joined, " --import "):
+					return importStdout, importStderr, errors.New("exit status 2")
+				case name == cfg.Credentials.GnuPG.Command && strings.Contains(joined, " --list-keys"):
+					return tt.listing, "", nil
+				case name == cfg.Credentials.GnuPG.GPGConfCommand && strings.HasSuffix(joined, "--list-dirs agent-socket"):
+					return agentSocket, "", nil
+				default:
+					return "", "", fmt.Errorf("unexpected command: %s %s", name, joined)
+				}
+			}}
+			journal := &syncBuffer{}
+			logger := log.New(journal, "", 0)
+			workspaceID := "workspace-" + strings.ReplaceAll(tt.name, " ", "-")
+			socket, err := prepareOpenPGPTarget(context.Background(), paths, cfg, workspaceID, &credentialOpenPGPManifest{
+				Fingerprints: []string{testFingerprint},
+				PublicKeys:   "public key data",
+			}, runner, logger)
+
+			if tt.wantSuccess {
+				if err != nil || socket != agentSocket {
+					t.Fatalf("prepare OpenPGP target = %q, %v; want %q, nil", socket, err, agentSocket)
+				}
+				entry := journal.String()
+				for _, want := range []string{
+					"OpenPGP import advisory (expected)",
+					"workspace " + workspaceID,
+					"fingerprint validation passed",
+					"gpg: no gpg-agent running in this session gpg: can't connect to the gpg-agent: End of file",
+				} {
+					if !strings.Contains(entry, want) {
+						t.Fatalf("advisory log %q does not contain %q", entry, want)
+					}
+				}
+				if strings.Count(entry, "\n") != 1 {
+					t.Fatalf("advisory log was not collapsed to one line: %q", entry)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatal("OpenPGP preparation succeeded without the configured fingerprint")
+			}
+			for _, want := range []string{testFingerprint, "gpg: imported 1", "no gpg-agent running", "End of file", "exit status 2"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("preparation error %q does not contain %q", err, want)
+				}
+			}
+			if entry := journal.String(); entry != "" {
+				t.Fatalf("failed fingerprint validation was also logged: %q", entry)
+			}
+		})
 	}
 }
 

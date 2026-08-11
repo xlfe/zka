@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -315,7 +316,7 @@ func ensureGPGSocketDirectory(ctx context.Context, gpgconfCommand, home string, 
 	return nil
 }
 
-func prepareOpenPGPTarget(ctx context.Context, paths Paths, cfg Config, workspaceID string, manifest *credentialOpenPGPManifest, runner CommandRunner) (string, error) {
+func prepareOpenPGPTarget(ctx context.Context, paths Paths, cfg Config, workspaceID string, manifest *credentialOpenPGPManifest, runner CommandRunner, logger *log.Logger) (string, error) {
 	if manifest == nil || len(manifest.Fingerprints) == 0 || manifest.PublicKeys == "" {
 		return "", fmt.Errorf("OpenPGP manifest is incomplete")
 	}
@@ -347,9 +348,9 @@ func prepareOpenPGPTarget(ctx context.Context, paths Paths, cfg Config, workspac
 	if err := ensureGPGSocketDirectory(ctx, cfg.Credentials.GnuPG.GPGConfCommand, home, runner); err != nil {
 		return "", err
 	}
-	if _, _, err := runner.Run(ctx, cfg.Credentials.GnuPG.Command, "--homedir", home, "--batch", "--yes", "--import", publicPath); err != nil {
-		return "", fmt.Errorf("import public keys: %w", err)
-	}
+	// GnuPG can import the public keys and then exit non-zero after probing the
+	// stable workspace relay. The fingerprint listing below is authoritative.
+	importStdout, importStderr, importErr := runner.Run(ctx, cfg.Credentials.GnuPG.Command, "--homedir", home, "--batch", "--yes", "--import", publicPath)
 	listArgs := []string{"--homedir", home, "--batch", "--with-colons", "--fingerprint", "--list-keys"}
 	listArgs = append(listArgs, manifest.Fingerprints...)
 	listing, _, err := runner.Run(ctx, cfg.Credentials.GnuPG.Command, listArgs...)
@@ -369,8 +370,21 @@ func prepareOpenPGPTarget(ctx context.Context, paths Paths, cfg Config, workspac
 	for _, rawFingerprint := range manifest.Fingerprints {
 		fingerprint, fingerprintErr := canonicalOpenPGPFingerprint(rawFingerprint)
 		if fingerprintErr != nil || !found[fingerprint] {
+			detail := openPGPImportDiagnostic(importStdout, importStderr, importErr)
+			if detail != "" {
+				return "", fmt.Errorf("public-key manifest does not contain configured fingerprint %s; gpg import: %s", rawFingerprint, detail)
+			}
 			return "", fmt.Errorf("public-key manifest does not contain configured fingerprint %s", rawFingerprint)
 		}
+	}
+	if importErr != nil && logger != nil {
+		detail := strings.Join(strings.Fields(strings.TrimSpace(importStderr)), " ")
+		label := "stderr"
+		if detail == "" {
+			detail = strings.Join(strings.Fields(importErr.Error()), " ")
+			label = "error"
+		}
+		logger.Printf("OpenPGP import advisory (expected): gpg --import exited non-zero for workspace %s; fingerprint validation passed; %s=%q", workspaceID, label, detail)
 	}
 	socket, _, err := runner.Run(ctx, cfg.Credentials.GnuPG.GPGConfCommand, "--homedir", home, "--list-dirs", "agent-socket")
 	if err != nil {
@@ -381,6 +395,20 @@ func prepareOpenPGPTarget(ctx context.Context, paths Paths, cfg Config, workspac
 		return "", fmt.Errorf("gpgconf returned invalid target agent socket %q", socket)
 	}
 	return socket, nil
+}
+
+func openPGPImportDiagnostic(stdout, stderr string, err error) string {
+	parts := make([]string, 0, 3)
+	if detail := strings.TrimSpace(stdout); detail != "" {
+		parts = append(parts, fmt.Sprintf("stdout=%q", detail))
+	}
+	if detail := strings.TrimSpace(stderr); detail != "" {
+		parts = append(parts, fmt.Sprintf("stderr=%q", detail))
+	}
+	if err != nil {
+		parts = append(parts, fmt.Sprintf("error=%q", err.Error()))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // Credential claim state machine:
@@ -484,7 +512,7 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 		capabilities[credentialCapabilitySSH] = CredentialCapabilityStatus{State: "ready", Available: true}
 	}
 	if bundle.OpenPGP.Enable {
-		if _, err := prepareOpenPGPTarget(ctx, d.paths, d.config, workspaceID, req.Manifest.OpenPGP, d.runner); err != nil {
+		if _, err := prepareOpenPGPTarget(ctx, d.paths, d.config, workspaceID, req.Manifest.OpenPGP, d.runner, d.logger); err != nil {
 			return workspaceCredentialStatus{}, err
 		}
 		detail := ""
