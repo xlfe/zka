@@ -93,18 +93,33 @@ configured executable and the `pivb` selected by the launching user's `PATH`.
 Unknown fields are forward-compatible, but an unknown schema or missing
 capability fails closed.
 
-A local launcher explicitly activates the local card. The operation is
-workspace-scoped and idempotent when the bundle and live card are unchanged:
+A local launcher first inspects the workspace-owned route:
 
 ```fish
-zka workspace credentials activate-local --if-unclaimed --bundle work example-project
-set pivb_route (zka workspace credentials endpoint example-project)
+set endpoint_json (zka workspace credentials endpoint --json example-project)
 ```
 
-Activation reads the live slot-9c public identity through pivbd and pins its
-serial, JWK key ID, and DER SubjectPublicKeyInfo. It refuses to replace a route
-owned by a remote attachment. Re-running it with a different live card is an
-explicit repin and advances the workspace generation.
+The endpoint state covers the whole selected bundle, not only the PIVB socket.
+It is `ready` only while every enabled capability and the remote provider
+transport are available, the bundle includes PIVB, every stable route is
+published, and every managed pane has the current credential environment.
+Launchers handle the result as follows:
+
+- `ready`: use the returned `socket`.
+- `unclaimed`: run `activate-local --if-unclaimed --bundle work` and query the
+  endpoint again.
+- `degraded` with `source=local` and the requested bundle already selected: run
+  unflagged `activate-local --bundle work` to restore ephemeral provider sources,
+  then query the endpoint again.
+- `degraded` for a remote source or a different selected bundle: fail closed and
+  report `detail`; do not take over the provider automatically.
+- Any unknown state: fail closed.
+
+Creating or refreshing a local claim requires exactly one ready attachment owned
+by this node, unless `--attachment` names one explicitly. It reads the live
+slot-9c public identity through pivbd and pins its serial, JWK key ID, and DER
+SubjectPublicKeyInfo. Re-running unflagged activation with a different live card
+is an explicit repin and advances the workspace generation.
 
 Pass only the stable route path to the trusted `agent-session` supervisor:
 
@@ -121,19 +136,29 @@ The four sandbox mounts remain `session.sock`, `credential.json`,
 `forward.sock`, `wif.sock`, `control.sock`, card-lease socket, PIVB config,
 PC/SC socket, and YubiKey devices stay outside the sandbox.
 
-The launcher may call `activate-local --if-unclaimed` on every start, but it
-must run from exactly one ready local attachment (or name that attachment
-explicitly). An existing local or remote route is returned unchanged without probing or repinning a card.
-Without `--if-unclaimed`, the command is an explicit local repin and refuses to
-replace a remote attachment. A launcher may also inspect:
+The launcher may call `activate-local --if-unclaimed` on every start. When a
+claim already exists, ZKA returns it unchanged before selecting a local
+attachment, refreshing provider sessions, building a capability manifest,
+probing SSH, OpenPGP, or PIVB, clearing provider sources, or repinning a card.
+If the workspace is still unclaimed, ordinary local-owner and provider checks
+apply.
+
+Without `--if-unclaimed`, activation is an explicit local selection. It may
+replace a remote provider or change the selected bundle, and it advances the
+claim generation when the binding changes. `workspace attach
+--claim-credentials` is likewise an explicit transfer operation. Transfers are
+blocked while route-unsafe panes require explicit backend recreation.
+
+A launcher may inspect:
 
 ```fish
 zka workspace credentials endpoint --json example-project
 ```
 
-The bare `endpoint` form exits nonzero unless the route is observed ready and
-its listener is published. JSON form remains available for inspecting
-`unclaimed`, `starting`, and `degraded` state plus the last listener error.
+The bare `endpoint` form exits nonzero unless the whole bundle is healthy and an
+available PIVB route is published. JSON form remains available for inspecting
+`unclaimed` and `degraded` states plus deterministic capability and recreation
+details.
 
 ## Remote claim lifecycle
 

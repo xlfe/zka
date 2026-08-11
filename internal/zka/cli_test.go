@@ -152,6 +152,60 @@ func TestWorkspaceCredentialsStatusCLIReportsUnclaimedByDefault(t *testing.T) {
 	}
 }
 
+func TestWorkspaceCredentialsActivateLocalIfUnclaimedDoesNotRequireLocalAttachment(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": sshCredentialBundle()}
+	workspace := createTestWorkspace(t, d, 1)
+	remoteOwner := readyCredentialAttachment(t, d, workspace, "remote-owner", "provider")
+	d.mu.Lock()
+	d.state.Workspaces[workspace.ID].CredentialClaim = &CredentialClaim{
+		ProviderSource: "remote", Bundle: "work", OwnerAttachmentID: remoteOwner.ID,
+		OwnerNodeID: remoteOwner.Node.ID, Generation: 1, State: "ready",
+		Capabilities: map[string]CredentialCapabilityStatus{
+			credentialCapabilitySSH: {State: "ready", Available: true},
+		},
+	}
+	d.mu.Unlock()
+	serveTestDaemon(t, d)
+
+	var output bytes.Buffer
+	code, err := runWorkspaceCredentials(
+		[]string{"activate-local", "--if-unclaimed", "--bundle", "work", workspace.ID},
+		d.paths, &output, io.Discard,
+	)
+	if err != nil || code != 0 {
+		t.Fatalf("activate-local code = %d, err = %v, output = %q", code, err, output.String())
+	}
+	if !strings.Contains(output.String(), "bundle=work") || !strings.Contains(output.String(), "node=provider") {
+		t.Fatalf("activate-local output = %q", output.String())
+	}
+}
+
+func TestCredentialActivationOwnerAttachmentPreservesVersionCompatibility(t *testing.T) {
+	workspace := &Workspace{
+		CredentialClaim: &CredentialClaim{Bundle: "work", State: "ready"},
+		Attachments: map[string]*Attachment{
+			"local": {ID: "local", Node: Host{ID: "node"}, Status: AttachmentReady},
+		},
+	}
+	owner, err := credentialActivationOwnerAttachment(workspace, "node", "", true)
+	if err != nil || owner != "local" {
+		t.Fatalf("resolvable owner = %q, %v; want local for an older daemon", owner, err)
+	}
+	delete(workspace.Attachments, "local")
+	owner, err = credentialActivationOwnerAttachment(workspace, "node", "missing", true)
+	if err != nil || owner != "" {
+		t.Fatalf("claimed workspace without local owner = %q, %v; want empty owner", owner, err)
+	}
+	workspace.CredentialClaim = nil
+	if _, err := credentialActivationOwnerAttachment(workspace, "node", "", true); err == nil {
+		t.Fatal("unclaimed workspace accepted an empty owner")
+	}
+}
+
 func TestInterspersedWorkspaceFlagsMatchDocumentedSyntax(t *testing.T) {
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)

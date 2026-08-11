@@ -413,11 +413,61 @@ func TestActivateLocalIfUnclaimedDoesNotMutateExistingProviderSources(t *testing
 	}
 }
 
+func TestActivateLocalIfUnclaimedDoesNotRequireOwnerOrProbeProvider(t *testing.T) {
+	runner := quietRunner()
+	d, err := newTestDaemon(t, testRoot(t), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{
+		"work": sshCredentialBundle(), "personal": sshCredentialBundle(),
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	remoteOwner := readyCredentialAttachment(t, d, workspace, "remote-owner", "provider")
+	readyCredentialTransport(t, d, remoteOwner.Node)
+	claimed, err := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
+		Workspace: workspace.ID, Bundle: "work", Provider: remoteOwner.Node, ProviderSource: "remote",
+		OwnerAttachmentID: remoteOwner.ID, Manifest: credentialBundleManifest{Bundle: "work", SSH: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sentinelKey := credentialSSHSourceKey("", workspace.ID, claimed.Generation)
+	d.credentialMu.Lock()
+	d.credentialSSHSources[sentinelKey] = "/sentinel/ssh-agent.sock"
+	d.credentialOpenPGP[sentinelKey] = &credentialOpenPGPManifest{Fingerprints: []string{"sentinel"}}
+	d.credentialMu.Unlock()
+	callsBefore := len(runner.Calls())
+
+	untouched, err := d.activateLocalCredentialBundle(
+		context.Background(), workspace.ID, "personal", true,
+		filepath.Join(d.paths.RuntimeDir, "missing-agent.sock"), "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if untouched.Bundle != "work" || untouched.OwnerNode != remoteOwner.Node.ID || untouched.Generation != claimed.Generation {
+		t.Fatalf("if-unclaimed status = %#v, want original remote binding", untouched)
+	}
+	if callsAfter := len(runner.Calls()); callsAfter != callsBefore {
+		t.Fatalf("if-unclaimed probed provider commands: before=%d after=%d calls=%#v", callsBefore, callsAfter, runner.Calls())
+	}
+	d.credentialMu.Lock()
+	sshSource := d.credentialSSHSources[sentinelKey]
+	openPGP := d.credentialOpenPGP[sentinelKey]
+	d.credentialMu.Unlock()
+	if sshSource == "" || openPGP == nil || len(openPGP.Fingerprints) != 1 || openPGP.Fingerprints[0] != "sentinel" {
+		t.Fatalf("if-unclaimed cleared provider sources: ssh=%q openpgp=%#v", sshSource, openPGP)
+	}
+}
+
 func TestActivateLocalCredentialBundleRequiresExplicitOwnerAttachment(t *testing.T) {
 	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
+	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": sshCredentialBundle()}
 	workspace := createTestWorkspace(t, d, 1)
 	readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
 

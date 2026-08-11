@@ -701,19 +701,22 @@ func (d *Daemon) workspaceCredentialStatus(workspaceRef string) (workspaceCreden
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, err
 	}
-	status := credentialStatusFromWorkspaceVersion(workspace, credentialEnvironmentVersionForConfig(d.config))
-	if workspace.CredentialClaim == nil {
-		d.mu.Unlock()
-		return status, nil
-	}
 	workspaceSnapshot := workspace.Clone()
 	d.mu.Unlock()
-	if !d.credentialClaimTransportReady(workspaceSnapshot) {
-		degradeCredentialStatus(&status, workspaceSnapshot)
+	return d.credentialStatusForWorkspace(workspaceSnapshot), nil
+}
+
+func (d *Daemon) credentialStatusForWorkspace(workspace *Workspace) workspaceCredentialStatus {
+	status := credentialStatusFromWorkspaceVersion(workspace, credentialEnvironmentVersionForConfig(d.config))
+	if workspace.CredentialClaim == nil {
+		return status
 	}
-	d.degradeMissingCredentialSSHSource(&status, workspaceSnapshot)
-	d.degradeMissingCredentialRoutes(&status, workspaceSnapshot)
-	return status, nil
+	if !d.credentialClaimTransportReady(workspace) {
+		degradeCredentialStatus(&status, workspace)
+	}
+	d.degradeMissingCredentialSSHSource(&status, workspace)
+	d.degradeMissingCredentialRoutes(&status, workspace)
+	return status
 }
 
 func sortedCredentialStatuses(workspaces []*Workspace) []workspaceCredentialStatus {
@@ -1073,7 +1076,7 @@ func (d *Daemon) allCredentialStatuses() credentialStatusResponse {
 	transport := d.credentialTransportStatus(workspaces)
 	statuses := make([]workspaceCredentialStatus, 0, len(workspaces))
 	for _, workspace := range workspaces {
-		statuses = append(statuses, credentialStatusFromWorkspaceVersion(workspace, credentialEnvironmentVersionForConfig(d.config)))
+		statuses = append(statuses, d.credentialStatusForWorkspace(workspace))
 	}
 	sort.Slice(statuses, func(i, j int) bool {
 		if statuses[i].WorkspaceName != statuses[j].WorkspaceName {
@@ -1081,18 +1084,6 @@ func (d *Daemon) allCredentialStatuses() credentialStatusResponse {
 		}
 		return statuses[i].WorkspaceID < statuses[j].WorkspaceID
 	})
-	byID := make(map[string]*Workspace, len(workspaces))
-	for _, workspace := range workspaces {
-		byID[workspace.ID] = workspace
-	}
-	for index := range statuses {
-		workspace := byID[statuses[index].WorkspaceID]
-		if workspace != nil && workspace.CredentialClaim != nil && !d.credentialClaimTransportReady(workspace) {
-			degradeCredentialStatus(&statuses[index], workspace)
-		}
-		d.degradeMissingCredentialSSHSource(&statuses[index], workspace)
-		d.degradeMissingCredentialRoutes(&statuses[index], workspace)
-	}
 	return credentialStatusResponse{
 		Transport:        transport,
 		Workspaces:       statuses,

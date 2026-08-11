@@ -596,6 +596,18 @@ func TestPIVBBindingTransfersWithoutReplacingStableWorkspaceRoute(t *testing.T) 
 	if noOp, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", true, "", localOwner.ID); err != nil || noOp.OwnerNode != attachment.Node.ID {
 		t.Fatalf("if-unclaimed activation changed or rejected remote route: status=%#v err=%v", noOp, err)
 	}
+	d.credentialMu.Lock()
+	transport := d.credentialTransports[attachment.Node.ID]
+	d.credentialMu.Unlock()
+	if err := d.setIncomingCredentialTransport(credentialTransportSessionRequest{
+		Provider: attachment.Node, State: "disconnected", Endpoint: transport.Endpoint,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err = d.pivbEndpoint(workspace.ID)
+	if err != nil || endpoint.State != "degraded" || !strings.Contains(endpoint.Detail, "credential transport is unavailable") {
+		t.Fatalf("disconnected provider endpoint = %#v, %v", endpoint, err)
+	}
 	localAgain, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID)
 	if err != nil || localAgain.OwnerNode != d.state.Node.ID {
 		t.Fatalf("explicit local transfer = %#v, %v", localAgain, err)
@@ -606,6 +618,114 @@ func TestPIVBBindingTransfersWithoutReplacingStableWorkspaceRoute(t *testing.T) 
 	endpoint, err = d.pivbEndpoint(workspace.ID)
 	if err != nil || endpoint.State != "unclaimed" || d.state.Workspaces[workspace.ID].CredentialClaim != nil {
 		t.Fatalf("release silently restored a provider: endpoint=%#v claim=%#v err=%v", endpoint, d.state.Workspaces[workspace.ID].CredentialClaim, err)
+	}
+}
+
+func TestPIVBEndpointReflectsWholeBundleHealthAndLocalRefresh(t *testing.T) {
+	card := testPIVBCard(t)
+	handler := http.NewServeMux()
+	handler.HandleFunc("GET /v1/describe", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(pivbForwardDescription{
+			Version: pivbForwardProtocolVersion, ProviderResource: "projects/1/locations/global/workloadIdentityPools/pool/providers/provider",
+			IssuerURI: "https://issuer.example", Card: card,
+			Aliases: map[string]CredentialPIVBAlias{"ro": {Target: "ro@example.iam.gserviceaccount.com"}},
+		})
+	})
+	handler.HandleFunc("GET /v1/policy", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(pivbForwardPolicy{
+			Version: pivbForwardProtocolVersion, ProviderResource: "projects/1/locations/global/workloadIdentityPools/pool/providers/provider",
+			IssuerURI: "https://issuer.example", Aliases: map[string]CredentialPIVBAlias{"ro": {Target: "ro@example.iam.gserviceaccount.com"}},
+			EnrolledKeys: []pivbEnrolledKey{{Serial: card.Serial, KeyID: card.KeyID}},
+		})
+	})
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bundle CredentialBundleConfig
+	bundle.SSHAgent.Enable = true
+	bundle.PIVB.Enable = true
+	bundle.PIVB.Aliases = []string{"ro"}
+	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": bundle}
+	d.config.Credentials.PIVB.ForwardSocket = serveFakePIVB(t, handler)
+	workspace := createTestWorkspace(t, d, 1)
+	localOwner := readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
+	sshPath := filepath.Join(d.paths.RuntimeDir, "local-agent.sock")
+	sshAgent, err := listenUnix(sshPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sshAgent.Close() })
+
+	status, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, sshPath, localOwner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := d.pivbEndpoint(workspace.ID)
+	if err != nil || endpoint.State != "ready" {
+		t.Fatalf("healthy endpoint = %#v, %v", endpoint, err)
+	}
+
+	d.mu.Lock()
+	sshCapability := d.state.Workspaces[workspace.ID].CredentialClaim.Capabilities[credentialCapabilitySSH]
+	sshCapability.State = "unavailable"
+	sshCapability.Available = false
+	sshCapability.Detail = "persisted SSH capability failure"
+	d.state.Workspaces[workspace.ID].CredentialClaim.Capabilities[credentialCapabilitySSH] = sshCapability
+	d.mu.Unlock()
+	endpoint, err = d.pivbEndpoint(workspace.ID)
+	if err != nil || endpoint.State != "degraded" || !strings.Contains(endpoint.Detail, "persisted SSH capability failure") {
+		t.Fatalf("unavailable bundle capability endpoint = %#v, %v", endpoint, err)
+	}
+	d.mu.Lock()
+	sshCapability.State = "ready"
+	sshCapability.Available = true
+	sshCapability.Detail = ""
+	d.state.Workspaces[workspace.ID].CredentialClaim.Capabilities[credentialCapabilitySSH] = sshCapability
+	d.mu.Unlock()
+
+	d.credentialMu.Lock()
+	delete(d.credentialSSHSources, credentialSSHSourceKey("", workspace.ID, status.Generation))
+	d.credentialMu.Unlock()
+	endpoint, err = d.pivbEndpoint(workspace.ID)
+	if err != nil || endpoint.State != "degraded" || endpoint.Source != "local" ||
+		!strings.Contains(endpoint.Detail, "ssh-agent: local credential source is unavailable") {
+		t.Fatalf("missing SSH source endpoint = %#v, %v", endpoint, err)
+	}
+
+	refreshed, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, sshPath, localOwner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Generation != status.Generation {
+		t.Fatalf("local refresh changed generation from %d to %d", status.Generation, refreshed.Generation)
+	}
+	endpoint, err = d.pivbEndpoint(workspace.ID)
+	if err != nil || endpoint.State != "ready" {
+		t.Fatalf("refreshed endpoint = %#v, %v", endpoint, err)
+	}
+}
+
+func TestPIVBEndpointRejectsBundleWithoutPIVB(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": sshCredentialBundle()}
+	workspace := createTestWorkspace(t, d, 1)
+	localOwner := readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
+	sshPath := filepath.Join(d.paths.RuntimeDir, "local-agent.sock")
+	sshAgent, err := listenUnix(sshPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sshAgent.Close() })
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, sshPath, localOwner.ID); err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := d.pivbEndpoint(workspace.ID)
+	if err != nil || endpoint.State != "degraded" || !strings.Contains(endpoint.Detail, "does not enable PIVB") {
+		t.Fatalf("SSH-only endpoint = %#v, %v", endpoint, err)
 	}
 }
 

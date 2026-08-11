@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const Version = "0.9.0"
+const Version = "0.9.1"
 
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
@@ -461,7 +461,7 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		if err != nil {
 			return 1, err
 		}
-		*attachmentID, err = credentialOwnerAttachment(workspace, node.ID, *attachmentID)
+		*attachmentID, err = credentialActivationOwnerAttachment(workspace, node.ID, *attachmentID, *ifUnclaimed)
 		if err != nil {
 			return 1, err
 		}
@@ -1125,6 +1125,17 @@ func credentialOwnerAttachment(workspace *Workspace, nodeID, explicit string) (s
 		return "", fmt.Errorf("multiple active attachments are owned by this node; pass --attachment with one of: %s", strings.Join(candidates, ","))
 	}
 	return candidates[0], nil
+}
+
+func credentialActivationOwnerAttachment(workspace *Workspace, nodeID, explicit string, ifUnclaimed bool) (string, error) {
+	ownerAttachment, err := credentialOwnerAttachment(workspace, nodeID, explicit)
+	if err == nil {
+		return ownerAttachment, nil
+	}
+	if ifUnclaimed && workspace != nil && workspace.CredentialClaim != nil {
+		return "", nil
+	}
+	return "", err
 }
 
 func refreshCredentialSessionForCLI(api API, bundle, action, workspace string, stderr io.Writer) {
