@@ -105,6 +105,9 @@ func (s *Store) Load() (StateData, error) {
 		if header.SchemaVersion < 9 {
 			migrateWorkspaceCredentialBinding(workspace)
 		}
+		if header.SchemaVersion < 10 {
+			migrateWorkspaceAttachmentClaims(workspace)
+		}
 		if legacy {
 			now := time.Now().UTC()
 			for id, pane := range workspace.Panes {
@@ -168,13 +171,37 @@ func (s *Store) Load() (StateData, error) {
 			if header.SchemaVersion < 9 {
 				migrateWorkspaceCredentialBinding(workspace)
 			}
+			if header.SchemaVersion < 10 {
+				migrateWorkspaceAttachmentClaims(workspace)
+			}
 		}
 	}
-	// Zero remains meaningful: it denotes the direct-credential regression.
-	// zkad's guarded startup migration handles those live backends after state
-	// loading; schema migration itself never terminates a process.
+	// Zero remains meaningful: it denotes a direct-credential backend. Schema
+	// migration never terminates a process; recreation is an explicit command.
 	state.SchemaVersion = stateSchemaVersion
 	return state, nil
+}
+
+// v9 claims are all node-owned: OwnerAttachmentID has no post-migration
+// writers. There is therefore no safe attachment owner to infer. Clear every
+// authoritative and cached claim, advance the revocation boundary, and require
+// an explicit attachment-backed re-claim after upgrade.
+func migrateWorkspaceAttachmentClaims(workspace *Workspace) {
+	if workspace == nil || workspace.CredentialClaim == nil && workspace.PIVBProvider == nil {
+		return
+	}
+	base := workspace.CredentialGeneration
+	if workspace.CredentialClaim != nil && workspace.CredentialClaim.Generation > base {
+		base = workspace.CredentialClaim.Generation
+	}
+	if workspace.PIVBProvider != nil && workspace.PIVBProvider.Generation > base {
+		base = workspace.PIVBProvider.Generation
+	}
+	if base != ^uint64(0) {
+		workspace.CredentialGeneration = base + 1
+	}
+	workspace.CredentialClaim = nil
+	workspace.PIVBProvider = nil
 }
 
 func migrateWorkspaceCredentialBinding(workspace *Workspace) {
@@ -292,11 +319,12 @@ func (s *Store) logf(format string, args ...any) {
 }
 
 func (s *Store) writeMigrationBackup(data []byte, version int) error {
-	path := fmt.Sprintf("%s.v%d.backup", s.paths.StateFile, version)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, fs.ErrExist) {
-		return nil
+	nonce, err := randomID()
+	if err != nil {
+		return fmt.Errorf("name state migration backup: %w", err)
 	}
+	path := fmt.Sprintf("%s.v%d.%s.%s.backup", s.paths.StateFile, version, time.Now().UTC().Format("20060102T150405.000000000Z"), nonce)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("create state migration backup: %w", err)
 	}
@@ -321,6 +349,7 @@ func (s *Store) writeMigrationBackup(data []byte, version int) error {
 		_ = dir.Close()
 	}
 	ok = true
+	s.logf("wrote schema-v%d state migration backup %s", version, path)
 	return nil
 }
 

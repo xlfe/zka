@@ -41,9 +41,8 @@ type credentialTargetSession struct {
 }
 
 // credentialProviderReconnectLoop restores provider control transports after a
-// daemon restart even when the workspace has no local Kitty attachment. The
-// durable binding is node-owned, so its liveness cannot depend on view state or
-// on the user issuing another remote command.
+// daemon restart while the durable owning attachment remains active. A dropped
+// transport degrades the claim; only confirmed detach/release revokes it.
 func (d *Daemon) credentialProviderReconnectLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()

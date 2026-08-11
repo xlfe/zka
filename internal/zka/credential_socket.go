@@ -11,13 +11,30 @@ import (
 )
 
 const (
-	// Version 2 projected managed paths into every pane. Version 3 introduced
-	// the accidental local/remote split. Version 4 restores one stable managed
-	// environment for every newly created pane.
+	// Version 5 adds cooperative PIVB route-required projection.
 	legacyCredentialEnvironmentVersion = 2
-	credentialEnvironmentVersion       = 4
+	credentialEnvironmentVersion       = 5
 	agentRelayDialTimeout              = 500 * time.Millisecond
 )
+
+const pivbRoutingEnvironment = "environment"
+
+func credentialEnvironmentVersionForConfig(Config) int {
+	return credentialEnvironmentVersion
+}
+
+func configHasPIVBBundle(cfg Config) bool {
+	for _, bundle := range cfg.Credentials.Bundles {
+		if bundle.PIVB.Enable {
+			return true
+		}
+	}
+	return false
+}
+
+func managedPIVBAttachmentProtocol(Config) int {
+	return 1
+}
 
 // agentRelaySocketPath is stable across claim generations and transport
 // reconnects, so a pane's SSH_AUTH_SOCK never depends on a particular SSH

@@ -158,10 +158,10 @@ func TestCredentialStatusReportsPaneEnvironmentMigrationAndClaimGaps(t *testing.
 	}
 
 	unclaimed := credentialStatusFromWorkspace(workspace)
-	if got, want := strings.Join(unclaimed.RecreatePaneIDs, ","), "local"; got != want {
+	if got, want := strings.Join(unclaimed.RecreatePaneIDs, ","), "legacy,local"; got != want {
 		t.Fatalf("unclaimed recreation panes = %q, want %q", got, want)
 	}
-	if !strings.Contains(unclaimed.RecreationDetail, "version 0") || !strings.Contains(unclaimed.RecreationDetail, "automatic") || len(unclaimed.Capabilities) != 0 {
+	if !strings.Contains(unclaimed.RecreationDetail, "explicit") || len(unclaimed.Capabilities) != 0 {
 		t.Fatalf("unclaimed recreation status = %#v", unclaimed)
 	}
 
@@ -173,10 +173,10 @@ func TestCredentialStatusReportsPaneEnvironmentMigrationAndClaimGaps(t *testing.
 		},
 	}
 	claimed := credentialStatusFromWorkspace(workspace)
-	if got, want := strings.Join(claimed.RecreatePaneIDs, ","), "local"; got != want {
+	if got, want := strings.Join(claimed.RecreatePaneIDs, ","), "legacy,local"; got != want {
 		t.Fatalf("claimed recreation panes = %q, want %q", got, want)
 	}
-	if !strings.Contains(claimed.RecreationDetail, "version 0") || !strings.Contains(claimed.RecreationDetail, "transfer is blocked") {
+	if !strings.Contains(claimed.RecreationDetail, "explicit") || !strings.Contains(claimed.RecreationDetail, "transfer is blocked") {
 		t.Fatalf("claimed recreation detail = %q", claimed.RecreationDetail)
 	}
 	if detail := claimed.Capabilities[credentialCapabilitySSH].Detail; !strings.Contains(detail, "SSH_AUTH_SOCK") {
@@ -198,7 +198,7 @@ func TestCredentialStatusReportsPaneEnvironmentMigrationAndClaimGaps(t *testing.
 				test.capability: {State: "ready", Available: true},
 			}
 			status := credentialStatusFromWorkspace(workspace)
-			if got := strings.Join(status.RecreatePaneIDs, ","); got != "local" {
+			if got := strings.Join(status.RecreatePaneIDs, ","); got != "legacy,local" {
 				t.Fatalf("recreation panes = %q", got)
 			}
 			if detail := status.Capabilities[test.capability].Detail; !strings.Contains(detail, test.endpoint) {
@@ -226,7 +226,8 @@ func TestCredentialStatusDegradesAndRecoversWithTransport(t *testing.T) {
 	endpoint := readyCredentialTransport(t, d, attachment.Node)
 	if _, err := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
 		Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: "work",
-		Manifest: credentialBundleManifest{Bundle: "work", SSH: true},
+		OwnerAttachmentID: attachment.ID,
+		Manifest:          credentialBundleManifest{Bundle: "work", SSH: true},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -263,13 +264,14 @@ func TestFailedCredentialPreparationRetainsPriorClaim(t *testing.T) {
 	attachment := readyCredentialAttachment(t, d, workspace, "provider-attachment", "provider")
 	readyCredentialTransport(t, d, attachment.Node)
 	if _, err := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
-		Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: "ssh", Manifest: credentialBundleManifest{Bundle: "ssh", SSH: true},
+		Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: "ssh", OwnerAttachmentID: attachment.ID, Manifest: credentialBundleManifest{Bundle: "ssh", SSH: true},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	_, err = d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
 		Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: "openpgp",
-		Manifest: credentialBundleManifest{Bundle: "openpgp", OpenPGP: &credentialOpenPGPManifest{Fingerprints: []string{testFingerprint}, PublicKeys: "invalid"}},
+		OwnerAttachmentID: attachment.ID,
+		Manifest:          credentialBundleManifest{Bundle: "openpgp", OpenPGP: &credentialOpenPGPManifest{Fingerprints: []string{testFingerprint}, PublicKeys: "invalid"}},
 	})
 	if err == nil {
 		t.Fatal("OpenPGP preparation unexpectedly succeeded")
@@ -376,6 +378,7 @@ func TestActivateLocalIfUnclaimedDoesNotMutateExistingProviderSources(t *testing
 		"work": sshCredentialBundle(), "personal": sshCredentialBundle(),
 	}
 	workspace := createTestWorkspace(t, d, 1)
+	localOwner := readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
 	workPath := filepath.Join(d.paths.RuntimeDir, "work-agent.sock")
 	workAgent, err := listenUnix(workPath)
 	if err != nil {
@@ -391,14 +394,14 @@ func TestActivateLocalIfUnclaimedDoesNotMutateExistingProviderSources(t *testing
 	t.Cleanup(func() { _ = personalAgent.Close() })
 	go serveCredentialTestByte(personalAgent, 'P')
 
-	bound, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, workPath)
+	bound, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, workPath, localOwner.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := credentialTestRoundTrip(t, agentRelaySocketPath(d.paths.AgentDir, workspace.ID), 'a'); got != 'W' {
 		t.Fatalf("initial provider reply = %q", got)
 	}
-	untouched, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "personal", true, personalPath)
+	untouched, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "personal", true, personalPath, localOwner.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,6 +410,20 @@ func TestActivateLocalIfUnclaimedDoesNotMutateExistingProviderSources(t *testing
 	}
 	if got := credentialTestRoundTrip(t, agentRelaySocketPath(d.paths.AgentDir, workspace.ID), 'b'); got != 'W' {
 		t.Fatalf("if-unclaimed changed provider reply to %q", got)
+	}
+}
+
+func TestActivateLocalCredentialBundleRequiresExplicitOwnerAttachment(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
+
+	_, err = d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", "")
+	if err == nil || !strings.Contains(err.Error(), "owner attachment is required") {
+		t.Fatalf("activation without explicit owner = %v", err)
 	}
 }
 
@@ -427,7 +444,8 @@ func TestConcurrentCredentialClaimsAreSerialized(t *testing.T) {
 			defer wg.Done()
 			_, claimErr := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
 				Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: bundle,
-				Manifest: credentialBundleManifest{Bundle: bundle, SSH: true},
+				OwnerAttachmentID: attachment.ID,
+				Manifest:          credentialBundleManifest{Bundle: bundle, SSH: true},
 			})
 			errorsByBundle <- claimErr
 		}(bundle)
@@ -459,7 +477,8 @@ func TestCredentialGenerationRemainsMonotonicAcrossRelease(t *testing.T) {
 	readyCredentialTransport(t, d, attachment.Node)
 	request := workspaceCredentialRequest{
 		Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: "work",
-		Manifest: credentialBundleManifest{Bundle: "work", SSH: true},
+		OwnerAttachmentID: attachment.ID,
+		Manifest:          credentialBundleManifest{Bundle: "work", SSH: true},
 	}
 	first, err := d.claimWorkspaceCredentials(context.Background(), request)
 	if err != nil {

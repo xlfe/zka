@@ -110,6 +110,18 @@ func TestCredentialBundlesReplaceForwardAgentConfiguration(t *testing.T) {
 	}
 }
 
+func TestConfigRejectsUnimplementedPIVBProvenanceMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"credentials":{"pivb":{"routing_mode":"cgroup-bound"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", path)
+	_, err := LoadConfig()
+	if err == nil || !strings.Contains(err.Error(), `must be "environment"`) || !strings.Contains(err.Error(), "enforced provenance is not available yet") {
+		t.Fatalf("unimplemented provenance mode error = %v", err)
+	}
+}
+
 func TestOpenPGPTargetBundleDoesNotRequireProviderFingerprints(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"credentials":{"bundles":{"work":{"openpgp":{"enable":true}}}}}`), 0o600); err != nil {

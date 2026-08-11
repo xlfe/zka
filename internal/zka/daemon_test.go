@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func TestCredentialClaimSurvivesOwnerAttachmentDetach(t *testing.T) {
+func TestCredentialClaimIsReleasedWhenOwnerAttachmentDetaches(t *testing.T) {
 	root := testRoot(t)
 	configPath := filepath.Join(root, "config.json")
 	if err := os.WriteFile(configPath, []byte(`{"credentials":{"bundles":{"work":{"ssh_agent":{"enable":true}}}}}`), 0o600); err != nil {
@@ -40,14 +40,16 @@ func TestCredentialClaimSurvivesOwnerAttachmentDetach(t *testing.T) {
 	readyCredentialTransport(t, d, attachment.Node)
 	status, err := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
 		Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: "work",
-		Manifest: credentialBundleManifest{Bundle: "work", SSH: true},
+		OwnerAttachmentID: attachment.ID,
+		Manifest:          credentialBundleManifest{Bundle: "work", SSH: true},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.State != "ready" || status.Bundle != "work" || status.OwnerNode != "provider" {
+	if status.State != "ready" || status.Bundle != "work" || status.OwnerNode != "provider" || status.OwnerAttachment != attachment.ID {
 		t.Fatalf("claimed status = %#v", status)
 	}
+	claimGeneration := status.Generation
 	if _, err := d.detachAttachment(workspace.ID, attachment.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -55,8 +57,11 @@ func TestCredentialClaimSurvivesOwnerAttachmentDetach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.State != "ready" || status.Bundle != "work" || status.OwnerNode != attachment.Node.ID {
+	if status.State != "unclaimed" || status.Bundle != "" || status.OwnerNode != "" || status.Generation != 0 {
 		t.Fatalf("detached status = %#v", status)
+	}
+	if got := d.state.Workspaces[workspace.ID].CredentialGeneration; got <= claimGeneration {
+		t.Fatalf("owner detach generation = %d, want > %d", got, claimGeneration)
 	}
 }
 

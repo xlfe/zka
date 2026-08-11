@@ -113,6 +113,12 @@ func (a API) ReconcileBackends(ctx context.Context, workspace string) (backendRe
 	return out, err
 }
 
+func (a API) RecreateCredentialBackends(ctx context.Context, workspace string) (*Workspace, error) {
+	var out Workspace
+	err := a.client.Call(ctx, "recreate_credential_backends", refRequest{Ref: workspace}, &out)
+	return &out, err
+}
+
 func (a API) ReconcileTopology(ctx context.Context, workspace, attachment string) (*Workspace, error) {
 	var out Workspace
 	client := a.client
@@ -157,10 +163,11 @@ func (a API) ReleaseWorkspaceCredentials(ctx context.Context, workspace string) 
 	return out, err
 }
 
-func (a API) ActivateLocalCredentials(ctx context.Context, workspace, bundle string, ifUnclaimed bool) (workspaceCredentialStatus, error) {
+func (a API) ActivateLocalCredentials(ctx context.Context, workspace, bundle, ownerAttachment string, ifUnclaimed bool) (workspaceCredentialStatus, error) {
 	var out workspaceCredentialStatus
 	err := a.client.Call(ctx, "credentials_activate_local", workspaceCredentialRequest{
-		Workspace: workspace, Bundle: bundle, IfUnclaimed: ifUnclaimed, CallerSSHAuthSock: os.Getenv("SSH_AUTH_SOCK"),
+		Workspace: workspace, Bundle: bundle, OwnerAttachmentID: ownerAttachment,
+		IfUnclaimed: ifUnclaimed, CallerSSHAuthSock: os.Getenv("SSH_AUTH_SOCK"),
 	}, &out)
 	return out, err
 }
@@ -240,6 +247,12 @@ func (a API) DetachAttachment(ctx context.Context, workspace, attachment string)
 func (a API) Event(ctx context.Context, event Event) (*Workspace, error) {
 	var out Workspace
 	err := a.client.Call(ctx, "event", event, &out)
+	return &out, err
+}
+
+func (a API) PaneProcessEvent(ctx context.Context, event Event) (*Workspace, error) {
+	var out Workspace
+	err := a.client.Call(ctx, "pane_process_event", event, &out)
 	return &out, err
 }
 

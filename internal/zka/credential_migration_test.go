@@ -70,7 +70,7 @@ func (r *credentialMigrationRunner) RunConfigured(_ context.Context, name string
 
 var _ configuredCommandRunner = (*credentialMigrationRunner)(nil)
 
-func TestVersionZeroPaneMigrationBindsLocalDefaultBeforeDetachedRestart(t *testing.T) {
+func TestVersionZeroPaneRecreationRetainsExplicitAttachmentClaim(t *testing.T) {
 	runner := &credentialMigrationRunner{active: map[string]bool{}}
 	d, err := newTestDaemon(t, testRoot(t), runner)
 	if err != nil {
@@ -98,7 +98,19 @@ func TestVersionZeroPaneMigrationBindsLocalDefaultBeforeDetachedRestart(t *testi
 	workspace := createTestWorkspace(t, d, 1)
 	pane := firstPane(workspace)
 	d.mu.Lock()
-	current := d.state.Workspaces[workspace.ID].Panes[pane.ID]
+	stored := d.state.Workspaces[workspace.ID]
+	ownerAttachment := "local-owner"
+	stored.Attachments[ownerAttachment] = &Attachment{
+		ID: ownerAttachment, Node: d.state.Node, Status: AttachmentReady, Transport: Transport{Kind: "local"}, Endpoint: "unix:test",
+	}
+	stored.CredentialGeneration = 1
+	stored.CredentialClaim = &CredentialClaim{
+		ProviderSource: "local", Bundle: "work", OwnerNodeID: d.state.Node.ID, OwnerAttachmentID: ownerAttachment,
+		Generation: 1, State: "ready", Capabilities: map[string]CredentialCapabilityStatus{
+			credentialCapabilitySSH: {State: "ready", Available: true},
+		},
+	}
+	current := stored.Panes[pane.ID]
 	current.BackendCreated, current.BackendReady = true, true
 	current.Process = ProcessStatus{Running: true, PID: 42}
 	d.mu.Unlock()
@@ -113,11 +125,13 @@ func TestVersionZeroPaneMigrationBindsLocalDefaultBeforeDetachedRestart(t *testi
 		}
 	}
 
-	d.migrateCredentialEnvironments(context.Background())
+	if _, err := d.recreateCredentialBackends(context.Background(), workspace.ID); err != nil {
+		t.Fatal(err)
+	}
 	d.mu.Lock()
 	result := d.state.Workspaces[workspace.ID].Clone()
 	d.mu.Unlock()
-	if result.CredentialClaim == nil || result.CredentialClaim.ProviderSource != "local" || result.CredentialClaim.OwnerNodeID != d.state.Node.ID {
+	if result.CredentialClaim == nil || result.CredentialClaim.ProviderSource != "local" || result.CredentialClaim.OwnerNodeID != d.state.Node.ID || result.CredentialClaim.OwnerAttachmentID != ownerAttachment {
 		t.Fatalf("migration binding = %#v", result.CredentialClaim)
 	}
 	migrated := result.Panes[pane.ID]
@@ -127,7 +141,7 @@ func TestVersionZeroPaneMigrationBindsLocalDefaultBeforeDetachedRestart(t *testi
 	if got := testEnvironmentValue(runner.environment, "SSH_AUTH_SOCK"); got != agentRelaySocketPath(d.paths.AgentDir, workspace.ID) {
 		t.Fatalf("replacement SSH_AUTH_SOCK = %q", got)
 	}
-	if got := testEnvironmentValue(runner.environment, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "4" {
+	if got := testEnvironmentValue(runner.environment, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "5" {
 		t.Fatalf("replacement credential version = %q", got)
 	}
 	if !migrationRunnerCalled(runner.calls, "kill", pane.Backend.Ref, "--force") ||
@@ -154,7 +168,7 @@ func TestVersionZeroPaneMigrationDoesNotStopUnclaimedWorkspaceWithoutDefault(t *
 	d.mu.Lock()
 	result := d.state.Workspaces[workspace.ID].Panes[pane.ID].Clone()
 	d.mu.Unlock()
-	if !result.BackendCreated || result.BackendDead || !strings.Contains(result.CredentialMigrationError, "default_bundle") {
+	if !result.BackendCreated || result.BackendDead || !strings.Contains(result.CredentialMigrationError, "explicit attachment-backed") {
 		t.Fatalf("blocked migration pane = %#v", result)
 	}
 	if migrationRunnerCalled(runner.calls, "kill", pane.Backend.Ref, "--force") {
@@ -173,8 +187,12 @@ func TestVersionZeroPaneMigrationDoesNotStopWhenRemoteProviderIsUnavailable(t *t
 	pane := firstPane(workspace)
 	d.mu.Lock()
 	current := d.state.Workspaces[workspace.ID]
+	current.Attachments["offline-owner"] = &Attachment{
+		ID: "offline-owner", Node: Host{ID: "offline-provider", Name: "offline-provider"}, Status: AttachmentReady,
+		Transport: Transport{Kind: "ssh"}, Endpoint: "ssh:offline-provider:offline-owner",
+	}
 	current.CredentialClaim = &CredentialClaim{
-		ProviderSource: "remote", Bundle: "work", OwnerNodeID: "offline-provider", Generation: 1, State: "ready",
+		ProviderSource: "remote", Bundle: "work", OwnerNodeID: "offline-provider", OwnerAttachmentID: "offline-owner", Generation: 1, State: "ready",
 		Capabilities: map[string]CredentialCapabilityStatus{credentialCapabilitySSH: {State: "ready", Available: true}},
 	}
 	current.Panes[pane.ID].BackendCreated = true
@@ -323,7 +341,19 @@ func versionZeroMigrationFixture(t *testing.T, runner *credentialMigrationRunner
 	workspace := createTestWorkspace(t, d, 1)
 	pane := firstPane(workspace)
 	d.mu.Lock()
-	current := d.state.Workspaces[workspace.ID].Panes[pane.ID]
+	stored := d.state.Workspaces[workspace.ID]
+	ownerAttachment := "local-owner"
+	stored.Attachments[ownerAttachment] = &Attachment{
+		ID: ownerAttachment, Node: d.state.Node, Status: AttachmentReady, Transport: Transport{Kind: "local"}, Endpoint: "unix:test",
+	}
+	stored.CredentialGeneration = 1
+	stored.CredentialClaim = &CredentialClaim{
+		ProviderSource: "local", Bundle: "work", OwnerNodeID: d.state.Node.ID, OwnerAttachmentID: ownerAttachment,
+		Generation: 1, State: "ready", Capabilities: map[string]CredentialCapabilityStatus{
+			credentialCapabilitySSH: {State: "ready", Available: true},
+		},
+	}
+	current := stored.Panes[pane.ID]
 	current.BackendCreated, current.BackendReady = true, true
 	current.Process = ProcessStatus{Running: true, PID: 42}
 	d.mu.Unlock()

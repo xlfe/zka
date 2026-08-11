@@ -11,9 +11,11 @@ import (
 )
 
 const (
-	stateSchemaVersion = 9
-	// 13 makes credential ownership workspace- and node-scoped, independently
-	// of Kitty attachments, and gives every pane one stable managed endpoint.
+	stateSchemaVersion = 10
+	// 14 restores attachment-owned credential claims and adds versioned PIVB
+	// attachment routing for managed panes.
+	// 13 made credential ownership workspace- and node-scoped, independently
+	// of Kitty attachments, and gave every pane one stable managed endpoint.
 	// 12 adds workspace-scoped, provider-mutable PIVB credential routing.
 	// 11 combines credential target heartbeat/snapshot reconciliation. There is
 	// no compatibility shim: every CLI and daemon on a node must be upgraded
@@ -21,8 +23,9 @@ const (
 	// 10 replaces the workspace-agent API with credential bundles. There is no
 	// compatibility shim: every CLI and daemon on a node must be upgraded
 	// together.
-	daemonProtocolVersion = 13
-	// 13 replaces attachment-owned claims with node-owned credential bindings.
+	daemonProtocolVersion = 14
+	// 14 requires an authenticated active attachment for credential claims.
+	// 13 replaced attachment-owned claims with node-owned credential bindings.
 	// 12 adds the PIVB credential manifest and stream capability.
 	// 11 binds both peer node IDs into the SSH control handshake and requires a
 	// credential-provider acknowledgement before a claim can be created.
@@ -36,7 +39,7 @@ const (
 	// remote pane, and sends the source pane instead. An origin that predates
 	// this would quietly place every remote pane in the home directory, so the
 	// version check turns that into an explicit upgrade prompt.
-	remoteProtocolVersion = 13
+	remoteProtocolVersion = 14
 	remoteProtocolName    = "zka.workspace"
 	remoteProtocolMax     = 1 << 20
 )
@@ -326,7 +329,7 @@ type Workspace struct {
 type CredentialClaim struct {
 	ProviderSource    string                                `json:"provider_source"` // local or remote
 	Bundle            string                                `json:"bundle"`
-	OwnerAttachmentID string                                `json:"owner_attachment_id,omitempty"` // v8 migration only
+	OwnerAttachmentID string                                `json:"owner_attachment_id"`
 	OwnerNodeID       string                                `json:"owner_node_id"`
 	Generation        uint64                                `json:"generation"`
 	State             string                                `json:"state"`

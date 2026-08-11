@@ -1,9 +1,13 @@
 package zka
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -30,13 +34,49 @@ func TestSchemaSixMigrationWritesRollbackBackup(t *testing.T) {
 	if loaded.SchemaVersion != stateSchemaVersion {
 		t.Fatalf("schema = %d, want %d", loaded.SchemaVersion, stateSchemaVersion)
 	}
-	backup, err := os.ReadFile(paths.StateFile + ".v6.backup")
-	if err != nil || string(backup) != string(encoded) {
-		t.Fatalf("v6 migration backup missing or wrong: %v", err)
+	assertMigrationBackup(t, paths.StateFile, 6, encoded)
+}
+
+func TestRepeatedUpgradeWritesFreshMigrationBackup(t *testing.T) {
+	paths := testPaths(testRoot(t))
+	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := newStateData()
+	state.SchemaVersion = 9
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(paths)
+	var journal bytes.Buffer
+	store.SetLogger(log.New(&journal, "", 0))
+	for attempt := 0; attempt < 2; attempt++ {
+		// Rewriting v9 models an operator restoring the rollback point before a
+		// second upgrade. Each pass must preserve that pass's exact input.
+		if err := os.WriteFile(paths.StateFile, encoded, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Load(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	matches, err := filepath.Glob(paths.StateFile + ".v9.*.backup")
+	if err != nil || len(matches) != 2 {
+		t.Fatalf("v9 backups after repeated upgrade = %#v, err=%v", matches, err)
+	}
+	for _, path := range matches {
+		backup, err := os.ReadFile(path)
+		if err != nil || string(backup) != string(encoded) {
+			t.Fatalf("fresh migration backup %s = %q, err=%v", path, backup, err)
+		}
+	}
+	if got := strings.Count(journal.String(), "wrote schema-v9 state migration backup "+paths.StateFile+".v9."); got != 2 {
+		t.Fatalf("migration backup log entries = %d, want 2; log=%q", got, journal.String())
 	}
 }
 
-func TestSchemaEightCredentialClaimsMigrateToNodeOwnership(t *testing.T) {
+func TestSchemaEightCredentialClaimsAreClearedForAttachmentReclaim(t *testing.T) {
 	paths := testPaths(testRoot(t))
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -80,24 +120,21 @@ func TestSchemaEightCredentialClaimsMigrateToNodeOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	remote := loaded.Workspaces["remote"]
-	if remote.CredentialClaim.ProviderSource != "remote" || remote.CredentialClaim.OwnerAttachmentID != "" ||
-		remote.CredentialClaim.PIVB == nil || remote.PIVBProvider != nil || remote.CredentialGeneration != 4 {
+	if remote.CredentialClaim != nil || remote.PIVBProvider != nil || remote.CredentialGeneration != 5 {
 		t.Fatalf("remote v8 binding = %#v, legacy=%#v", remote.CredentialClaim, remote.PIVBProvider)
 	}
 	local := loaded.Workspaces["local"]
-	if local.CredentialClaim == nil || local.CredentialClaim.ProviderSource != "local" || local.CredentialClaim.OwnerNodeID != "origin" || local.PIVBProvider != nil || local.CredentialGeneration != 2 {
+	if local.CredentialClaim != nil || local.PIVBProvider != nil || local.CredentialGeneration != 3 {
 		t.Fatalf("local v8 binding = %#v, legacy=%#v", local.CredentialClaim, local.PIVBProvider)
 	}
 	cached := loaded.Remotes["devbox"].Workspaces["remote"]
-	if cached.CredentialClaim.ProviderSource != "remote" || cached.CredentialClaim.OwnerAttachmentID != "" || cached.CredentialClaim.PIVB == nil || cached.CredentialGeneration != 4 {
+	if cached.CredentialClaim != nil || cached.PIVBProvider != nil || cached.CredentialGeneration != 5 {
 		t.Fatalf("cached remote v8 binding = %#v", cached.CredentialClaim)
 	}
-	if backup, err := os.ReadFile(paths.StateFile + ".v8.backup"); err != nil || string(backup) != string(encoded) {
-		t.Fatalf("v8 migration backup missing or wrong: %v", err)
-	}
+	assertMigrationBackup(t, paths.StateFile, 8, encoded)
 }
 
-func TestSchemaEightSplitProviderConflictFailsClosedAndRemainsInspectable(t *testing.T) {
+func TestSchemaEightSplitProviderConflictIsClearedAtAttachmentMigration(t *testing.T) {
 	paths := testPaths(testRoot(t))
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -130,21 +167,11 @@ func TestSchemaEightSplitProviderConflictFailsClosedAndRemainsInspectable(t *tes
 		t.Fatal(err)
 	}
 	workspace := loaded.Workspaces["conflict"]
-	if workspace.CredentialClaim == nil || workspace.CredentialClaim.State != "migration_conflict" || workspace.PIVBProvider == nil {
+	if workspace.CredentialClaim != nil || workspace.PIVBProvider != nil {
 		t.Fatalf("split-provider migration = claim=%#v legacy=%#v", workspace.CredentialClaim, workspace.PIVBProvider)
 	}
-	for _, capability := range workspace.CredentialClaim.Capabilities {
-		if capability.Available || capability.State != "unavailable" {
-			t.Fatalf("conflicting capability remained available: %#v", capability)
-		}
-	}
-	if workspace.CredentialGeneration != 5 {
-		t.Fatalf("credential generation = %d, want 5", workspace.CredentialGeneration)
-	}
-	var detail strings.Builder
-	writeWorkspaceDetail(&detail, workspace)
-	if output := detail.String(); !strings.Contains(output, "credential_migration_conflict=legacy_pivb") || !strings.Contains(output, "serial=42") || !strings.Contains(output, "key=legacy-key") {
-		t.Fatalf("inspect detail omitted retained legacy provider: %s", output)
+	if workspace.CredentialGeneration != 6 {
+		t.Fatalf("credential generation = %d, want 6", workspace.CredentialGeneration)
 	}
 }
 
@@ -265,9 +292,20 @@ func TestWedgedStateRecoversOnUpgrade(t *testing.T) {
 			t.Fatalf("tab title still acquires literal quotes: %q", tab.Title)
 		}
 	}
-	if backup, err := os.ReadFile(paths.StateFile + ".v5.backup"); err != nil || string(backup) != string(encoded) {
-		t.Fatalf("v5 migration backup missing or wrong: %v", err)
+	assertMigrationBackup(t, paths.StateFile, 5, encoded)
+}
+
+func assertMigrationBackup(t *testing.T, stateFile string, version int, want []byte) string {
+	t.Helper()
+	matches, err := filepath.Glob(fmt.Sprintf("%s.v%d.*.backup", stateFile, version))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("v%d migration backups = %#v, err=%v", version, matches, err)
 	}
+	backup, err := os.ReadFile(matches[0])
+	if err != nil || string(backup) != string(want) {
+		t.Fatalf("v%d migration backup missing or wrong: %v", version, err)
+	}
+	return matches[0]
 }
 
 // The wedged attachment must converge on its first pass after the upgrade, with

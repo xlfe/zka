@@ -54,7 +54,7 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 	checks = append(checks, hookRelayDoctorCheck(paths))
 	stateErr := NewStore(paths).Ensure()
 	checks = append(checks, doctorCheck{Name: "state-dir", OK: stateErr == nil, Detail: doctorDetail(stateErr, paths.StateDir)})
-	currentPaneCredentials, providerChecksUnsafe := currentPaneCredentialEnvironmentDoctorCheck(paths)
+	currentPaneCredentials, providerChecksUnsafe := currentPaneCredentialEnvironmentDoctorCheck(paths, cfg)
 	checks = append(checks, currentPaneCredentials)
 	commands := []struct{ name, command string }{
 		{"kitty", cfg.Kitty.Command}, {"kitten", cfg.Kitty.KittenCommand},
@@ -77,6 +77,19 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 			struct{ name, command string }{"gpgconf", cfg.Credentials.GnuPG.GPGConfCommand},
 			struct{ name, command string }{"gpg-connect-agent", cfg.Credentials.GnuPG.GPGConnectAgentCommand},
 		)
+	}
+	if configHasPIVBBundle(cfg) {
+		commands = append(commands, struct{ name, command string }{"pivb", cfg.Credentials.PIVB.Command})
+		capabilityErr := ensureManagedPIVBCapability(ctx, cfg, ExecRunner{})
+		checks = append(checks, doctorCheck{
+			Name: "pivb-attachment-protocol", OK: capabilityErr == nil,
+			Detail: doctorDetail(capabilityErr, fmt.Sprintf("%s supports attachment protocol %d", cfg.Credentials.PIVB.Command, managedPIVBAttachmentProtocol(cfg))),
+		})
+		pathCapabilityErr := ensurePaneVisiblePIVBCapability(ctx, cfg)
+		checks = append(checks, doctorCheck{
+			Name: "pivb-pane-capabilities", OK: pathCapabilityErr == nil,
+			Detail: doctorDetail(pathCapabilityErr, fmt.Sprintf("PATH pivb supports attachment protocol %d", managedPIVBAttachmentProtocol(cfg))),
+		})
 	}
 	// The view layer is skipped by configuration, not probing: a probe cannot
 	// distinguish "no kitty because headless" from "no kitty because broken".
@@ -273,7 +286,11 @@ func hookRelayDoctorCheck(paths Paths) doctorCheck {
 	return doctorCheck{Name: name, OK: true, Warning: stale != 0, Detail: detail}
 }
 
-func currentPaneCredentialEnvironmentDoctorCheck(paths Paths) (doctorCheck, bool) {
+func currentPaneCredentialEnvironmentDoctorCheck(paths Paths, configs ...Config) (doctorCheck, bool) {
+	cfg := defaultConfig()
+	if len(configs) != 0 {
+		cfg = configs[0]
+	}
 	const name = "current-pane-credentials"
 	paneID := os.Getenv("ZKA_PANE_ID")
 	if paneID == "" {
@@ -282,7 +299,7 @@ func currentPaneCredentialEnvironmentDoctorCheck(paths Paths) (doctorCheck, bool
 	workspaceID := os.Getenv("ZKA_WORKSPACE_ID")
 	rawVersion := os.Getenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION")
 	if rawVersion == "" || rawVersion == "0" {
-		detail := fmt.Sprintf("pane %s uses version 0 direct credentials and is awaiting managed-environment migration", shortID(paneID))
+		detail := fmt.Sprintf("pane %s uses version 0 direct credentials and requires explicit backend recreation", shortID(paneID))
 		if home, homeErr := credentialOpenPGPHome(paths, workspaceID); homeErr == nil {
 			detail += fmt.Sprintf("; managed SSH_AUTH_SOCK=%s; managed GNUPGHOME=%s", agentRelaySocketPath(paths.AgentDir, workspaceID), home)
 		}
@@ -292,14 +309,15 @@ func currentPaneCredentialEnvironmentDoctorCheck(paths Paths) (doctorCheck, bool
 	if err != nil || version < 0 {
 		return doctorCheck{Name: name, Detail: fmt.Sprintf("pane %s has invalid credential environment version %q", shortID(paneID), rawVersion)}, true
 	}
-	if version == legacyCredentialEnvironmentVersion || version == 3 || version == credentialEnvironmentVersion {
+	requiredVersion := credentialEnvironmentVersionForConfig(cfg)
+	if version == requiredVersion {
 		return doctorCheck{Name: name, OK: true, Detail: fmt.Sprintf("pane %s uses managed credential environment v%d", shortID(paneID), version)}, false
 	}
 	if version > credentialEnvironmentVersion {
 		return doctorCheck{Name: name, Detail: fmt.Sprintf("pane %s uses credential environment v%d, newer than this zka supports", shortID(paneID), version)}, true
 	}
 
-	detail := fmt.Sprintf("pane %s uses legacy credential environment v%d and must be triaged for recreation", shortID(paneID), version)
+	detail := fmt.Sprintf("pane %s uses credential environment v%d but routing mode %s requires v%d; run `zka workspace reconcile --recreate-backends %s`", shortID(paneID), version, cfg.Credentials.PIVB.RoutingMode, requiredVersion, workspaceID)
 	if home, homeErr := credentialOpenPGPHome(paths, workspaceID); homeErr == nil {
 		// These are origin-side paths derived solely from the workspace ID. Do
 		// not include the provider's resolved SSH or gpg-agent socket paths:

@@ -106,6 +106,11 @@ let
       cfg.notifications.ntfyCommand
     else
       "${cfg.notifications.ntfyPackage}/bin/${cfg.notifications.ntfyCommand}";
+  pivbCommand =
+    if cfg.credentials.pivb.package == null then
+      "pivb"
+    else
+      "${cfg.credentials.pivb.package}/bin/pivb";
   anyOpenPGPBundle = lib.any (bundle: bundle.openpgp.enable) (lib.attrValues cfg.credentials.bundles);
   forbiddenForwardAgent = lib.any (
     option:
@@ -181,7 +186,11 @@ let
         configure_agent = cfg.credentials.gnupg.configureAgent;
         operation_timeout = cfg.credentials.gnupg.operationTimeout;
       };
-      pivb.forward_socket = if cfg.credentials.pivb.forwardSocket == null then "" else cfg.credentials.pivb.forwardSocket;
+      pivb = {
+        forward_socket = if cfg.credentials.pivb.forwardSocket == null then "" else cfg.credentials.pivb.forwardSocket;
+        command = pivbCommand;
+        routing_mode = cfg.credentials.pivb.routingMode;
+      };
       bundles = lib.mapAttrs (_: bundle: {
         ssh_agent.enable = bundle.sshAgent.enable;
         openpgp = {
@@ -220,6 +229,7 @@ let
   ++ lib.optional (cfg.zmx.package != null) cfg.zmx.package
   ++ lib.optional (cfg.sway.package != null) cfg.sway.package
   ++ lib.optional (cfg.notifications.ntfyPackage != null) cfg.notifications.ntfyPackage
+  ++ lib.optional (cfg.credentials.pivb.package != null) cfg.credentials.pivb.package
   ++ lib.optional (anyOpenPGPBundle || cfg.credentials.gnupg.configureAgent) cfg.credentials.gnupg.package
   ++ cfg.extraPackages;
 in
@@ -367,10 +377,24 @@ in
         };
       };
 
-      pivb.forwardSocket = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        description = "Absolute provider-side pivbd forwarding socket; null uses $XDG_RUNTIME_DIR/pivb/forward.sock at runtime.";
+      pivb = {
+        package = lib.mkOption {
+          type = lib.types.nullOr lib.types.package;
+          default = null;
+          description = "PIVB package used for managed-pane capability negotiation; null resolves pivb from PATH.";
+        };
+
+        forwardSocket = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "Absolute provider-side pivbd forwarding socket; null uses $XDG_RUNTIME_DIR/pivb/forward.sock at runtime.";
+        };
+
+        routingMode = lib.mkOption {
+          type = lib.types.enum [ "environment" ];
+          default = "environment";
+          description = "Managed PIVB route binding. Protocol 1 is cooperative; enforced provenance remains future work.";
+        };
       };
 
       bundles = lib.mkOption {

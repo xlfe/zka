@@ -70,6 +70,8 @@ type CredentialsConfig struct {
 
 type CredentialPIVBConfig struct {
 	ForwardSocket string `json:"forward_socket"`
+	Command       string `json:"command"`
+	RoutingMode   string `json:"routing_mode"`
 }
 
 type CredentialProviderConfig struct {
@@ -123,6 +125,8 @@ func defaultConfig() Config {
 	cfg.Credentials.GnuPG.GPGConfCommand = "gpgconf"
 	cfg.Credentials.GnuPG.GPGConnectAgentCommand = "gpg-connect-agent"
 	cfg.Credentials.GnuPG.OperationTimeout = "45s"
+	cfg.Credentials.PIVB.Command = "pivb"
+	cfg.Credentials.PIVB.RoutingMode = pivbRoutingEnvironment
 	cfg.Credentials.Bundles = map[string]CredentialBundleConfig{}
 	cfg.Credentials.Providers = map[string]CredentialProviderConfig{}
 	cfg.SSH.ExpectedNodeIDs = map[string]string{}
@@ -187,6 +191,7 @@ func LoadConfig() (Config, error) {
 		"credentials.gnupg.command":                   cfg.Credentials.GnuPG.Command,
 		"credentials.gnupg.gpgconf_command":           cfg.Credentials.GnuPG.GPGConfCommand,
 		"credentials.gnupg.gpg_connect_agent_command": cfg.Credentials.GnuPG.GPGConnectAgentCommand,
+		"credentials.pivb.command":                    cfg.Credentials.PIVB.Command,
 	} {
 		if command == "" {
 			return Config{}, fmt.Errorf("%s must not be empty", label)
@@ -266,6 +271,9 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.Credentials.PIVB.ForwardSocket != "" && !filepath.IsAbs(cfg.Credentials.PIVB.ForwardSocket) {
 		return Config{}, fmt.Errorf("credentials.pivb.forward_socket must be absolute")
+	}
+	if cfg.Credentials.PIVB.RoutingMode != pivbRoutingEnvironment {
+		return Config{}, fmt.Errorf("credentials.pivb.routing_mode must be %q; enforced provenance is not available yet", pivbRoutingEnvironment)
 	}
 	if cfg.SSH.IdentityAgent != "" {
 		cfg.SSH.Options = append([]string{"-o", "IdentityAgent=" + cfg.SSH.IdentityAgent}, cfg.SSH.Options...)

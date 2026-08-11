@@ -26,15 +26,15 @@ func TestCurrentPaneCredentialEnvironmentDoctorCheck(t *testing.T) {
 		t.Fatalf("version-0 pane check = %#v unsafe=%v", check, unsafe)
 	}
 
-	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "2")
+	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "5")
 	check, unsafe := currentPaneCredentialEnvironmentDoctorCheck(paths)
-	if !check.OK || unsafe || !strings.Contains(check.Detail, "managed credential environment v2") {
-		t.Fatalf("v2 managed pane check = %#v unsafe=%v", check, unsafe)
+	if !check.OK || unsafe || !strings.Contains(check.Detail, "managed credential environment v5") {
+		t.Fatalf("v5 managed pane check = %#v unsafe=%v", check, unsafe)
 	}
 
-	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "3")
-	if check, unsafe = currentPaneCredentialEnvironmentDoctorCheck(paths); !check.OK || unsafe || !strings.Contains(check.Detail, "managed credential environment v3") {
-		t.Fatalf("remote pane check = %#v unsafe=%v", check, unsafe)
+	t.Setenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION", "6")
+	if check, unsafe = currentPaneCredentialEnvironmentDoctorCheck(paths); check.OK || !unsafe || !strings.Contains(check.Detail, "newer than this zka supports") {
+		t.Fatalf("future-version pane check = %#v unsafe=%v", check, unsafe)
 	}
 }
 

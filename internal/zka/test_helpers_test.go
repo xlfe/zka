@@ -175,6 +175,7 @@ func testPaths(root string) Paths {
 func newTestDaemon(t testing.TB, root string, runner CommandRunner) (*Daemon, error) {
 	t.Helper()
 	t.Setenv("ZKA_CONFIG", "")
+	t.Setenv("ZKA_HOOK_SOCKET", "")
 	d, err := NewDaemon(testPaths(root), runner, log.New(io.Discard, "", 0))
 	if err == nil {
 		d.desktop = &fakeNotifier{}
@@ -208,6 +209,7 @@ func (b *syncBuffer) String() string {
 func newTestDaemonWithLog(t testing.TB, root string, runner CommandRunner) (*Daemon, *syncBuffer, error) {
 	t.Helper()
 	t.Setenv("ZKA_CONFIG", "")
+	t.Setenv("ZKA_HOOK_SOCKET", "")
 	journal := &syncBuffer{}
 	d, err := NewDaemon(testPaths(root), runner, log.New(journal, "", 0))
 	if err == nil {
@@ -258,6 +260,21 @@ func createTestWorkspace(t testing.TB, daemon *Daemon, panes int) *Workspace {
 		t.Fatal(err)
 	}
 	return workspace
+}
+
+func addReadyCredentialAttachment(d *Daemon, workspaceID string, node Host) string {
+	id := "credential-owner-" + node.ID
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	workspace := d.state.Workspaces[workspaceID]
+	if workspace.Attachments == nil {
+		workspace.Attachments = map[string]*Attachment{}
+	}
+	workspace.Attachments[id] = &Attachment{
+		ID: id, Node: node, Status: AttachmentReady, Transport: Transport{Kind: "ssh"},
+		Endpoint: "ssh:" + node.Name + ":" + id, Views: map[string]RuntimeView{}, ClientHeartbeats: map[string]time.Time{},
+	}
+	return id
 }
 
 func waitFor(t testing.TB, condition func() bool) {

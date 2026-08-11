@@ -535,7 +535,8 @@ func TestPIVBBindingTransfersWithoutReplacingStableWorkspaceRoute(t *testing.T) 
 	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": bundle}
 	d.config.Credentials.PIVB.ForwardSocket = serveFakePIVB(t, handler)
 	workspace := createTestWorkspace(t, d, 1)
-	status, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "")
+	localOwner := readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
+	status, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -551,7 +552,7 @@ func TestPIVBBindingTransfersWithoutReplacingStableWorkspaceRoute(t *testing.T) 
 	d.mu.Lock()
 	firstGeneration := d.state.Workspaces[workspace.ID].CredentialClaim.Generation
 	d.mu.Unlock()
-	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, ""); err != nil {
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID); err != nil {
 		t.Fatal(err)
 	}
 	d.mu.Lock()
@@ -575,7 +576,8 @@ func TestPIVBBindingTransfersWithoutReplacingStableWorkspaceRoute(t *testing.T) 
 	}
 	if _, err := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
 		Workspace: workspace.ID, Provider: attachment.Node, ProviderSource: "remote", Bundle: "work",
-		Manifest: credentialBundleManifest{Bundle: "work", PIVB: manifest},
+		OwnerAttachmentID: attachment.ID,
+		Manifest:          credentialBundleManifest{Bundle: "work", PIVB: manifest},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -591,10 +593,10 @@ func TestPIVBBindingTransfersWithoutReplacingStableWorkspaceRoute(t *testing.T) 
 	if currentRoute != stableRoute {
 		t.Fatal("provider transfer replaced the pane-facing workspace route")
 	}
-	if noOp, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", true, ""); err != nil || noOp.OwnerNode != attachment.Node.ID {
+	if noOp, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", true, "", localOwner.ID); err != nil || noOp.OwnerNode != attachment.Node.ID {
 		t.Fatalf("if-unclaimed activation changed or rejected remote route: status=%#v err=%v", noOp, err)
 	}
-	localAgain, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "")
+	localAgain, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID)
 	if err != nil || localAgain.OwnerNode != d.state.Node.ID {
 		t.Fatalf("explicit local transfer = %#v, %v", localAgain, err)
 	}
@@ -645,13 +647,14 @@ func TestLocalPIVBListenerFailureIsPersistedAsDegraded(t *testing.T) {
 	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": bundle}
 	d.config.Credentials.PIVB.ForwardSocket = serveFakePIVB(t, handler)
 	workspace := createTestWorkspace(t, d, 1)
+	localOwner := readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
 	blocker, err := listenUnix(pivbRelaySocketPath(d.paths, workspace.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer blocker.Close()
 
-	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, ""); err == nil {
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID); err == nil {
 		t.Fatal("local activation reported success while another live listener owned the route")
 	}
 	d.mu.Lock()

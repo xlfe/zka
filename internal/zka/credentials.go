@@ -48,6 +48,7 @@ type credentialOpenPGPManifest struct {
 type workspaceCredentialRequest struct {
 	Workspace         string                   `json:"workspace"`
 	Bundle            string                   `json:"bundle,omitempty"`
+	OwnerAttachmentID string                   `json:"owner_attachment_id,omitempty"`
 	IfUnclaimed       bool                     `json:"if_unclaimed,omitempty"`
 	Provider          Host                     `json:"provider,omitempty"`
 	ProviderSource    string                   `json:"provider_source,omitempty"`
@@ -73,6 +74,7 @@ type workspaceCredentialStatus struct {
 	WorkspaceName    string                              `json:"workspace_name"`
 	Bundle           string                              `json:"bundle,omitempty"`
 	OwnerNode        string                              `json:"owner_node,omitempty"`
+	OwnerAttachment  string                              `json:"owner_attachment_id,omitempty"`
 	Generation       uint64                              `json:"generation,omitempty"`
 	State            string                              `json:"state"`
 	Capabilities     map[string]credentialCapabilityView `json:"capabilities"`
@@ -489,11 +491,24 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, fmt.Errorf("local credential provider must be this workspace origin")
 	}
-	if workspace.CredentialClaim != nil && len(panesRequiringCredentialEnvironment(workspace)) != 0 {
+	ownerAttachment := workspace.Attachments[req.OwnerAttachmentID]
+	if req.OwnerAttachmentID == "" || ownerAttachment == nil {
+		d.mu.Unlock()
+		return workspaceCredentialStatus{}, fmt.Errorf("credential claim requires an active controlling attachment")
+	}
+	if ownerAttachment.Status != AttachmentReady || ownerAttachment.Revoked {
+		d.mu.Unlock()
+		return workspaceCredentialStatus{}, fmt.Errorf("credential attachment %s is not active", req.OwnerAttachmentID)
+	}
+	if ownerAttachment.Node.ID != provider.ID {
+		d.mu.Unlock()
+		return workspaceCredentialStatus{}, fmt.Errorf("credential attachment %s belongs to node %s, not authenticated provider %s", req.OwnerAttachmentID, ownerAttachment.Node.ID, provider.ID)
+	}
+	if workspace.CredentialClaim != nil && len(panesRequiringCredentialEnvironmentVersion(workspace, credentialEnvironmentVersionForConfig(d.config))) != 0 {
 		existing := workspace.CredentialClaim
 		if existing.ProviderSource != source || existing.OwnerNodeID != provider.ID || existing.Bundle != req.Bundle {
 			d.mu.Unlock()
-			return workspaceCredentialStatus{}, fmt.Errorf("credential provider transfer is blocked until version 0 panes complete managed-environment migration")
+			return workspaceCredentialStatus{}, fmt.Errorf("credential provider transfer is blocked until route-unsafe panes complete explicit backend recreation")
 		}
 	}
 	workspaceID := workspace.ID
@@ -544,6 +559,11 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, err
 	}
+	ownerAttachment = workspace.Attachments[req.OwnerAttachmentID]
+	if ownerAttachment == nil || ownerAttachment.Status != AttachmentReady || ownerAttachment.Revoked || ownerAttachment.Node.ID != ownerNode {
+		d.mu.Unlock()
+		return workspaceCredentialStatus{}, fmt.Errorf("credential controlling attachment changed while preparing claim")
+	}
 	if source == "remote" && !d.incomingCredentialTransportReady(ownerNode) {
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, fmt.Errorf("credential provider transport changed while preparing credential claim")
@@ -554,7 +574,7 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 	}
 	previousClaim := workspace.CredentialClaim
 	previousUpdatedAt := workspace.UpdatedAt
-	if credentialClaimMatchesManifest(previousClaim, source, ownerNode, req.Bundle, req.Manifest) {
+	if credentialClaimMatchesManifest(previousClaim, source, ownerNode, req.OwnerAttachmentID, req.Bundle, req.Manifest) {
 		d.mu.Unlock()
 		d.reconcileCredentialRoutes(ctx)
 		status, statusErr := d.workspaceCredentialStatus(workspaceID)
@@ -573,7 +593,7 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 	newGeneration := generationBase + 1
 	workspace.CredentialGeneration = newGeneration
 	workspace.CredentialClaim = &CredentialClaim{
-		ProviderSource: source, Bundle: req.Bundle, OwnerNodeID: ownerNode,
+		ProviderSource: source, Bundle: req.Bundle, OwnerNodeID: ownerNode, OwnerAttachmentID: req.OwnerAttachmentID,
 		Generation: newGeneration, State: "ready", Capabilities: capabilities,
 		OpenPGPKeys: keys, PIVB: clonePIVBManifest(req.Manifest.PIVB), UpdatedAt: time.Now().UTC(),
 	}
@@ -594,8 +614,8 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 	return status, statusErr
 }
 
-func credentialClaimMatchesManifest(claim *CredentialClaim, source, ownerNode, bundle string, manifest credentialBundleManifest) bool {
-	if claim == nil || claim.ProviderSource != source || claim.OwnerNodeID != ownerNode || claim.Bundle != bundle || claim.State != "ready" ||
+func credentialClaimMatchesManifest(claim *CredentialClaim, source, ownerNode, ownerAttachment, bundle string, manifest credentialBundleManifest) bool {
+	if claim == nil || claim.ProviderSource != source || claim.OwnerNodeID != ownerNode || claim.OwnerAttachmentID != ownerAttachment || claim.Bundle != bundle || claim.State != "ready" ||
 		!sameStringSet(claim.OpenPGPKeys, manifestOpenPGPFingerprints(manifest.OpenPGP)) {
 		return false
 	}
@@ -633,15 +653,26 @@ func (d *Daemon) releaseWorkspaceCredentials(workspaceRef string) (workspaceCred
 	}
 	previousClaim := workspace.CredentialClaim
 	previousUpdatedAt := workspace.UpdatedAt
+	previousCredentialGeneration := workspace.CredentialGeneration
 	previousGeneration := uint64(0)
 	if previousClaim != nil {
 		previousGeneration = previousClaim.Generation
+		base := workspace.CredentialGeneration
+		if previousClaim.Generation > base {
+			base = previousClaim.Generation
+		}
+		if base == ^uint64(0) {
+			d.mu.Unlock()
+			return workspaceCredentialStatus{}, fmt.Errorf("credential generation exhausted for workspace %s", workspace.ID)
+		}
+		workspace.CredentialGeneration = base + 1
 	}
 	workspace.CredentialClaim = nil
 	workspace.PIVBProvider = nil
 	workspace.UpdatedAt = time.Now().UTC()
 	if err := d.store.Save(d.state); err != nil {
 		workspace.CredentialClaim = previousClaim
+		workspace.CredentialGeneration = previousCredentialGeneration
 		workspace.UpdatedAt = previousUpdatedAt
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, err
@@ -670,7 +701,7 @@ func (d *Daemon) workspaceCredentialStatus(workspaceRef string) (workspaceCreden
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, err
 	}
-	status := credentialStatusFromWorkspace(workspace)
+	status := credentialStatusFromWorkspaceVersion(workspace, credentialEnvironmentVersionForConfig(d.config))
 	if workspace.CredentialClaim == nil {
 		d.mu.Unlock()
 		return status, nil
@@ -700,30 +731,34 @@ func sortedCredentialStatuses(workspaces []*Workspace) []workspaceCredentialStat
 }
 
 func credentialStatusFromWorkspace(workspace *Workspace) workspaceCredentialStatus {
+	return credentialStatusFromWorkspaceVersion(workspace, credentialEnvironmentVersion)
+}
+
+func credentialStatusFromWorkspaceVersion(workspace *Workspace, requiredVersion int) workspaceCredentialStatus {
 	status := workspaceCredentialStatus{
 		WorkspaceID: workspace.ID, WorkspaceName: workspace.Name, State: "unclaimed",
 		Capabilities: map[string]credentialCapabilityView{},
 	}
 	claim := workspace.CredentialClaim
 	if claim == nil {
-		status.RecreatePaneIDs = panesRequiringCredentialEnvironment(workspace)
+		status.RecreatePaneIDs = panesRequiringCredentialEnvironmentVersion(workspace, requiredVersion)
 		if len(status.RecreatePaneIDs) != 0 {
-			status.RecreationDetail = "version 0 panes are awaiting automatic managed-credential migration"
+			status.RecreationDetail = "panes require explicit managed-credential backend recreation"
 			status.RecreationDetail = appendCredentialMigrationErrors(status.RecreationDetail, workspace, status.RecreatePaneIDs)
 		}
 		return status
 	}
 
-	status.Bundle, status.OwnerNode = claim.Bundle, claim.OwnerNodeID
+	status.Bundle, status.OwnerNode, status.OwnerAttachment = claim.Bundle, claim.OwnerNodeID, claim.OwnerAttachmentID
 	status.Generation, status.State = claim.Generation, claim.State
 	for name, capability := range claim.Capabilities {
 		status.Capabilities[name] = credentialCapabilityView{State: capability.State, Available: capability.Available, Detail: capability.Detail}
 	}
-	status.RecreatePaneIDs = panesRequiringCredentialEnvironment(workspace)
+	status.RecreatePaneIDs = panesRequiringCredentialEnvironmentVersion(workspace, requiredVersion)
 	if len(status.RecreatePaneIDs) == 0 {
 		return status
 	}
-	status.RecreationDetail = "version 0 panes are awaiting automatic managed-credential migration; provider transfer is blocked until migration completes"
+	status.RecreationDetail = "panes require explicit managed-credential backend recreation; provider transfer is blocked until recreation completes"
 	status.RecreationDetail = appendCredentialMigrationErrors(status.RecreationDetail, workspace, status.RecreatePaneIDs)
 	if _, ok := claim.Capabilities[credentialCapabilitySSH]; ok {
 		capability := status.Capabilities[credentialCapabilitySSH]
@@ -1036,7 +1071,16 @@ func (d *Daemon) allCredentialStatuses() credentialStatusResponse {
 	}
 	d.mu.Unlock()
 	transport := d.credentialTransportStatus(workspaces)
-	statuses := sortedCredentialStatuses(workspaces)
+	statuses := make([]workspaceCredentialStatus, 0, len(workspaces))
+	for _, workspace := range workspaces {
+		statuses = append(statuses, credentialStatusFromWorkspaceVersion(workspace, credentialEnvironmentVersionForConfig(d.config)))
+	}
+	sort.Slice(statuses, func(i, j int) bool {
+		if statuses[i].WorkspaceName != statuses[j].WorkspaceName {
+			return statuses[i].WorkspaceName < statuses[j].WorkspaceName
+		}
+		return statuses[i].WorkspaceID < statuses[j].WorkspaceID
+	})
 	byID := make(map[string]*Workspace, len(workspaces))
 	for _, workspace := range workspaces {
 		byID[workspace.ID] = workspace

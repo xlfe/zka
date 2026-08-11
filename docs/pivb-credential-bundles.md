@@ -29,6 +29,7 @@ Declare the same bundle name and PIVB alias allowlist on each ZKA peer:
 ```nix
 services.zka.credentials = {
   defaultBundle = "work";
+  pivb.routingMode = "environment";
   bundles.work.pivb = {
     enable = true;
     aliases = [ "ro" "deploy" ];
@@ -70,6 +71,28 @@ scdaemon/PCSC without ZKA are outside this cooperative protocol.
 
 ## Select a workspace route
 
+For every PIVB-enabled managed backend ZKA removes ambient PIVB attachment
+variables and installs one complete versioned tuple:
+
+```text
+PIVB_ATTACHMENT_MODE=route-required
+PIVB_ROUTE_SOCKET=/absolute/stable/workspace/socket
+PIVB_ATTACHMENT_PROTOCOL=1
+```
+
+PIVB protocol 1 carries both the socket and `route_required: true` through the
+trusted-host WIF API. It rejects partial, malformed, unknown, or conflicting
+policy before any local signer, PIN, touch notification, or card lookup. Route
+transport failures are `PIVB_UNAVAILABLE`; a responding endpoint with an
+invalid route protocol is `PIVB_CONFIG`; policy failures are
+`PIVB_ROUTE_REQUIRED`. There is no route-less retry.
+
+Before creating a backend, ZKA requires schema-1 output from `pivb capabilities
+--format=json` with protocol 1 and `route-required`. It checks both zkad's
+configured executable and the `pivb` selected by the launching user's `PATH`.
+Unknown fields are forward-compatible, but an unknown schema or missing
+capability fails closed.
+
 A local launcher explicitly activates the local card. The operation is
 workspace-scoped and idempotent when the bundle and live card are unchanged:
 
@@ -98,8 +121,9 @@ The four sandbox mounts remain `session.sock`, `credential.json`,
 `forward.sock`, `wif.sock`, `control.sock`, card-lease socket, PIVB config,
 PC/SC socket, and YubiKey devices stay outside the sandbox.
 
-The launcher may call `activate-local --if-unclaimed` on every start. An existing
-local or remote route is returned unchanged without probing or repinning a card.
+The launcher may call `activate-local --if-unclaimed` on every start, but it
+must run from exactly one ready local attachment (or name that attachment
+explicitly). An existing local or remote route is returned unchanged without probing or repinning a card.
 Without `--if-unclaimed`, the command is an explicit local repin and refuses to
 replace a remote attachment. A launcher may also inspect:
 
@@ -137,9 +161,10 @@ fixed-alias agent session can use the new provider on its next subject-token
 request. Existing Google access tokens are unaffected and remain valid until
 their own expiry.
 
-Explicit release removes the remote route. Detaching a Kitty view does not
-change the provider because credential ownership is node-scoped, not
-attachment-scoped:
+Every generation is owned by the ready attachment that made the claim.
+Detaching that attachment atomically clears the whole bundle and advances the
+generation; a transient control disconnect only degrades it, and detaching a
+non-owner does nothing. Explicit release also removes the route:
 
 ```fish
 zka workspace credentials release devbox:example-project
@@ -150,9 +175,35 @@ unavailable until another remote claim or an explicit local activation. A route
 generation change closes active relay connections, so an in-flight mint fails
 closed and is not retried automatically on another provider.
 
+## Stage 2 blocker: enforced pane provenance
+
+Protocol 1 authenticates the route response and fails closed when the inherited
+policy is present, but the policy itself is cooperative. Cgroup membership
+cannot upgrade it into adversarial pane identity. On the tested target host, a
+same-UID process can write its PID into another user scope's `cgroup.procs`, so
+matching the route peer's cgroup device/inode would let one workspace
+impersonate another.
+
+An inherited descriptor could act as an unforgeable per-pane second factor,
+but it cannot cross the current backend chain. The target-host probes ran
+[zmx 0.6.0](https://github.com/neurosnap/zmx/blob/v0.6.0/src/main.zig#L817-L825),
+whose tagged source closes every inherited descriptor from 3 through 63 except
+its own internal descriptors before it forks the PTY child. ZKA therefore
+exposes no `cgroup-bound` or protocol-2 mode. Stage 2 is blocked on one of these
+architectural changes:
+
+- zmx adds an explicit, versioned pass-descriptor contract that ZKA can probe;
+- ZKA starts panes inside process isolation that hides the user bus, Kitty,
+  zkad, local PIVB, and other zmx session sockets while exposing mediated
+  per-pane endpoints.
+
+Until then, PIVB routing enforcement is PIVB-only and cooperative. SSH-agent
+and OpenPGP workspace sockets are also routing endpoints, not same-UID security
+boundaries.
+
 Remote response read, size, and transport failures return `503
 PIVB_UNAVAILABLE`. A response that arrives successfully but fails the origin's
-route/card/context binding returns `403 PIVB_CONFIG`; provider errors such as
+route/card/context binding returns `502 PIVB_CONFIG`; provider errors such as
 `PIVB_LOCKED` otherwise retain their original status and code.
 
 ## Timeout and audit contract

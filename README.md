@@ -24,7 +24,7 @@ and provider socket paths on the provider.
 </p>
 
 > [!NOTE]
-> zka 0.8.3 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
+> zka 0.9.0 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
 > builds on Kitty, zmx, OpenSSH, systemd user services, and coding-agent hooks
 > instead of replacing them.
 
@@ -424,7 +424,9 @@ OpenPGP fingerprints:
 ```nix
 # Shared by laptop (provider) and devbox (origin).
 services.zka.credentials = {
-  defaultBundle = "work"; # bound automatically only when creating a workspace
+  defaultBundle = "work"; # selected only by an explicit create/attach claim
+  # Protocol 1 is cooperative. Enforced provenance is not yet available.
+  pivb.routingMode = "environment";
   bundles.work = {
     sshAgent.enable = true;
     openpgp.enable = true;
@@ -556,9 +558,18 @@ zka workspace attach devbox:example-project --claim-credentials --credential-bun
 zka workspace credentials status --json devbox:example-project
 ```
 
-A binding is workspace-wide and owned by the provider node, not by a Kitty
-attachment or SSH process. Detaching a view therefore leaves credentials bound.
-The binding ends on explicit release or workspace deletion:
+A binding is workspace-wide and has exactly one controlling attachment. The
+attachment must be ready, authenticated by the control path, and belong to the
+provider node. Detaching that owning view releases the whole bundle and advances
+the durable generation; detaching any other view leaves it unchanged. Explicit
+release and workspace deletion have the same fail-closed effect:
+
+This deliberately reverses the short-lived node-owned schema-9 model. Node
+ownership made a confirmed detach indistinguishable from a temporary transport
+loss, so a reconnect loop could retain or resurrect authority after the user
+closed the controlling view. Attachment ownership preserves reconnect across a
+dropped control connection while giving confirmed detach a durable revocation
+event.
 
 ```fish
 zka workspace credentials release devbox:example-project
@@ -604,10 +615,32 @@ PIVB service, timeout, and smart-card lease contract.
 
 The credential environment is fixed when the zmx backend is created, not when a
 view attaches or a provider changes. Every new local or remote pane receives the
-same stable workspace `SSH_AUTH_SOCK` and `GNUPGHOME`. An unclaimed or
+same stable workspace `SSH_AUTH_SOCK`, `GNUPGHOME`, and—when any configured
+bundle enables PIVB—the exact cooperative attachment tuple:
+
+```text
+PIVB_ATTACHMENT_MODE=route-required
+PIVB_ROUTE_SOCKET=/absolute/stable/workspace/socket
+PIVB_ATTACHMENT_PROTOCOL=1
+```
+
+`pivb capabilities --format=json` is checked against both zkad's configured
+binary and the `pivb` resolved from the launching user's `PATH` before a backend
+is started. A partial tuple, stale binary, unknown protocol, conflicting route,
+or failed route is rejected without trying the origin-local card. An unclaimed or
 disconnected route fails closed; a local binding routes those paths to the
 origin provider, and an explicit remote claim transfers them without recreating
 the pane, zmx backend, sandbox, or attachment.
+
+Enforced attachment provenance remains a separate Stage 2. A cgroup is not an
+authenticator in a delegated user subtree: a same-UID process can write its PID
+to another pane scope's `cgroup.procs` and impersonate that workspace. An
+inherited descriptor would provide a second factor, but the target-host probes
+ran [zmx 0.6.0](https://github.com/neurosnap/zmx/blob/v0.6.0/src/main.zig#L817-L825),
+which closes inherited descriptors 3 through 63 before spawning the PTY child.
+Stage 2 therefore requires either an explicit zmx pass-descriptor contract or
+process isolation that removes the same-UID control surfaces. ZKA does not
+expose a `cgroup-bound` mode that would overstate this boundary.
 
 If a remote provider daemon restarts without an explicit
 `ssh.identityAgent`, SSH becomes degraded until the bundle is re-claimed rather
@@ -625,7 +658,7 @@ no local secret keys. The normal keyring is unchanged; unset `GNUPGHOME` (or use
 an explicit `--homedir`) when you want to inspect it. This is isolation, not
 keyring data loss.
 
-### Migrating from v0.8.0
+### Recreating managed credential backends
 
 After upgrading and restarting zka across the fleet, inventory pane
 environments:
@@ -635,22 +668,32 @@ zka doctor
 zka workspace credentials status --json
 ```
 
-Environment versions 2 and 3 already contain stable workspace paths and remain
-valid. Version 0 panes contain the regressed direct local environment. zkad
-prepares the workspace's existing binding, or its local `defaultBundle` when it
-is unclaimed, verifies daemon listeners and `zmx run <name> -d`, then recreates
-each version 0 backend with environment version 4. This terminates programs in
-that pane; durable migration status makes a daemon interruption retryable. The
-replacement is launched by zkad and therefore inherits the daemon service's
-environment, not arbitrary session variables from the old shell. If a pane
-depends on session-specific environment such as direnv exports or custom PATH
-entries, recreate the workspace from that shell instead of relying on automatic
-migration.
+Environment version 5 is protocol 1. Any other live version is route-unsafe.
+Ordinary `workspace reconcile`
+remains a non-destructive topology recapture/backend census; it never terminates
+a pane. Recreate only after reviewing the named panes:
 
-If no default or explicit binding exists, or the installed zmx lacks detached
-run support, the pane is left running and `credentials status` reports the
-blocking reason. Provider transfer is refused while version 0 migration is
-pending. Schema migration writes a one-time `.v8.backup` beside the state file.
+```fish
+zka workspace reconcile --recreate-backends example-project
+```
+
+The explicit operation requires an existing attachment-owned ready claim,
+checks the configured and pane-visible PIVB capabilities, verifies stable
+listeners and detached `zmx run`, then replaces the complete affected backend.
+It never claims `defaultBundle` implicitly. This terminates programs in the
+named panes. Durable pending state makes interruption retryable, while a failed
+preflight leaves the old backend running. Until every live backend reports the
+exact selected version, endpoint status is degraded and PIVB minting is
+unavailable.
+
+Schema 9 to 10 deliberately clears every credential claim—including cached
+remote copies—because schema 9 did not retain an attachment owner. Every
+workspace therefore requires a manual claim from a ready attachment after the
+upgrade. Each upgrade attempt writes a new private
+`.v9.<timestamp>.<nonce>.backup`; backups are never reused across an
+upgrade/rollback/upgrade cycle. Zkad logs each exact backup path. Backups are
+retained rather than pruned automatically; remove obsolete copies only after
+the rollback window has closed.
 
 For each OpenPGP private-key operation, the provider must have an interactive
 session, must not report a positive screen lock, and must successfully deliver a
@@ -692,7 +735,7 @@ or substitute for OpenSSH host/user authentication.
 | --- | --- | --- |
 | Network | zka opens no TCP listener. Remote control, topology, and credential streams travel inside authenticated, encrypted OpenSSH sessions; incompatible protocols fail closed. | SSH configuration, host keys, authorized client keys, and the remote Unix account remain part of the trusted computing base. |
 | Local user | Runtime/state directories are mode `0700`, files and Unix sockets are `0600`, and the systemd unit uses `UMask=0077` and `NoNewPrivileges=true`. | Any process already running as that Unix user can read user-owned state and can connect to a credential socket whose path it can reach. Per-workspace sockets are routing boundaries, not same-UID isolation. |
-| Workspace | Creation binds the driver's default bundle unless explicitly disabled. Later attachment never claims implicitly. Bindings are provider-node-owned; detach does not release them. Daemon-owned endpoints remain stable and fail closed while a remote transport is unavailable. | A claimed origin is trusted to request the granted operations. A compromised origin process is not confined to the visible pane that motivated the claim. |
+| Workspace | Dormant creation remains unclaimed; create-and-attach may explicitly select the driver's default bundle. Later attachment claims only with `--claim-credentials`. Each generation is owned by one active provider attachment; confirmed owner detach releases it, while transport loss only degrades it. Daemon-owned endpoints remain stable and fail closed. | Protocol 1 is cooperative. A same-UID process can strip the inherited marker or reach another user-owned control socket; enforced pane provenance requires a future zmx descriptor contract or process isolation. |
 | Provider identity | The outbound alias is pinned to an expected target node ID, and the origin accepts credential listeners only from configured provider node IDs. Optional source CIDRs can narrow fixed-host deployments. | The provider node ID is asserted inside an authenticated SSH session but is not yet bound to the particular client public key. Another key authorized for the same account could assert a configured ID. Public-key binding through sshd authentication metadata remains future work. |
 
 ### Socket resolution policy
@@ -1216,24 +1259,27 @@ paths. Provider checks now run inside zkad's sanitized environment, so they do
 not inherit the pane's managed `GNUPGHOME` or `SSH_AUTH_SOCK`:
 
 ```text
-FAIL  current-pane-credentials pane 01234567 uses legacy credential environment v2 and must be triaged for recreation; origin SSH_AUTH_SOCK=/run/user/1000/zka/agents/abcdef….sock; origin GNUPGHOME=…/credentials/abcdef…/gnupg
+FAIL  current-pane-credentials pane 01234567 uses credential environment v2 but routing mode environment requires v5; run `zka workspace reconcile --recreate-backends abcdef…`
 ok    provider-environment reachable graphical session from local CLI session
 ok    credentials-provider configured provider sockets are reachable
-FAIL  credential-environment example-project=01234567 (v0.8.0 credential environment detected; run the bundle's credential probe inside each pane (for SSH, ssh-add -l; for OpenPGP, gpg --list-secret-keys) and recreate only panes where local credentials fail; remotely created panes may already be healthy)
+FAIL  credential-environment example-project=01234567 (run `zka workspace reconcile --recreate-backends abcdef…` after claiming from a ready attachment)
 ```
 
 `zka workspace inspect WORKSPACE` includes attachment health, pane/backend state,
 canonical topology generation/digest, convergence state, agent evidence, and
 retained notification failures. `zka workspace reconcile WORKSPACE` forces a
-complete local recapture and repair without restarting the pane backends.
+complete local recapture and repair without restarting pane backends. Backend
+replacement requires the separate `--recreate-backends` flag.
 
-The current migration writes a private `.v7.backup` beside a schema-7 state
-file before upgrading it to schema 8. Both the local daemon protocol and remote
-protocol are version 12. There is no compatibility shim for the removed
-workspace-agent API or old remote
-transport: upgrade the CLI and daemon fleet together, then restart zkad on all
-SSH peers. To roll back, stop zkad, replace the schema-8 state file with its
-`.v7.backup`, install the prior binary on every peer, then restart zkad.
+The current migration writes a unique private `.v9.<timestamp>.<nonce>.backup`
+before upgrading to schema 10. Both the local daemon and remote protocols are
+version 14. Upgrade the CLI and daemon fleet together, then restart zkad on all
+SSH peers. To roll back, first inventory and stop every live backend reporting
+credential environment v5; an old daemon would otherwise accept the
+restored v9 pane record while the newer route-required process keeps running.
+Then stop zkad, restore the newest matching v9 backup for the upgrade being
+rolled back, install the prior binary on every
+peer, and restart zkad. Do not restore state alone.
 
 `zka doctor` checks the enabled Codex and Claude Code executables and their
 managed hook files. An integration disabled in the NixOS module is reported as
@@ -1268,12 +1314,12 @@ routing the new pane through zka.
 
 ## Project status
 
-Version 0.8.3 combines three systems: durable Kitty-native workspaces, Codex and
+Version 0.9.0 combines three systems: durable Kitty-native workspaces, Codex and
 Claude Code attention routing, and reconnect-safe remote credential bundles.
 The current tree extends those bundles with workspace-owned PIVB routes while
 preserving the fixed-alias sandbox ABI. It also includes remote mirrors and two-phase
 moves, headless origins, Waybar streaming, desktop/ntfy notifications, and
-durable cleanup after partial failures. Version 0.8.3 restores inherited
+durable cleanup after partial failures. Version 0.9.0 restores inherited
 SSH and GnuPG credentials in locally created panes and inventories ambiguous
 v0.8.0 pane environments before recreation. It also recovers Focus actions from
 stale compositor environment hints while keeping the underlying session problem

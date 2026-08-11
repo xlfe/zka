@@ -15,7 +15,10 @@ type pivbEndpointResponse struct {
 	Detail      string `json:"detail,omitempty"`
 }
 
-func (d *Daemon) activateLocalCredentialBundle(ctx context.Context, workspaceRef, bundleName string, ifUnclaimed bool, callerSSHAuthSock string) (workspaceCredentialStatus, error) {
+func (d *Daemon) activateLocalCredentialBundle(ctx context.Context, workspaceRef, bundleName string, ifUnclaimed bool, callerSSHAuthSock, ownerAttachment string) (workspaceCredentialStatus, error) {
+	if ownerAttachment == "" {
+		return workspaceCredentialStatus{}, fmt.Errorf("owner attachment is required to activate workspace credentials")
+	}
 	bundle, ok := d.config.credentialBundle(bundleName)
 	if !ok {
 		return workspaceCredentialStatus{}, fmt.Errorf("credential bundle %q is not configured on this node", bundleName)
@@ -41,7 +44,7 @@ func (d *Daemon) activateLocalCredentialBundle(ctx context.Context, workspaceRef
 	}
 	status, err := d.claimWorkspaceCredentials(ctx, workspaceCredentialRequest{
 		Workspace: workspaceID, Bundle: bundleName, IfUnclaimed: ifUnclaimed,
-		Provider: provider, ProviderSource: "local", Manifest: manifest,
+		Provider: provider, ProviderSource: "local", OwnerAttachmentID: ownerAttachment, Manifest: manifest,
 	})
 	if err != nil {
 		return status, err
@@ -79,6 +82,14 @@ func (d *Daemon) pivbEndpoint(workspaceRef string) (pivbEndpointResponse, error)
 			result.State = "degraded"
 			result.Detail = appendCredentialDetail(result.Detail, "workspace PIVB route listener is not published")
 		}
+	}
+	required := credentialEnvironmentVersionForConfig(d.config)
+	if unsafe := panesRequiringCredentialEnvironmentVersion(workspace, required); len(unsafe) != 0 {
+		if result.State == "ready" {
+			result.State = "degraded"
+		}
+		result.Detail = appendCredentialDetail(result.Detail,
+			fmt.Sprintf("pane credential environment does not match routing mode %s; run `zka workspace reconcile --recreate-backends %s`", d.config.Credentials.PIVB.RoutingMode, workspace.ID))
 	}
 	return result, nil
 }

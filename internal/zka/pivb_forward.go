@@ -348,6 +348,8 @@ func (d *Daemon) proxyPIVBMint(ctx context.Context, stream net.Conn, workspace, 
 		if err != nil {
 			return writePIVBProxyError(stream, http.StatusBadGateway, "PIVB_INTERNAL", "PIVB provider returned an invalid response: "+err.Error())
 		}
+		d.logger.Printf("PIVB route mint succeeded attachment_mode=route-required protocol=%d route=local workspace=%s bundle=%s generation=%d provider_node=%s provider_attachment=%s operation=%s alias=%s",
+			managedPIVBAttachmentProtocol(d.config), workspace, bundleName, generation, providerNode, ownerAttachment, operationID, mint.Alias)
 	}
 	response := &http.Response{StatusCode: resp.StatusCode, Status: resp.Status, ProtoMajor: 1, ProtoMinor: 1, Header: resp.Header.Clone(), Body: io.NopCloser(bytes.NewReader(responseBody)), ContentLength: int64(len(responseBody))}
 	return response.Write(stream)
@@ -373,28 +375,34 @@ func bindPIVBMintResponse(raw []byte, expected CredentialPIVBCard, trusted pivbF
 	return json.Marshal(response)
 }
 
-func proxyBoundPIVBResponse(stream net.Conn, client net.Conn, expected CredentialPIVBCard, trusted pivbForwardContext) error {
+func proxyBoundPIVBResponse(stream net.Conn, client net.Conn, expected CredentialPIVBCard, trusted pivbForwardContext) (pivbForwardContext, bool, error) {
 	resp, err := http.ReadResponse(bufio.NewReader(io.LimitReader(stream, pivbForwardResponseMax+8<<10)), nil)
 	if err != nil {
-		return fmt.Errorf("%w: read remote PIVB response: %w", errPIVBRemoteResponseTransport, err)
+		return trusted, false, fmt.Errorf("%w: read remote PIVB response: %w", errPIVBRemoteResponseTransport, err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, pivbForwardResponseMax+1))
 	if err != nil || len(body) > pivbForwardResponseMax {
-		return fmt.Errorf("%w: remote PIVB response exceeds the fixed size limit", errPIVBRemoteResponseTransport)
+		return trusted, false, fmt.Errorf("%w: remote PIVB response exceeds the fixed size limit", errPIVBRemoteResponseTransport)
 	}
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	succeeded := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if succeeded {
 		body, err = bindPIVBMintResponse(body, expected, trusted)
 		if err != nil {
-			return fmt.Errorf("%w: bind remote PIVB response to active route: %w", errPIVBRemoteResponseBinding, err)
+			return trusted, false, fmt.Errorf("%w: bind remote PIVB response to active route: %w", errPIVBRemoteResponseBinding, err)
 		}
+		var rebound pivbMintResponse
+		if err := decodeStrictJSON(body, &rebound); err != nil {
+			return trusted, false, fmt.Errorf("%w: decode rebound PIVB response: %w", errPIVBRemoteResponseBinding, err)
+		}
+		trusted = rebound.ForwardContext
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
 	if err := resp.Write(client); err != nil {
-		return fmt.Errorf("%w: write remote PIVB response: %w", errPIVBRemoteResponseTransport, err)
+		return trusted, false, fmt.Errorf("%w: write remote PIVB response: %w", errPIVBRemoteResponseTransport, err)
 	}
-	return nil
+	return trusted, succeeded, nil
 }
 
 func writePIVBProxyError(conn io.Writer, status int, code, message string) error {

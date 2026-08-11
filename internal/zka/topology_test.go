@@ -88,13 +88,7 @@ func TestStateLoadProposesLivePaneMissingFromManifestWithoutFabricatingTopology(
 	if attachment.AppliedTopologyGeneration != 0 || attachment.ReconcileStatus != "pending" {
 		t.Fatalf("migration trusted stale attachment: %#v", attachment)
 	}
-	backup, err := os.ReadFile(paths.StateFile + ".v4.backup")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(backup) != string(encoded) {
-		t.Fatal("v4 migration backup does not match the original state")
-	}
+	assertMigrationBackup(t, paths.StateFile, 4, encoded)
 }
 
 func TestPartialCaptureCannotHideActivePane(t *testing.T) {

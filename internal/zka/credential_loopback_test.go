@@ -18,19 +18,19 @@ import (
 func TestCredentialLoopbackSignsAndVerifiesGitCommit(t *testing.T) {
 	gpg, err := exec.LookPath("gpg")
 	if err != nil {
-		t.Fatalf("gpg is required for the credential loopback test: %v", err)
+		t.Skipf("gpg is required for the credential loopback test: %v", err)
 	}
 	gpgconf, err := exec.LookPath("gpgconf")
 	if err != nil {
-		t.Fatalf("gpgconf is required for the credential loopback test: %v", err)
+		t.Skipf("gpgconf is required for the credential loopback test: %v", err)
 	}
 	gpgConnectAgent, err := exec.LookPath("gpg-connect-agent")
 	if err != nil {
-		t.Fatalf("gpg-connect-agent is required for the credential loopback test: %v", err)
+		t.Skipf("gpg-connect-agent is required for the credential loopback test: %v", err)
 	}
 	git, err := exec.LookPath("git")
 	if err != nil {
-		t.Fatalf("git is required for the credential loopback test: %v", err)
+		t.Skipf("git is required for the credential loopback test: %v", err)
 	}
 
 	// Assuan uses Unix sockets with a small platform path limit, so this test
@@ -153,15 +153,16 @@ func TestCredentialLoopbackSignsAndVerifiesGitCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ownerAttachment := readyCredentialAttachment(t, origin, workspace, "provider-owner", providerNode.ID)
 	if _, err := origin.claimWorkspaceCredentials(ctx, workspaceCredentialRequest{
-		Workspace: workspace.ID, Bundle: "work", Provider: providerNode, ProviderSource: "remote", Manifest: manifest,
+		Workspace: workspace.ID, Bundle: "work", Provider: providerNode, ProviderSource: "remote", OwnerAttachmentID: ownerAttachment.ID, Manifest: manifest,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	// Reconciliation may replay preparation after any control reconnect. The
 	// same manifest must therefore be harmless when prepared again.
 	if _, err := origin.claimWorkspaceCredentials(ctx, workspaceCredentialRequest{
-		Workspace: workspace.ID, Bundle: "work", Provider: providerNode, ProviderSource: "remote", Manifest: manifest,
+		Workspace: workspace.ID, Bundle: "work", Provider: providerNode, ProviderSource: "remote", OwnerAttachmentID: ownerAttachment.ID, Manifest: manifest,
 	}); err != nil {
 		t.Fatalf("idempotent claim preparation: %v", err)
 	}

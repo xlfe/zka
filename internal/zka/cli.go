@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const Version = "0.8.3"
+const Version = "0.9.0"
 
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
@@ -258,9 +258,6 @@ func runKitty(args []string, paths Paths, stdout, stderr io.Writer) (int, error)
 	if err != nil {
 		return 1, err
 	}
-	if err := bindCreatedWorkspaceCredentials(ctx, api, "", workspace, bundle); err != nil {
-		return 1, fmt.Errorf("workspace %s created but credentials were not activated; retry with: zka workspace credentials activate-local --bundle %s %s: %w", workspace.Name, bundle, workspace.ID, err)
-	}
 	session, err := GenerateManagedSession(template, workspace)
 	if err != nil {
 		_ = api.DeleteWorkspace(context.Background(), workspace.ID)
@@ -282,6 +279,11 @@ func runKitty(args []string, paths Paths, stdout, stderr io.Writer) (int, error)
 		return 1, err
 	}
 	workspace = launchedWorkspace
+	if bundle != "" {
+		if _, err := api.ActivateLocalCredentials(ctx, workspace.ID, bundle, attachmentID, false); err != nil {
+			return 1, fmt.Errorf("workspace %s attached but credentials were not claimed by attachment %s: %w", workspace.Name, attachmentID, err)
+		}
+	}
 	fmt.Fprintf(stdout, "%s\t%s\n", workspace.ID, workspace.Name)
 	return 0, nil
 }
@@ -347,7 +349,7 @@ func printWorkspaceUsage(w io.Writer) {
 
   list [--origin SSH_ALIAS] [--json]
   inspect [SSH_ALIAS:]REF [--json]
-  reconcile [SSH_ALIAS:]REF [--attachment ID]
+  reconcile [SSH_ALIAS:]REF [--attachment ID] [--recreate-backends]
   create [SSH_ALIAS:]NAME [--template FILE] [--cwd DIR] [--attach] [--credential-bundle NAME] [--no-credentials]
   attach [SSH_ALIAS:]REF [--pane PANE] [--claim-credentials] [--credential-bundle NAME]
   move [SSH_ALIAS:]REF [--pane PANE]
@@ -357,8 +359,8 @@ func printWorkspaceUsage(w io.Writer) {
   kill [SSH_ALIAS:]REF
   focus REF [--pane PANE]
   seen REF [--pane PANE]
-  credentials claim [--bundle NAME] [SSH_ALIAS:]REF
-  credentials activate-local [--bundle NAME] [--if-unclaimed] REF
+  credentials claim [--bundle NAME] [--attachment ID] [SSH_ALIAS:]REF
+  credentials activate-local [--bundle NAME] [--attachment ID] [--if-unclaimed] REF
   credentials endpoint [--json] REF
   credentials release [SSH_ALIAS:]REF
   credentials status [--json] [[SSH_ALIAS:]REF]`)
@@ -373,6 +375,7 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 	case "claim":
 		fs := newFlagSet("workspace credentials claim", stderr)
 		bundleName := fs.String("bundle", "", "credential bundle to claim")
+		attachmentID := fs.String("attachment", "", "active controlling attachment id")
 		if err := parseInterspersed(fs, args[1:]); err != nil {
 			return 2, err
 		}
@@ -399,6 +402,14 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		if host == "" {
 			host = workspace.RemoteHost
 		}
+		node, err := api.Node(context.Background())
+		if err != nil {
+			return 1, err
+		}
+		*attachmentID, err = credentialOwnerAttachment(workspace, node.ID, *attachmentID)
+		if err != nil {
+			return 1, err
+		}
 		if host == "" {
 			return 1, fmt.Errorf("workspace %q is authoritative here; use credentials activate-local", workspace.Name)
 		}
@@ -407,7 +418,7 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		defer cancel()
 		var status workspaceCredentialStatus
 		err = api.RemoteCall(ctx, host, "credentials_claim", workspaceCredentialRequest{
-			Workspace: workspace.ID, Bundle: *bundleName,
+			Workspace: workspace.ID, Bundle: *bundleName, OwnerAttachmentID: *attachmentID,
 		}, &status)
 		if err != nil {
 			return 1, err
@@ -419,6 +430,7 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 	case "activate-local":
 		fs := newFlagSet("workspace credentials activate-local", stderr)
 		bundleName := fs.String("bundle", "", "local credential bundle to activate")
+		attachmentID := fs.String("attachment", "", "active controlling attachment id")
 		ifUnclaimed := fs.Bool("if-unclaimed", false, "leave an existing workspace credential binding unchanged")
 		if err := parseInterspersed(fs, args[1:]); err != nil {
 			return 2, err
@@ -445,12 +457,20 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		if workspace.RemoteHost != "" {
 			return 1, fmt.Errorf("activate-local must run on workspace origin %s", workspace.Origin.Name)
 		}
+		node, err := api.Node(context.Background())
+		if err != nil {
+			return 1, err
+		}
+		*attachmentID, err = credentialOwnerAttachment(workspace, node.ID, *attachmentID)
+		if err != nil {
+			return 1, err
+		}
 		if !*ifUnclaimed || workspace.CredentialClaim == nil {
 			refreshCredentialSessionForCLI(api, *bundleName, "activate-local", workspace.ID, stderr)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		status, err := api.ActivateLocalCredentials(ctx, workspace.ID, *bundleName, *ifUnclaimed)
+		status, err := api.ActivateLocalCredentials(ctx, workspace.ID, *bundleName, *attachmentID, *ifUnclaimed)
 		if err != nil {
 			return 1, err
 		}
@@ -686,18 +706,6 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 		}
 		return 1, err
 	}
-	if err := bindCreatedWorkspaceCredentials(ctx, api, host, workspace, bundle); err != nil {
-		ref := workspace.ID
-		retry := "zka workspace credentials activate-local"
-		if host != "" {
-			ref = host + ":" + workspace.ID
-			retry = "zka workspace credentials claim"
-		}
-		if bundle != "" {
-			retry += " --bundle " + bundle
-		}
-		return 1, fmt.Errorf("workspace %s created but credentials were not bound; retry with: %s %s: %w", workspace.Name, retry, ref, err)
-	}
 	if !*attach {
 		fmt.Fprintf(stdout, "%s\t%s\n", workspace.ID, workspace.Name)
 		return 0, nil
@@ -707,6 +715,9 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 		ref = host + ":" + workspace.ID
 	}
 	attachArgs := []string{ref}
+	if bundle != "" {
+		attachArgs = append([]string{"--claim-credentials", "--credential-bundle", bundle}, attachArgs...)
+	}
 	code, err := runWorkspaceAttach(attachArgs, paths, false, stdout, stderr)
 	if err != nil {
 		retry := "zka workspace attach " + ref
@@ -737,23 +748,10 @@ func creationCredentialBundle(cfg Config, explicit string, noCredentials, compat
 	return bundle, nil
 }
 
-func bindCreatedWorkspaceCredentials(ctx context.Context, api API, host string, workspace *Workspace, bundle string) error {
-	if workspace == nil || bundle == "" {
-		return nil
-	}
-	if host == "" {
-		_, err := api.ActivateLocalCredentials(ctx, workspace.ID, bundle, true)
-		return err
-	}
-	var status workspaceCredentialStatus
-	return api.RemoteCall(ctx, host, "credentials_claim", workspaceCredentialRequest{
-		Workspace: workspace.ID, Bundle: bundle, IfUnclaimed: true,
-	}, &status)
-}
-
 func runWorkspaceReconcile(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
 	fs := newFlagSet("workspace reconcile", stderr)
 	attachmentID := fs.String("attachment", "", "local attachment id")
+	recreateBackends := fs.Bool("recreate-backends", false, "stop and recreate route-unsafe managed backends")
 	if err := parseInterspersed(fs, args); err != nil {
 		return 2, err
 	}
@@ -770,6 +768,20 @@ func runWorkspaceReconcile(args []string, paths Paths, stdout, stderr io.Writer)
 	cfg, err := LoadConfig()
 	if err != nil {
 		return 1, err
+	}
+	if *recreateBackends {
+		if workspace.RemoteHost != "" {
+			var recreated Workspace
+			err = api.RemoteCall(ctx, workspace.RemoteHost, "recreate_credential_backends", refRequest{Ref: workspace.ID}, &recreated)
+			workspace = &recreated
+		} else {
+			workspace, err = api.RecreateCredentialBackends(ctx, workspace.ID)
+		}
+		if err != nil {
+			return 1, err
+		}
+		fmt.Fprintf(stdout, "%s\tcredential backends recreated\n", workspace.ID)
+		return 0, nil
 	}
 	if cfg.Headless && *attachmentID == "" && workspace.RemoteHost == "" {
 		// No Kitty can ever run here, so there is no view to recapture — but
@@ -867,11 +879,17 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	defer cancel()
 	api := NewAPI(paths)
 	host, ref := splitWorkspaceRef(fs.Arg(0))
-	if *claimCredentials && host == "" {
-		return 2, fmt.Errorf("--claim-credentials requires a remote workspace")
-	}
 	if *credentialBundle != "" && !*claimCredentials {
 		return 2, fmt.Errorf("--credential-bundle requires --claim-credentials")
+	}
+	if *claimCredentials && *credentialBundle == "" {
+		cfg, err := LoadConfig()
+		if err != nil {
+			return 1, err
+		}
+		if cfg.Credentials.DefaultBundle == "" {
+			return 2, fmt.Errorf("--claim-credentials requires --credential-bundle because credentials.default_bundle is not set")
+		}
 	}
 	var workspace *Workspace
 	var err error
@@ -1052,6 +1070,14 @@ func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspac
 	if bundleName == "" {
 		bundleName = cfg.Credentials.DefaultBundle
 	}
+	node, err := api.Node(context.Background())
+	if err != nil {
+		return err
+	}
+	ownerAttachment, err := credentialOwnerAttachment(workspace, node.ID, "")
+	if err != nil {
+		return err
+	}
 	if bundleName == "" {
 		return fmt.Errorf("workspace %s attached but no credential bundle was selected", workspace.Name)
 	}
@@ -1059,12 +1085,46 @@ func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspac
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var status workspaceCredentialStatus
+	if host == "" {
+		_, err := api.ActivateLocalCredentials(ctx, workspace.ID, bundleName, ownerAttachment, false)
+		if err != nil {
+			return fmt.Errorf("workspace %s attached but credential bundle %s was not claimed: %w", workspace.Name, bundleName, err)
+		}
+		return nil
+	}
 	if err := api.RemoteCall(ctx, host, "credentials_claim", workspaceCredentialRequest{
-		Workspace: workspace.ID, Bundle: bundleName,
+		Workspace: workspace.ID, Bundle: bundleName, OwnerAttachmentID: ownerAttachment,
 	}, &status); err != nil {
 		return fmt.Errorf("workspace %s attached but credential bundle %s was not claimed: %w", workspace.Name, bundleName, err)
 	}
 	return nil
+}
+
+func credentialOwnerAttachment(workspace *Workspace, nodeID, explicit string) (string, error) {
+	if workspace == nil {
+		return "", fmt.Errorf("workspace is unavailable")
+	}
+	if explicit != "" {
+		attachment := workspace.Attachments[explicit]
+		if attachment == nil || attachment.Node.ID != nodeID || attachment.Status != AttachmentReady || attachment.Revoked {
+			return "", fmt.Errorf("attachment %s is not an active attachment owned by this node", explicit)
+		}
+		return explicit, nil
+	}
+	var candidates []string
+	for id, attachment := range workspace.Attachments {
+		if attachment != nil && attachment.Node.ID == nodeID && attachment.Status == AttachmentReady && !attachment.Revoked {
+			candidates = append(candidates, id)
+		}
+	}
+	sort.Strings(candidates)
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("credential claim requires an active attachment owned by this node")
+	}
+	if len(candidates) > 1 {
+		return "", fmt.Errorf("multiple active attachments are owned by this node; pass --attachment with one of: %s", strings.Join(candidates, ","))
+	}
+	return candidates[0], nil
 }
 
 func refreshCredentialSessionForCLI(api API, bundle, action, workspace string, stderr io.Writer) {
@@ -1878,10 +1938,14 @@ func managedPaneCommandEnvironment(cfg Config, paths Paths, workspaceID, paneID 
 	if creating && cfg.credentialsEnabled() {
 		environment = removeEnvironmentValue(environment, "SSH_AUTH_SOCK")
 		environment = removeEnvironmentValue(environment, "GNUPGHOME")
-		sshEnabled, openPGPEnabled := false, false
+		for _, name := range []string{"PIVB_ATTACHMENT_MODE", "PIVB_ROUTE_SOCKET", "PIVB_ATTACHMENT_PROTOCOL"} {
+			environment = removeEnvironmentValue(environment, name)
+		}
+		sshEnabled, openPGPEnabled, pivbEnabled := false, false, false
 		for _, bundle := range cfg.Credentials.Bundles {
 			sshEnabled = sshEnabled || bundle.SSHAgent.Enable
 			openPGPEnabled = openPGPEnabled || bundle.OpenPGP.Enable
+			pivbEnabled = pivbEnabled || bundle.PIVB.Enable
 		}
 		if sshEnabled {
 			environment = replaceEnvironmentValue(environment, "SSH_AUTH_SOCK", agentRelaySocketPath(paths.AgentDir, workspaceID))
@@ -1891,7 +1955,12 @@ func managedPaneCommandEnvironment(cfg Config, paths Paths, workspaceID, paneID 
 				environment = replaceEnvironmentValue(environment, "GNUPGHOME", home)
 			}
 		}
-		environment = replaceEnvironmentValue(environment, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION", strconv.Itoa(credentialEnvironmentVersion))
+		if pivbEnabled {
+			environment = replaceEnvironmentValue(environment, "PIVB_ATTACHMENT_MODE", "route-required")
+			environment = replaceEnvironmentValue(environment, "PIVB_ROUTE_SOCKET", pivbRelaySocketPath(paths, workspaceID))
+			environment = replaceEnvironmentValue(environment, "PIVB_ATTACHMENT_PROTOCOL", strconv.Itoa(managedPIVBAttachmentProtocol(cfg)))
+		}
+		environment = replaceEnvironmentValue(environment, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION", strconv.Itoa(credentialEnvironmentVersionForConfig(cfg)))
 	}
 	return environment
 }
@@ -1977,6 +2046,14 @@ func runPane(args []string, paths Paths, stdin io.Reader, stdout, stderr io.Writ
 	})
 	if err != nil {
 		return 1, err
+	}
+	if prepared.Create {
+		capabilityCtx, capabilityCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err = ensurePaneVisiblePIVBCapability(capabilityCtx, cfg)
+		capabilityCancel()
+		if err != nil {
+			return 1, err
+		}
 	}
 	identityCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	identityErr := kitty.SetIdentity(identityCtx, endpoint, windowID, prepared.Workspace.ID, prepared.Pane.ID)
@@ -2234,7 +2311,7 @@ func runPaneHost(args []string, paths Paths, stdin io.Reader, stdout, stderr io.
 	}
 	api := NewAPI(paths)
 	credentialVersion, _ := strconv.Atoi(os.Getenv("ZKA_CREDENTIAL_ENVIRONMENT_VERSION"))
-	workspace, err := api.Event(context.Background(), Event{
+	workspace, err := api.PaneProcessEvent(context.Background(), Event{
 		WorkspaceID: *workspaceID, PaneID: *paneID, Kind: "process_started", Source: "pane-host",
 		PID: os.Getpid(), CredentialEnvironmentVersion: credentialVersion,
 	})
@@ -2250,7 +2327,7 @@ func runPaneHost(args []string, paths Paths, stdin io.Reader, stdout, stderr io.
 	cmd.Env = append(os.Environ(), "ZKA_WORKSPACE_ID="+*workspaceID, "ZKA_PANE_ID="+*paneID)
 	err = cmd.Run()
 	exitCode := processExitCode(err)
-	_, eventErr := api.Event(context.Background(), Event{WorkspaceID: *workspaceID, PaneID: *paneID, Kind: "process_exit", Source: "pane-host", ExitCode: &exitCode, Detail: fmt.Sprintf("exit code %d", exitCode)})
+	_, eventErr := api.PaneProcessEvent(context.Background(), Event{WorkspaceID: *workspaceID, PaneID: *paneID, Kind: "process_exit", Source: "pane-host", ExitCode: &exitCode, Detail: fmt.Sprintf("exit code %d", exitCode)})
 	if eventErr != nil {
 		fmt.Fprintf(stderr, "zka: report process exit: %v\n", eventErr)
 	}
@@ -2281,6 +2358,14 @@ func runRemoteAttach(args []string, paths Paths, stdin io.Reader, stdout, stderr
 	cfg, err := LoadConfig()
 	if err != nil {
 		return 1, err
+	}
+	if prepared.Create {
+		capabilityCtx, capabilityCancel := context.WithTimeout(ctx, 5*time.Second)
+		err = ensurePaneVisiblePIVBCapability(capabilityCtx, cfg)
+		capabilityCancel()
+		if err != nil {
+			return 1, err
+		}
 	}
 	if !prepared.Create {
 		if pane.BackendDead {

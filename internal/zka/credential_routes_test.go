@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -17,6 +18,7 @@ func TestPreparePaneDoesNotReserveBackendWhenStableCredentialRouteIsUnavailable(
 	}
 	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": sshCredentialBundle()}
 	workspace := createTestWorkspace(t, d, 1)
+	readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
 	pane := firstPane(workspace)
 	blocker, err := listenUnix(agentRelaySocketPath(d.paths.AgentDir, workspace.ID))
 	if err != nil {
@@ -42,6 +44,29 @@ func TestPreparePaneDoesNotReserveBackendWhenStableCredentialRouteIsUnavailable(
 	}
 }
 
+func TestPreparePaneBlocksRouteUnsafePIVBBackend(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := CredentialBundleConfig{}
+	bundle.PIVB.Enable = true
+	bundle.PIVB.Aliases = []string{"ro"}
+	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": bundle}
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	d.mu.Lock()
+	stored := d.state.Workspaces[workspace.ID].Panes[pane.ID]
+	stored.BackendCreated = true
+	stored.CredentialEnvironmentVersion = legacyCredentialEnvironmentVersion
+	d.mu.Unlock()
+
+	_, err = d.preparePane(workspacePaneRequest{Workspace: workspace.ID, Pane: pane.ID})
+	if err == nil || !strings.Contains(err.Error(), "--recreate-backends "+workspace.ID) {
+		t.Fatalf("route-unsafe attach error = %v", err)
+	}
+}
+
 func TestStableSSHRouteSwitchesAcrossLocalAndRemoteProviders(t *testing.T) {
 	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
@@ -51,6 +76,7 @@ func TestStableSSHRouteSwitchesAcrossLocalAndRemoteProviders(t *testing.T) {
 	bundle.SSHAgent.Enable = true
 	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": bundle}
 	workspace := createTestWorkspace(t, d, 1)
+	localOwner := readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
 
 	localAgentPath := filepath.Join(d.paths.RuntimeDir, "local-agent.sock")
 	localAgent, err := listenUnix(localAgentPath)
@@ -59,7 +85,7 @@ func TestStableSSHRouteSwitchesAcrossLocalAndRemoteProviders(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = localAgent.Close() })
 	go serveCredentialTestByte(localAgent, 'L')
-	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, localAgentPath); err != nil {
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, localAgentPath, localOwner.ID); err != nil {
 		t.Fatal(err)
 	}
 	routePath := agentRelaySocketPath(d.paths.AgentDir, workspace.ID)
@@ -78,6 +104,7 @@ func TestStableSSHRouteSwitchesAcrossLocalAndRemoteProviders(t *testing.T) {
 	}
 
 	provider := Host{ID: "provider", Name: "laptop"}
+	providerAttachment := readyCredentialAttachment(t, d, workspace, "provider-owner", provider.ID)
 	brokerPath := filepath.Join(d.paths.RuntimeDir, "provider-broker.sock")
 	broker, err := listenUnix(brokerPath)
 	if err != nil {
@@ -110,7 +137,8 @@ func TestStableSSHRouteSwitchesAcrossLocalAndRemoteProviders(t *testing.T) {
 	}
 	status, err := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
 		Workspace: workspace.ID, Bundle: "work", Provider: provider, ProviderSource: "remote",
-		Manifest: credentialBundleManifest{Bundle: "work", SSH: true},
+		OwnerAttachmentID: providerAttachment.ID,
+		Manifest:          credentialBundleManifest{Bundle: "work", SSH: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -133,6 +161,7 @@ func TestStableSSHRouteSwitchesAcrossLocalAndRemoteProviders(t *testing.T) {
 		t.Fatal("remote route did not reach the provider broker")
 	}
 	secondProvider := Host{ID: "second-provider", Name: "second-laptop"}
+	secondProviderAttachment := readyCredentialAttachment(t, d, workspace, "second-provider-owner", secondProvider.ID)
 	secondBrokerPath := filepath.Join(d.paths.RuntimeDir, "second-provider-broker.sock")
 	secondBroker, err := listenUnix(secondBrokerPath)
 	if err != nil {
@@ -165,7 +194,8 @@ func TestStableSSHRouteSwitchesAcrossLocalAndRemoteProviders(t *testing.T) {
 	}
 	secondStatus, err := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
 		Workspace: workspace.ID, Bundle: "work", Provider: secondProvider, ProviderSource: "remote",
-		Manifest: credentialBundleManifest{Bundle: "work", SSH: true},
+		OwnerAttachmentID: secondProviderAttachment.ID,
+		Manifest:          credentialBundleManifest{Bundle: "work", SSH: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -233,6 +263,7 @@ func TestStableOpenPGPRouteSwitchesBetweenRemoteProviders(t *testing.T) {
 	bundle.OpenPGP.Enable = true
 	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": bundle}
 	workspace := createTestWorkspace(t, d, 1)
+	readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
 	routePath := filepath.Join(d.paths.RuntimeDir, "openpgp-route.sock")
 	d.credentialMu.Lock()
 	d.credentialRoutePaths[workspace.ID] = routePath
@@ -311,6 +342,7 @@ func TestCredentialTransferClosesActiveOldGenerationStream(t *testing.T) {
 	}
 	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": sshCredentialBundle()}
 	workspace := createTestWorkspace(t, d, 1)
+	localOwner := readyCredentialAttachment(t, d, workspace, "local-transfer-owner", d.state.Node.ID)
 	localAgentPath := filepath.Join(d.paths.RuntimeDir, "long-lived-local-agent.sock")
 	localAgent, err := listenUnix(localAgentPath)
 	if err != nil {
@@ -329,7 +361,7 @@ func TestCredentialTransferClosesActiveOldGenerationStream(t *testing.T) {
 			}()
 		}
 	}()
-	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, localAgentPath); err != nil {
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, localAgentPath, localOwner.ID); err != nil {
 		t.Fatal(err)
 	}
 	client, err := net.DialTimeout("unix", agentRelaySocketPath(d.paths.AgentDir, workspace.ID), time.Second)
@@ -356,6 +388,7 @@ func TestCredentialTransferClosesActiveOldGenerationStream(t *testing.T) {
 	}
 
 	provider := Host{ID: "replacement-provider", Name: "replacement"}
+	providerAttachment := readyCredentialAttachment(t, d, workspace, "replacement-owner", provider.ID)
 	brokerPath := filepath.Join(d.paths.RuntimeDir, "replacement-provider.sock")
 	broker, err := listenUnix(brokerPath)
 	if err != nil {
@@ -367,7 +400,8 @@ func TestCredentialTransferClosesActiveOldGenerationStream(t *testing.T) {
 	}
 	if _, err := d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
 		Workspace: workspace.ID, Bundle: "work", Provider: provider, ProviderSource: "remote",
-		Manifest: credentialBundleManifest{Bundle: "work", SSH: true},
+		OwnerAttachmentID: providerAttachment.ID,
+		Manifest:          credentialBundleManifest{Bundle: "work", SSH: true},
 	}); err != nil {
 		t.Fatal(err)
 	}

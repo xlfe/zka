@@ -104,6 +104,7 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 	providerEnvironment, providerEnvironmentIssues := sanitizeProviderEnvironment(paths, os.Environ())
 	providerSSHSocket := environmentValue(providerEnvironment, "SSH_AUTH_SOCK")
 	store := NewStore(paths)
+	store.SetLogger(logger)
 	state, err := store.Load()
 	if err != nil {
 		return nil, err
@@ -255,7 +256,6 @@ func (d *Daemon) Start() error {
 	d.startWorkerLocked(func(ctx context.Context) { d.notificationRetryLoop(ctx) })
 	d.startWorkerLocked(func(ctx context.Context) { d.credentialRouteLoop(ctx) })
 	d.startWorkerLocked(func(ctx context.Context) { d.credentialProviderReconnectLoop(ctx) })
-	d.startWorkerLocked(func(ctx context.Context) { d.credentialEnvironmentMigrationLoop(ctx) })
 	d.startWorkerLocked(func(ctx context.Context) { d.cardLeaseLoop(ctx) })
 	d.lifeMu.Unlock()
 	d.resumeLifecycleCleanup()
@@ -423,7 +423,7 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 
 func operationNeedsLocalPeer(op string) bool {
 	switch op {
-	case "credential_session_refresh", "credential_provider_diagnostics", "credentials_activate_local", "remote_call":
+	case "credential_session_refresh", "credential_provider_diagnostics", "credentials_activate_local", "remote_call", "pane_process_event":
 		return true
 	default:
 		return false
@@ -721,7 +721,13 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
-		return d.activateLocalCredentialBundle(ctx, req.Workspace, req.Bundle, req.IfUnclaimed, d.callerSSHSocket(ctx, req.CallerSSHAuthSock))
+		return d.activateLocalCredentialBundle(ctx, req.Workspace, req.Bundle, req.IfUnclaimed, d.callerSSHSocket(ctx, req.CallerSSHAuthSock), req.OwnerAttachmentID)
+	case "recreate_credential_backends":
+		var req refRequest
+		if err := decodePayload(raw, &req); err != nil {
+			return nil, err
+		}
+		return d.recreateCredentialBackends(ctx, req.Ref)
 	case "credential_session_refresh":
 		var req credentialSessionRefreshRequest
 		if err := decodePayload(raw, &req); err != nil {
@@ -801,6 +807,12 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		}
 		return d.detachAttachment(req.Workspace, req.Attachment)
 	case "event":
+		var event Event
+		if err := decodePayload(raw, &event); err != nil {
+			return nil, err
+		}
+		return d.applyEvent(ctx, event)
+	case "pane_process_event":
 		var event Event
 		if err := decodePayload(raw, &event); err != nil {
 			return nil, err
@@ -1508,12 +1520,12 @@ func (d *Daemon) setAttachmentPaneReady(req attachmentPaneReadyRequest) (*Attach
 	return attachment.Clone(), nil
 }
 
-func panesRequiringCredentialEnvironment(workspace *Workspace) []string {
+func panesRequiringCredentialEnvironmentVersion(workspace *Workspace, required int) []string {
 	var ids []string
 	for _, pane := range workspace.Panes {
 		liveLegacyBackend := pane.BackendCreated && !pane.BackendDead
 		incompleteMigration := pane.CredentialMigrationState != ""
-		if !pane.Retiring() && pane.CredentialEnvironmentVersion == 0 && (liveLegacyBackend || incompleteMigration) {
+		if !pane.Retiring() && pane.CredentialEnvironmentVersion != required && (liveLegacyBackend || incompleteMigration) {
 			ids = append(ids, pane.ID)
 		}
 	}
@@ -2075,17 +2087,45 @@ func appendUnique(values []string, value string) []string {
 
 func (d *Daemon) detachAttachment(workspaceRef, attachmentID string) (*Workspace, error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
+	initial, err := d.resolveWorkspaceLocked(workspaceRef)
+	d.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
+	claimLock := d.credentialClaimLock(initial.ID)
+	claimLock.Lock()
+	defer claimLock.Unlock()
+	d.mu.Lock()
+	workspace, err := d.resolveWorkspaceLocked(initial.ID)
+	if err != nil {
+		d.mu.Unlock()
+		return nil, err
+	}
 	if err := requireWorkspaceMutable(workspace); err != nil {
+		d.mu.Unlock()
 		return nil, err
 	}
 	attachment := workspace.Attachments[attachmentID]
 	if attachment == nil {
+		d.mu.Unlock()
 		return nil, fmt.Errorf("unknown attachment %q", attachmentID)
+	}
+	previous := workspace.Clone()
+	previousGeneration := uint64(0)
+	releaseOwner := workspace.CredentialClaim != nil && workspace.CredentialClaim.OwnerAttachmentID == attachmentID
+	if releaseOwner {
+		previousGeneration = workspace.CredentialClaim.Generation
+		base := workspace.CredentialGeneration
+		if previousGeneration > base {
+			base = previousGeneration
+		}
+		if base == ^uint64(0) {
+			d.mu.Unlock()
+			return nil, fmt.Errorf("credential generation exhausted for workspace %s", workspace.ID)
+		}
+		workspace.CredentialGeneration = base + 1
+		workspace.CredentialClaim = nil
+		workspace.PIVBProvider = nil
 	}
 	attachment.Status = AttachmentDetached
 	attachment.Views = map[string]RuntimeView{}
@@ -2099,9 +2139,17 @@ func (d *Daemon) detachAttachment(workspaceRef, attachmentID string) (*Workspace
 	}
 	workspace.PendingRevocations = removeString(workspace.PendingRevocations, attachmentID)
 	if err := d.store.Save(d.state); err != nil {
+		d.state.Workspaces[workspace.ID] = previous
+		d.mu.Unlock()
 		return nil, err
 	}
-	return workspace.Clone(), nil
+	result := workspace.Clone()
+	workspaceID := workspace.ID
+	d.mu.Unlock()
+	if releaseOwner {
+		d.revokeCredentialRoutes(workspaceID, previousGeneration)
+	}
+	return result, nil
 }
 
 func removeString(values []string, value string) []string {
@@ -2159,7 +2207,7 @@ func (d *Daemon) applyEvent(_ context.Context, event Event) (*Workspace, error) 
 		pane.Process = ProcessStatus{Running: true, PID: event.PID, Started: now}
 		pane.BackendCreated, pane.BackendReady, pane.BackendStart = true, true, false
 		pane.CredentialEnvironmentVersion = event.CredentialEnvironmentVersion
-		if event.CredentialEnvironmentVersion == credentialEnvironmentVersion {
+		if event.CredentialEnvironmentVersion == credentialEnvironmentVersionForConfig(d.config) {
 			pane.CredentialMigrationState, pane.CredentialMigrationError = "", ""
 		}
 		pane.BackendDead, pane.BackendError = false, ""

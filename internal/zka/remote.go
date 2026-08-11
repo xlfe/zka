@@ -223,7 +223,7 @@ func (m *RemoteManager) cacheResult(host, op string, result json.RawMessage) err
 			return fmt.Errorf("decode remote workspace list from %s: %w", host, err)
 		}
 		return m.daemon.cacheRemoteSnapshot(host, workspaces)
-	case "get", "update_attachment", "update_manifest", "detach_attachment", "seen", "rename_workspace", "close_panes", "create_workspace":
+	case "get", "update_attachment", "update_manifest", "detach_attachment", "recreate_credential_backends", "seen", "rename_workspace", "close_panes", "create_workspace":
 		var workspace Workspace
 		if err := json.Unmarshal(result, &workspace); err != nil {
 			return fmt.Errorf("decode remote workspace response from %s: %w", host, err)
@@ -1212,6 +1212,19 @@ func dispatchRemoteControl(ctx context.Context, api API, op string, raw json.Raw
 			return nil, err
 		}
 		workspace, err := api.DetachAttachment(ctx, req.Workspace, req.Attachment)
+		value = workspace
+		if err != nil {
+			return nil, err
+		}
+	case "recreate_credential_backends":
+		var req refRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		if err := requireAuthoritative(ctx, api, req.Ref); err != nil {
+			return nil, err
+		}
+		workspace, err := api.RecreateCredentialBackends(ctx, req.Ref)
 		value = workspace
 		if err != nil {
 			return nil, err

@@ -11,7 +11,6 @@ const (
 	credentialMigrationPending  = "pending"
 	credentialMigrationStarting = "starting"
 	credentialMigrationFailed   = "failed"
-	credentialMigrationRetry    = 5 * time.Second
 )
 
 type credentialMigrationCandidate struct {
@@ -20,23 +19,9 @@ type credentialMigrationCandidate struct {
 	pane        *Pane
 }
 
-// credentialEnvironmentMigrationLoop is deliberately conservative: it never
-// stops a version-0 backend until a provider binding, stable daemon listeners,
-// and a zmx version supporting detached run have all been verified. The
-// durable pane state makes a daemon crash between kill and restart retryable.
-func (d *Daemon) credentialEnvironmentMigrationLoop(ctx context.Context) {
-	ticker := time.NewTicker(credentialMigrationRetry)
-	defer ticker.Stop()
-	for {
-		d.migrateCredentialEnvironments(ctx)
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
+// migrateCredentialEnvironments performs the guarded recreation work. It is
+// invoked only by the explicit recreate API (and focused tests), never by a
+// background reconciliation loop.
 func (d *Daemon) migrateCredentialEnvironments(ctx context.Context) {
 	if !d.config.credentialsEnabled() {
 		return
@@ -88,17 +73,64 @@ func (d *Daemon) migrateCredentialEnvironments(ctx context.Context) {
 	}
 }
 
+func (d *Daemon) recreateCredentialBackends(ctx context.Context, workspaceRef string) (*Workspace, error) {
+	d.credentialMigrationMu.Lock()
+	defer d.credentialMigrationMu.Unlock()
+	d.mu.Lock()
+	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
+	if err != nil {
+		d.mu.Unlock()
+		return nil, err
+	}
+	if workspace.RemoteHost != "" {
+		d.mu.Unlock()
+		return nil, fmt.Errorf("workspace %q is not authoritative on this host", workspace.Name)
+	}
+	workspaceID := workspace.ID
+	d.mu.Unlock()
+	if err := d.ensureCredentialMigrationBinding(ctx, workspaceID); err != nil {
+		return nil, err
+	}
+	if err := ensureManagedPIVBLaunchCapabilities(ctx, d.config, d.runner); err != nil {
+		return nil, err
+	}
+	if err := d.checkDetachedZMXRun(ctx); err != nil {
+		return nil, err
+	}
+	d.reconcileCredentialRoutes(ctx)
+	for _, candidate := range d.credentialMigrationCandidates() {
+		if candidate.workspaceID != workspaceID {
+			continue
+		}
+		if err := d.validateCredentialMigrationRoutes(workspaceID); err != nil {
+			return nil, err
+		}
+		backendStopped, err := d.migrateCredentialPane(ctx, candidate)
+		if err != nil {
+			d.recordPaneCredentialMigrationError(candidate.workspaceID, candidate.pane.ID, err, backendStopped)
+			return nil, err
+		}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	workspace = d.state.Workspaces[workspaceID]
+	if workspace == nil {
+		return nil, fmt.Errorf("workspace disappeared during backend recreation")
+	}
+	return workspace.Clone(), nil
+}
+
 func (d *Daemon) validateCredentialMigrationRoutes(workspaceID string) error {
 	d.mu.Lock()
 	workspace := d.state.Workspaces[workspaceID]
 	if workspace == nil || workspace.CredentialClaim == nil || workspace.CredentialClaim.State != "ready" {
 		d.mu.Unlock()
-		return fmt.Errorf("automatic migration is waiting for a ready credential binding")
+		return fmt.Errorf("backend recreation requires a ready credential binding")
 	}
 	capabilities := cloneCredentialCapabilities(workspace.CredentialClaim.Capabilities)
 	d.mu.Unlock()
 	if err := d.validateCredentialRoutes(workspaceID, capabilities); err != nil {
-		return fmt.Errorf("automatic migration is waiting for stable credential routes: %w", err)
+		return fmt.Errorf("backend recreation is waiting for stable credential routes: %w", err)
 	}
 	return nil
 }
@@ -108,7 +140,7 @@ func (d *Daemon) workspacesRequiringCredentialMigration() []string {
 	defer d.mu.Unlock()
 	var ids []string
 	for _, workspace := range d.state.Workspaces {
-		if workspace.RemoteHost == "" && !workspace.DeletionPending && len(panesRequiringCredentialEnvironment(workspace)) != 0 {
+		if workspace.RemoteHost == "" && !workspace.DeletionPending && len(panesRequiringCredentialEnvironmentVersion(workspace, credentialEnvironmentVersionForConfig(d.config))) != 0 {
 			ids = append(ids, workspace.ID)
 		}
 	}
@@ -125,11 +157,12 @@ func (d *Daemon) ensureCredentialMigrationBinding(ctx context.Context, workspace
 	if workspace.CredentialClaim != nil {
 		claimSource := workspace.CredentialClaim.ProviderSource
 		claimBundle := workspace.CredentialClaim.Bundle
+		ownerAttachment := workspace.CredentialClaim.OwnerAttachmentID
 		d.mu.Unlock()
 		if claimSource == "local" {
 			migrationCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
-			if _, err := d.activateLocalCredentialBundle(migrationCtx, workspaceID, claimBundle, false, ""); err != nil {
+			if _, err := d.activateLocalCredentialBundle(migrationCtx, workspaceID, claimBundle, false, "", ownerAttachment); err != nil {
 				return fmt.Errorf("refresh local credential binding before migration: %w", err)
 			}
 		}
@@ -143,25 +176,15 @@ func (d *Daemon) ensureCredentialMigrationBinding(ctx context.Context, workspace
 			}
 		}
 		if status == nil {
-			return fmt.Errorf("automatic migration workspace disappeared")
+			return fmt.Errorf("backend recreation workspace disappeared")
 		}
 		if status.State != "ready" {
-			return fmt.Errorf("automatic migration is waiting for credential binding generation %d to become ready", status.Generation)
+			return fmt.Errorf("backend recreation is waiting for credential binding generation %d to become ready", status.Generation)
 		}
 		return nil
 	}
-	bundle := d.config.Credentials.DefaultBundle
 	d.mu.Unlock()
-	if bundle == "" {
-		return fmt.Errorf("automatic migration is waiting for credentials.default_bundle or an explicit credential claim")
-	}
-	migrationCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	_, err := d.activateLocalCredentialBundle(migrationCtx, workspaceID, bundle, true, "")
-	if err != nil {
-		return fmt.Errorf("prepare local default credential bundle %q before migration: %w", bundle, err)
-	}
-	return nil
+	return fmt.Errorf("managed backend recreation requires an explicit attachment-backed credential claim")
 }
 
 func (d *Daemon) credentialMigrationCandidates() []credentialMigrationCandidate {
@@ -173,7 +196,7 @@ func (d *Daemon) credentialMigrationCandidates() []credentialMigrationCandidate 
 			continue
 		}
 		for _, pane := range workspace.Panes {
-			if pane.BackendDead || pane.Retiring() || pane.CredentialEnvironmentVersion != 0 {
+			if pane.BackendDead || pane.Retiring() || pane.CredentialEnvironmentVersion == credentialEnvironmentVersionForConfig(d.config) {
 				continue
 			}
 			if !pane.BackendCreated && pane.CredentialMigrationState != credentialMigrationStarting && pane.CredentialMigrationState != credentialMigrationPending {
@@ -223,15 +246,15 @@ func (d *Daemon) migrateCredentialPane(ctx context.Context, candidate credential
 			if detail == "" {
 				detail = killErr.Error()
 			}
-			return false, fmt.Errorf("stop version-0 zmx backend %s: %s", candidate.pane.Backend.Ref, detail)
+			return false, fmt.Errorf("stop route-unsafe zmx backend %s: %s", candidate.pane.Backend.Ref, detail)
 		}
 		backendStopped = true
 		active, err = listZMXSessions(ctx, d.runner, d.config.ZMX.Command)
 		if err != nil {
-			return backendStopped, fmt.Errorf("confirm version-0 zmx backend stopped: %w", err)
+			return backendStopped, fmt.Errorf("confirm route-unsafe zmx backend stopped: %w", err)
 		}
 		if active[candidate.pane.Backend.Ref] {
-			return false, fmt.Errorf("version-0 zmx backend %s is still running", candidate.pane.Backend.Ref)
+			return false, fmt.Errorf("route-unsafe zmx backend %s is still running", candidate.pane.Backend.Ref)
 		}
 	}
 
@@ -298,7 +321,7 @@ func (d *Daemon) recordWorkspaceCredentialMigrationError(workspaceID string, err
 	workspace := d.state.Workspaces[workspaceID]
 	var panes []string
 	if workspace != nil {
-		panes = panesRequiringCredentialEnvironment(workspace)
+		panes = panesRequiringCredentialEnvironmentVersion(workspace, credentialEnvironmentVersionForConfig(d.config))
 	}
 	d.mu.Unlock()
 	for _, paneID := range panes {

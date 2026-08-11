@@ -138,6 +138,7 @@ func (d *Daemon) preparePaneCredentialRoutes(ctx context.Context, workspaceRef, 
 	workspaceID := workspace.ID
 	authoritative := workspace.RemoteHost == ""
 	needsBackend := true
+	unsafePaneID, unsafePaneVersion := "", 0
 	if paneRef != "" {
 		pane, paneErr := resolvePaneLocked(workspace, paneRef)
 		if paneErr != nil {
@@ -145,12 +146,20 @@ func (d *Daemon) preparePaneCredentialRoutes(ctx context.Context, workspaceRef, 
 			return paneErr
 		}
 		needsBackend = !pane.BackendCreated && !pane.BackendStart
+		if configHasPIVBBundle(d.config) && pane.BackendCreated && !pane.BackendDead &&
+			pane.CredentialEnvironmentVersion != credentialEnvironmentVersionForConfig(d.config) {
+			unsafePaneID, unsafePaneVersion = pane.ID, pane.CredentialEnvironmentVersion
+		}
 	}
 	d.mu.Unlock()
+	if authoritative && unsafePaneID != "" {
+		return fmt.Errorf("pane %s uses route-unsafe credential environment v%d; run `zka workspace reconcile --recreate-backends %s` before attaching", unsafePaneID, unsafePaneVersion, workspaceID)
+	}
 	if !authoritative || !needsBackend {
 		return nil
 	}
 	capabilities := map[string]CredentialCapabilityStatus{}
+	pivbEnabled := false
 	for _, bundle := range d.config.Credentials.Bundles {
 		if bundle.SSHAgent.Enable {
 			capabilities[credentialCapabilitySSH] = CredentialCapabilityStatus{State: "ready", Available: true}
@@ -158,9 +167,21 @@ func (d *Daemon) preparePaneCredentialRoutes(ctx context.Context, workspaceRef, 
 		if bundle.OpenPGP.Enable {
 			capabilities[credentialCapabilityOpenPGP] = CredentialCapabilityStatus{State: "ready", Available: true}
 		}
+		if bundle.PIVB.Enable {
+			pivbEnabled = true
+			capabilities[credentialCapabilityPIVB] = CredentialCapabilityStatus{State: "ready", Available: true}
+		}
 	}
 	if len(capabilities) == 0 {
 		return nil
+	}
+	// Probe before route publication or backend reservation. The daemon's
+	// configured executable and the pane-visible PATH executable are checked
+	// independently; either one being stale must fail before launch.
+	if pivbEnabled {
+		if err := ensureManagedPIVBLaunchCapabilities(ctx, d.config, d.runner); err != nil {
+			return fmt.Errorf("prepare managed credential environment: %w", err)
+		}
 	}
 	d.reconcileCredentialRoutes(ctx)
 	if err := d.validateCredentialRoutes(workspaceID, capabilities); err != nil {
@@ -243,6 +264,15 @@ func (d *Daemon) serveCredentialRoute(ctx context.Context, listener *credentialR
 		d.writeCredentialRouteUnavailable(client, listener.capability, "workspace credentials are unclaimed")
 		return
 	}
+	if listener.capability == credentialCapabilityPIVB {
+		required := credentialEnvironmentVersionForConfig(d.config)
+		if unsafe := panesRequiringCredentialEnvironmentVersion(workspace, required); len(unsafe) != 0 {
+			d.mu.Unlock()
+			_ = writePIVBProxyError(client, http.StatusServiceUnavailable, "PIVB_UNAVAILABLE",
+				fmt.Sprintf("workspace has route-unsafe pane backends %s; run `zka workspace reconcile --recreate-backends %s`", strings.Join(unsafe, ","), workspace.ID))
+			return
+		}
+	}
 	claim := *workspace.CredentialClaim
 	claim.Capabilities = cloneCredentialCapabilities(workspace.CredentialClaim.Capabilities)
 	claim.PIVB = clonePIVBManifest(workspace.CredentialClaim.PIVB)
@@ -319,7 +349,7 @@ func (d *Daemon) serveLocalCredentialRoute(ctx context.Context, client net.Conn,
 		_ = d.filterOpenPGPStream(ctx, "", hello, manifest, client)
 	case credentialCapabilityPIVB:
 		if claim.PIVB != nil {
-			_ = d.proxyPIVBMint(ctx, client, hello.Workspace, hello.Bundle, hello.Generation, "", claim.OwnerNodeID, claim.PIVB)
+			_ = d.proxyPIVBMint(ctx, client, hello.Workspace, hello.Bundle, hello.Generation, claim.OwnerAttachmentID, claim.OwnerNodeID, claim.PIVB)
 		}
 	}
 }
@@ -348,22 +378,28 @@ func (d *Daemon) serveRemoteCredentialRoute(ctx context.Context, client net.Conn
 		go func() { _, _ = io.Copy(stream, client) }()
 		ctx := pivbForwardContext{
 			OriginNodeID: originNodeID, WorkspaceID: hello.Workspace, Bundle: hello.Bundle,
-			ClaimGeneration: hello.Generation, ProviderNodeID: claim.OwnerNodeID,
+			ClaimGeneration: hello.Generation, ProviderNodeID: claim.OwnerNodeID, ProviderAttachID: claim.OwnerAttachmentID,
 		}
-		proxyRemotePIVBResponse(stream, client, claim.PIVB.Card, ctx)
+		if bound, succeeded := proxyRemotePIVBResponse(stream, client, claim.PIVB.Card, ctx); succeeded {
+			d.logger.Printf("PIVB route mint succeeded attachment_mode=route-required protocol=%d route=remote workspace=%s bundle=%s generation=%d provider_node=%s provider_attachment=%s operation=%s",
+				managedPIVBAttachmentProtocol(d.config), hello.Workspace, hello.Bundle, hello.Generation, claim.OwnerNodeID, claim.OwnerAttachmentID, bound.OperationID)
+		}
 		return
 	}
 	proxyCredentialConnections(ctx, client, stream)
 }
 
-func proxyRemotePIVBResponse(stream net.Conn, client net.Conn, expected CredentialPIVBCard, trusted pivbForwardContext) {
-	if err := proxyBoundPIVBResponse(stream, client, expected, trusted); err != nil {
+func proxyRemotePIVBResponse(stream net.Conn, client net.Conn, expected CredentialPIVBCard, trusted pivbForwardContext) (pivbForwardContext, bool) {
+	bound, succeeded, err := proxyBoundPIVBResponse(stream, client, expected, trusted)
+	if err != nil {
 		status, code, message := http.StatusServiceUnavailable, "PIVB_UNAVAILABLE", "remote PIVB route is unavailable: "
 		if errors.Is(err, errPIVBRemoteResponseBinding) {
 			status, code, message = http.StatusForbidden, "PIVB_CONFIG", "remote PIVB response rejected by origin: "
 		}
 		_ = writePIVBProxyError(client, status, code, message+err.Error())
+		return trusted, false
 	}
+	return bound, succeeded
 }
 
 func (d *Daemon) writeCredentialRouteUnavailable(conn net.Conn, capability, detail string) {

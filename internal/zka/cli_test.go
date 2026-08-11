@@ -38,7 +38,7 @@ func TestLocalAndRemotePaneBackendCommandsUseStableCredentialEnvironment(t *test
 	if got, want := testEnvironmentValue(local.Env, "GNUPGHOME"), filepath.Join(paths.StateDir, "credentials", "workspace", "gnupg"); got != want {
 		t.Fatalf("local GNUPGHOME = %q, want %q", got, want)
 	}
-	if got := testEnvironmentValue(local.Env, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "4" {
+	if got := testEnvironmentValue(local.Env, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "5" {
 		t.Fatalf("local credential environment version = %q", got)
 	}
 
@@ -49,7 +49,7 @@ func TestLocalAndRemotePaneBackendCommandsUseStableCredentialEnvironment(t *test
 	if got, want := testEnvironmentValue(remote.Env, "GNUPGHOME"), filepath.Join(paths.StateDir, "credentials", "workspace", "gnupg"); got != want {
 		t.Fatalf("remote GNUPGHOME = %q, want %q", got, want)
 	}
-	if got := testEnvironmentValue(remote.Env, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "4" {
+	if got := testEnvironmentValue(remote.Env, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "5" {
 		t.Fatalf("remote credential environment version = %q", got)
 	}
 
@@ -94,14 +94,24 @@ func TestManagedPaneEnvironmentRemovesUnconfiguredAmbientCredentials(t *testing.
 	var bundle CredentialBundleConfig
 	bundle.PIVB.Enable = true
 	cfg.Credentials.Bundles = map[string]CredentialBundleConfig{"pivb": bundle}
-	environment := managedPaneCommandEnvironment(cfg, testPaths(testRoot(t)), "workspace", "pane", true)
+	paths := testPaths(testRoot(t))
+	environment := managedPaneCommandEnvironment(cfg, paths, "workspace", "pane", true)
 	for _, name := range []string{"SSH_AUTH_SOCK", "GNUPGHOME"} {
 		if testEnvironmentContains(environment, name) {
 			t.Fatalf("managed environment leaked ambient %s: %#v", name, environment)
 		}
 	}
-	if got := testEnvironmentValue(environment, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "4" {
+	if got := testEnvironmentValue(environment, "ZKA_CREDENTIAL_ENVIRONMENT_VERSION"); got != "5" {
 		t.Fatalf("managed credential environment version = %q", got)
+	}
+	if got := testEnvironmentValue(environment, "PIVB_ATTACHMENT_MODE"); got != "route-required" {
+		t.Fatalf("PIVB_ATTACHMENT_MODE = %q", got)
+	}
+	if got := testEnvironmentValue(environment, "PIVB_ATTACHMENT_PROTOCOL"); got != "1" {
+		t.Fatalf("PIVB_ATTACHMENT_PROTOCOL = %q", got)
+	}
+	if got := testEnvironmentValue(environment, "PIVB_ROUTE_SOCKET"); got != pivbRelaySocketPath(paths, "workspace") {
+		t.Fatalf("PIVB_ROUTE_SOCKET = %q", got)
 	}
 }
 
@@ -187,7 +197,7 @@ func TestWorkspaceCreateDispatchAndUsage(t *testing.T) {
 		t.Fatalf("local create claim: code=%d err=%v", code, err)
 	}
 	code, err = runWorkspace([]string{"attach", "api", "--claim-credentials"}, Paths{}, &stdout, &stderr)
-	if code != 2 || err == nil || !strings.Contains(err.Error(), "--claim-credentials requires a remote workspace") {
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "credentials.default_bundle is not set") {
 		t.Fatalf("local attach claim: code=%d err=%v", code, err)
 	}
 	stdout.Reset()
