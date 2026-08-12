@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const Version = "0.9.2"
+const Version = "0.9.3"
 
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
