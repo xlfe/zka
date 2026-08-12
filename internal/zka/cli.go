@@ -971,7 +971,7 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 			return 1, err
 		}
 		if *claimCredentials {
-			if err := claimAttachedWorkspaceCredentials(api, host, workspace, *credentialBundle, stderr); err != nil {
+			if err := claimAttachedWorkspaceCredentials(api, host, workspace, existing.ID, *credentialBundle, stderr); err != nil {
 				return 1, err
 			}
 		}
@@ -1054,7 +1054,7 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 		return 1, err
 	}
 	if *claimCredentials {
-		if err := claimAttachedWorkspaceCredentials(api, host, workspace, *credentialBundle, stderr); err != nil {
+		if err := claimAttachedWorkspaceCredentials(api, host, workspace, attachmentID, *credentialBundle, stderr); err != nil {
 			return 1, err
 		}
 	}
@@ -1062,7 +1062,13 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	return 0, nil
 }
 
-func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspace, bundleName string, stderr io.Writer) error {
+func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspace, ownerAttachmentID, bundleName string, stderr io.Writer) error {
+	if workspace == nil {
+		return fmt.Errorf("workspace attached but its credential owner could not be verified: workspace is unavailable")
+	}
+	if ownerAttachmentID == "" {
+		return fmt.Errorf("workspace %s attached but its credential owner could not be verified: attachment is unavailable", workspace.Name)
+	}
 	cfg, err := LoadConfig()
 	if err != nil {
 		return err
@@ -1070,13 +1076,26 @@ func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspac
 	if bundleName == "" {
 		bundleName = cfg.Credentials.DefaultBundle
 	}
+	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	var authoritative *Workspace
+	if host == "" {
+		authoritative, err = api.Workspace(resolveCtx, workspace.ID)
+	} else {
+		var remote Workspace
+		err = api.RemoteCall(resolveCtx, host, "get", refRequest{Ref: workspace.ID}, &remote)
+		authoritative = &remote
+	}
+	resolveCancel()
+	if err != nil {
+		return fmt.Errorf("workspace %s attached but its credential owner could not be verified: %w", workspace.Name, err)
+	}
 	node, err := api.Node(context.Background())
 	if err != nil {
 		return err
 	}
-	ownerAttachment, err := credentialOwnerAttachment(workspace, node.ID, "")
+	ownerAttachment, err := credentialOwnerAttachment(authoritative, node.ID, ownerAttachmentID)
 	if err != nil {
-		return err
+		return fmt.Errorf("workspace %s attached but its credential owner could not be verified: %w", workspace.Name, err)
 	}
 	if bundleName == "" {
 		return fmt.Errorf("workspace %s attached but no credential bundle was selected", workspace.Name)
