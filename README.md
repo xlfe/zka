@@ -24,7 +24,7 @@ and provider socket paths on the provider.
 </p>
 
 > [!NOTE]
-> zka 0.9.1 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
+> zka 0.9.2 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
 > builds on Kitty, zmx, OpenSSH, systemd user services, and coding-agent hooks
 > instead of replacing them.
 
@@ -1314,12 +1314,12 @@ routing the new pane through zka.
 
 ## Project status
 
-Version 0.9.1 combines three systems: durable Kitty-native workspaces, Codex and
+Version 0.9.2 combines three systems: durable Kitty-native workspaces, Codex and
 Claude Code attention routing, and reconnect-safe remote credential bundles.
 The current tree extends those bundles with workspace-owned PIVB routes while
 preserving the fixed-alias sandbox ABI. It also includes remote mirrors and two-phase
 moves, headless origins, Waybar streaming, desktop/ntfy notifications, and
-durable cleanup after partial failures. Version 0.9.1 makes repeated local
+durable cleanup after partial failures. Version 0.9.2 makes repeated local
 activation a true no-op for an existing claim and reports whole-bundle endpoint
 health before a launcher starts its sandbox. It retains inherited SSH and GnuPG
 credentials in locally created panes, inventories ambiguous v0.8.0 pane

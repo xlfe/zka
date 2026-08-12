@@ -29,6 +29,8 @@ const (
 	assuanNoPinentry  = "ERR 67108949 No Pinentry <GPG Agent>"
 	assuanNoDevice    = "ERR 100696144 No such device <SCD>"
 	assuanNoSecretKey = "ERR 67108881 No secret key <GPG Agent>"
+	// Libgpg-error source SCD (6), code General (1).
+	assuanSCDGeneralErrorCode = "100663297"
 )
 
 type openPGPFilter struct {
@@ -453,10 +455,10 @@ func (f *openPGPFilter) privateKeyOperation(ctx context.Context, command, operat
 		f.daemon.notifyCredentialFailure(ctx, f.host, f.hello, f.allowed[f.selectedGrip], operation, operation+" timed out")
 		return writeAssuanLine(f.downstream, assuanTimeout)
 	}
-	if assuanScdaemonDied(lines) {
+	if assuanScdaemonRetryable(lines) {
 		if retryErr := f.reconnectAndReplay(deadline); retryErr == nil {
 			lines, err = f.exchangeWithDeadline(command, deadline)
-			if err != nil || assuanScdaemonDied(lines) {
+			if err != nil || assuanScdaemonRetryable(lines) {
 				f.clearPrivateKeyState()
 			}
 			if err != nil {
@@ -647,12 +649,22 @@ func assuanEscapeData(data []byte) string {
 	return result.String()
 }
 
-func assuanScdaemonDied(lines []string) bool {
-	if len(lines) == 0 || !strings.HasPrefix(lines[len(lines)-1], "ERR") {
+func assuanScdaemonRetryable(lines []string) bool {
+	if len(lines) == 0 {
+		return false
+	}
+	fields := strings.Fields(lines[len(lines)-1])
+	if len(fields) < 2 || fields[0] != "ERR" {
 		return false
 	}
 	detail := strings.ToLower(lines[len(lines)-1])
-	return strings.Contains(detail, "<scd>") && (strings.Contains(detail, "daemon") || strings.Contains(detail, "card error") || strings.Contains(detail, "broken pipe"))
+	if !strings.Contains(detail, "<scd>") {
+		return false
+	}
+	return fields[1] == assuanSCDGeneralErrorCode ||
+		strings.Contains(detail, "daemon") ||
+		strings.Contains(detail, "card error") ||
+		strings.Contains(detail, "broken pipe")
 }
 
 type credentialLockState struct {

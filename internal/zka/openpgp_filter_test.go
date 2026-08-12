@@ -288,58 +288,92 @@ func TestOpenPGPFilterDeadlineClosesUpstreamAndClearsOperation(t *testing.T) {
 }
 
 func TestOpenPGPFilterRetriesDecryptWithSanitizedState(t *testing.T) {
-	h := newAssuanFilterHarness(t, "2s", true, func(command string) []string {
-		if command == "PKDECRYPT" {
-			return []string{"ERR 100663404 Card error <SCD>"}
-		}
-		return []string{"OK"}
-	})
-	replayed := make(chan string, 8)
-	var retryPeer net.Conn
-	h.filter.dial = func() (net.Conn, string, error) {
-		client, agent := net.Pipe()
-		retryPeer = agent
-		go func() {
-			reader := bufio.NewReaderSize(agent, assuanLineMax)
-			for {
-				command, err := readAssuanLine(reader)
-				if err != nil {
-					return
-				}
-				replayed <- command
+	for _, test := range []struct {
+		name     string
+		response string
+	}{
+		{name: "card error", response: "ERR 100663404 Card error <SCD>"},
+		{name: "general error", response: "ERR 100663297 General error <SCD>"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newAssuanFilterHarness(t, "2s", true, func(command string) []string {
 				if command == "PKDECRYPT" {
-					_ = writeAssuanLine(agent, "D plaintext")
+					return []string{test.response}
 				}
-				if err := writeAssuanLine(agent, "OK"); err != nil {
-					return
+				return []string{"OK"}
+			})
+			replayed := make(chan string, 8)
+			var retryPeer net.Conn
+			h.filter.dial = func() (net.Conn, string, error) {
+				client, agent := net.Pipe()
+				retryPeer = agent
+				go func() {
+					reader := bufio.NewReaderSize(agent, assuanLineMax)
+					for {
+						command, err := readAssuanLine(reader)
+						if err != nil {
+							return
+						}
+						replayed <- command
+						if command == "PKDECRYPT" {
+							_ = writeAssuanLine(agent, "D plaintext")
+						}
+						if err := writeAssuanLine(agent, "OK"); err != nil {
+							return
+						}
+					}
+				}()
+				return client, "OK retry agent", nil
+			}
+			t.Cleanup(func() {
+				if retryPeer != nil {
+					_ = retryPeer.Close()
+				}
+			})
+			if response := h.exchange(t, "SETKEY "+testAllowedGrip); response[len(response)-1] != "OK" {
+				t.Fatalf("SETKEY response = %#v", response)
+			}
+			response := h.exchange(t, "PKDECRYPT")
+			if strings.Join(response, "\n") != "D plaintext\nOK" {
+				t.Fatalf("retried PKDECRYPT response = %#v", response)
+			}
+			commands := make([]string, 0, 3)
+			for len(commands) < 3 {
+				select {
+				case command := <-replayed:
+					commands = append(commands, command)
+				case <-time.After(time.Second):
+					t.Fatalf("replayed commands = %#v", commands)
 				}
 			}
-		}()
-		return client, "OK retry agent", nil
+			if got, want := strings.Join(commands, "\n"), "RESET\nSETKEY "+testAllowedGrip+"\nPKDECRYPT"; got != want {
+				t.Fatalf("replayed commands = %q, want %q", got, want)
+			}
+		})
 	}
-	t.Cleanup(func() {
-		if retryPeer != nil {
-			_ = retryPeer.Close()
-		}
-	})
-	if response := h.exchange(t, "SETKEY "+testAllowedGrip); response[len(response)-1] != "OK" {
-		t.Fatalf("SETKEY response = %#v", response)
-	}
-	response := h.exchange(t, "PKDECRYPT")
-	if strings.Join(response, "\n") != "D plaintext\nOK" {
-		t.Fatalf("retried PKDECRYPT response = %#v", response)
-	}
-	commands := make([]string, 0, 3)
-	for len(commands) < 3 {
-		select {
-		case command := <-replayed:
-			commands = append(commands, command)
-		case <-time.After(time.Second):
-			t.Fatalf("replayed commands = %#v", commands)
-		}
-	}
-	if got, want := strings.Join(commands, "\n"), "RESET\nSETKEY "+testAllowedGrip+"\nPKDECRYPT"; got != want {
-		t.Fatalf("replayed commands = %q, want %q", got, want)
+}
+
+func TestAssuanScdaemonRetryable(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		lines []string
+		want  bool
+	}{
+		{name: "general error code", lines: []string{"ERR 100663297 Unspecified failure <SCD>"}, want: true},
+		{name: "card error", lines: []string{"ERR 100663404 Card error <SCD>"}, want: true},
+		{name: "daemon error", lines: []string{"ERR 100663416 SmartCard daemon error <SCD>"}, want: true},
+		{name: "broken pipe", lines: []string{"ERR 100696096 Broken pipe <SCD>"}, want: true},
+		{name: "general code without scdaemon source", lines: []string{"ERR 100663297 General error <GPG Agent>"}},
+		{name: "general error from agent", lines: []string{"ERR 67108865 General error <GPG Agent>"}},
+		{name: "unrelated scdaemon error", lines: []string{assuanNoDevice}},
+		{name: "success", lines: []string{"OK"}},
+		{name: "empty"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := assuanScdaemonRetryable(test.lines); got != test.want {
+				t.Fatalf("assuanScdaemonRetryable(%#v) = %v, want %v", test.lines, got, test.want)
+			}
+		})
 	}
 }
 
