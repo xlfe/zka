@@ -72,6 +72,9 @@ type CredentialPIVBConfig struct {
 	ForwardSocket string `json:"forward_socket"`
 	Command       string `json:"command"`
 	RoutingMode   string `json:"routing_mode"`
+	// GrantWindow is the default authorisation window a claim requests when the
+	// operator names none. Empty leaves every claim windowless.
+	GrantWindow string `json:"grant_window"`
 }
 
 type CredentialProviderConfig struct {
@@ -127,6 +130,7 @@ func defaultConfig() Config {
 	cfg.Credentials.GnuPG.OperationTimeout = "45s"
 	cfg.Credentials.PIVB.Command = "pivb"
 	cfg.Credentials.PIVB.RoutingMode = pivbRoutingEnvironment
+	cfg.Credentials.PIVB.GrantWindow = ""
 	cfg.Credentials.Bundles = map[string]CredentialBundleConfig{}
 	cfg.Credentials.Providers = map[string]CredentialProviderConfig{}
 	cfg.SSH.ExpectedNodeIDs = map[string]string{}
@@ -200,6 +204,11 @@ func LoadConfig() (Config, error) {
 	timeout, err := time.ParseDuration(cfg.Credentials.GnuPG.OperationTimeout)
 	if err != nil || timeout <= 0 {
 		return Config{}, fmt.Errorf("credentials.gnupg.operation_timeout must be a positive Go duration")
+	}
+	if cfg.Credentials.PIVB.GrantWindow != "" {
+		if _, err := parseCredentialGrantWindow(credentialGrantWindowConfigLabel, cfg.Credentials.PIVB.GrantWindow); err != nil {
+			return Config{}, err
+		}
 	}
 	if sshForwardAgentEnabled(cfg.SSH.Options) {
 		return Config{}, fmt.Errorf("ssh.options must not enable ForwardAgent; use a credential bundle with ssh_agent enabled")
@@ -279,6 +288,53 @@ func LoadConfig() (Config, error) {
 		cfg.SSH.Options = append([]string{"-o", "IdentityAgent=" + cfg.SSH.IdentityAgent}, cfg.SSH.Options...)
 	}
 	return cfg, nil
+}
+
+const (
+	// A window shorter than a minute buys nothing a single touch does not
+	// already cover, and one longer than half a day outlives the working
+	// session an operator was thinking about when they opened it.
+	credentialGrantWindowMin = time.Minute
+	credentialGrantWindowMax = 12 * time.Hour
+
+	credentialGrantWindowConfigLabel = "credentials.pivb.grant_window"
+	credentialGrantWindowFlagLabel   = "--window"
+)
+
+// parseCredentialGrantWindow converts an operator-facing duration into the
+// whole seconds the claim records. Zero is always legal and means the window
+// is closed; every other value has to sit inside the bounds above and land on
+// a second boundary, because a window is quoted back to operators and stamped
+// into provider requests as an integer.
+func parseCredentialGrantWindow(label, value string) (int64, error) {
+	window, err := time.ParseDuration(strings.TrimSpace(value))
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a Go duration", label)
+	}
+	if window == 0 {
+		return 0, nil
+	}
+	if window < credentialGrantWindowMin || window > credentialGrantWindowMax {
+		return 0, fmt.Errorf("%s must be 0 or between %s and %s", label, credentialGrantWindowMin, credentialGrantWindowMax)
+	}
+	if window%time.Second != 0 {
+		return 0, fmt.Errorf("%s must be a whole number of seconds", label)
+	}
+	return int64(window / time.Second), nil
+}
+
+// resolveCredentialWindowSeconds picks the window one claim asks for. An
+// omitted flag inherits the configured default; any explicit value overrides
+// it, including "0", so an operator can always close the window on a node
+// whose configuration opens one by default.
+func resolveCredentialWindowSeconds(flagValue string, cfg Config) (int64, error) {
+	if strings.TrimSpace(flagValue) == "" {
+		if strings.TrimSpace(cfg.Credentials.PIVB.GrantWindow) == "" {
+			return 0, nil
+		}
+		return parseCredentialGrantWindow(credentialGrantWindowConfigLabel, cfg.Credentials.PIVB.GrantWindow)
+	}
+	return parseCredentialGrantWindow(credentialGrantWindowFlagLabel, flagValue)
 }
 
 func validPIVBAlias(value string) bool {

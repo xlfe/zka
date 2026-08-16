@@ -85,7 +85,7 @@ func TestStableSSHRouteSwitchesAcrossLocalAndRemoteProviders(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = localAgent.Close() })
 	go serveCredentialTestByte(localAgent, 'L')
-	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, localAgentPath, localOwner.ID); err != nil {
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, localAgentPath, localOwner.ID, 0); err != nil {
 		t.Fatal(err)
 	}
 	routePath := agentRelaySocketPath(d.paths.AgentDir, workspace.ID)
@@ -361,7 +361,7 @@ func TestCredentialTransferClosesActiveOldGenerationStream(t *testing.T) {
 			}()
 		}
 	}()
-	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, localAgentPath, localOwner.ID); err != nil {
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, localAgentPath, localOwner.ID, 0); err != nil {
 		t.Fatal(err)
 	}
 	client, err := net.DialTimeout("unix", agentRelaySocketPath(d.paths.AgentDir, workspace.ID), time.Second)

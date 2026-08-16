@@ -721,7 +721,7 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 		if err := decodePayload(raw, &req); err != nil {
 			return nil, err
 		}
-		return d.activateLocalCredentialBundle(ctx, req.Workspace, req.Bundle, req.IfUnclaimed, d.callerSSHSocket(ctx, req.CallerSSHAuthSock), req.OwnerAttachmentID)
+		return d.activateLocalCredentialBundle(ctx, req.Workspace, req.Bundle, req.IfUnclaimed, d.callerSSHSocket(ctx, req.CallerSSHAuthSock), req.OwnerAttachmentID, req.WindowSeconds)
 	case "recreate_credential_backends":
 		var req refRequest
 		if err := decodePayload(raw, &req); err != nil {
@@ -2113,6 +2113,7 @@ func (d *Daemon) detachAttachment(workspaceRef, attachmentID string) (*Workspace
 	previous := workspace.Clone()
 	previousGeneration := uint64(0)
 	releaseOwner := workspace.CredentialClaim != nil && workspace.CredentialClaim.OwnerAttachmentID == attachmentID
+	releasedLocalPIVB := releaseOwner && workspace.CredentialClaim.PIVB != nil && workspace.CredentialClaim.ProviderSource == "local"
 	if releaseOwner {
 		previousGeneration = workspace.CredentialClaim.Generation
 		base := workspace.CredentialGeneration
@@ -2148,6 +2149,9 @@ func (d *Daemon) detachAttachment(workspaceRef, attachmentID string) (*Workspace
 	d.mu.Unlock()
 	if releaseOwner {
 		d.revokeCredentialRoutes(workspaceID, previousGeneration)
+	}
+	if releasedLocalPIVB {
+		d.invalidatePIVBReuse(workspaceID, 0)
 	}
 	return result, nil
 }

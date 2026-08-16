@@ -53,6 +53,7 @@ type workspaceCredentialRequest struct {
 	Provider          Host                     `json:"provider,omitempty"`
 	ProviderSource    string                   `json:"provider_source,omitempty"`
 	CallerSSHAuthSock string                   `json:"caller_ssh_auth_sock,omitempty"`
+	WindowSeconds     int64                    `json:"window_s,omitempty"`
 	Manifest          credentialBundleManifest `json:"manifest,omitempty"`
 }
 
@@ -76,6 +77,9 @@ type workspaceCredentialStatus struct {
 	OwnerNode        string                              `json:"owner_node,omitempty"`
 	OwnerAttachment  string                              `json:"owner_attachment_id,omitempty"`
 	Generation       uint64                              `json:"generation,omitempty"`
+	WindowSeconds    int64                               `json:"window_s,omitempty"`
+	WindowGranted    int64                               `json:"window_granted_s,omitempty"`
+	WindowDeadline   int64                               `json:"window_deadline,omitempty"`
 	State            string                              `json:"state"`
 	Capabilities     map[string]credentialCapabilityView `json:"capabilities"`
 	RecreatePaneIDs  []string                            `json:"panes_requiring_recreation,omitempty"`
@@ -445,6 +449,9 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 			return workspaceCredentialStatus{}, fmt.Errorf("credential bundle %q PIVB policy: %w", req.Bundle, err)
 		}
 	}
+	if err := validateCredentialGrantWindow(req, bundle); err != nil {
+		return workspaceCredentialStatus{}, err
+	}
 	d.mu.Lock()
 	initial, initialErr := d.resolveWorkspaceLocked(req.Workspace)
 	d.mu.Unlock()
@@ -574,7 +581,12 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 	}
 	previousClaim := workspace.CredentialClaim
 	previousUpdatedAt := workspace.UpdatedAt
-	if credentialClaimMatchesManifest(previousClaim, source, ownerNode, req.OwnerAttachmentID, req.Bundle, req.Manifest) {
+	// A windowed claim is never a no-op, even byte-for-byte identical to the
+	// one it replaces: renewing a grant moves the window's anchor, and the
+	// provider only re-reads a claim when its generation changes. Refreshing
+	// in place would leave the provider authorising against a stale deadline.
+	if req.WindowSeconds == 0 &&
+		credentialClaimMatchesManifest(previousClaim, source, ownerNode, req.OwnerAttachmentID, req.Bundle, req.WindowSeconds, req.Manifest) {
 		d.mu.Unlock()
 		d.reconcileCredentialRoutes(ctx)
 		status, statusErr := d.workspaceCredentialStatus(workspaceID)
@@ -594,7 +606,7 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 	workspace.CredentialGeneration = newGeneration
 	workspace.CredentialClaim = &CredentialClaim{
 		ProviderSource: source, Bundle: req.Bundle, OwnerNodeID: ownerNode, OwnerAttachmentID: req.OwnerAttachmentID,
-		Generation: newGeneration, State: "ready", Capabilities: capabilities,
+		Generation: newGeneration, WindowSeconds: req.WindowSeconds, State: "ready", Capabilities: capabilities,
 		OpenPGPKeys: keys, PIVB: clonePIVBManifest(req.Manifest.PIVB), UpdatedAt: time.Now().UTC(),
 	}
 	workspace.PIVBProvider = nil
@@ -614,8 +626,29 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 	return status, statusErr
 }
 
-func credentialClaimMatchesManifest(claim *CredentialClaim, source, ownerNode, ownerAttachment, bundle string, manifest credentialBundleManifest) bool {
+// validateCredentialGrantWindow fails a windowed claim closed. A window is
+// only meaningful where a touch is: it needs a PIVB-bearing bundle, and it
+// needs the claimed provider to say how much of one it is willing to grant.
+func validateCredentialGrantWindow(req workspaceCredentialRequest, bundle CredentialBundleConfig) error {
+	if req.WindowSeconds < 0 {
+		return fmt.Errorf("credential grant window must not be negative")
+	}
+	if req.WindowSeconds == 0 {
+		return nil
+	}
+	if !bundle.PIVB.Enable || req.Manifest.PIVB == nil {
+		return fmt.Errorf("credential bundle %q does not enable PIVB, so it cannot carry a grant window", req.Bundle)
+	}
+	if req.Manifest.PIVB.MaxGrantWindowS <= 0 {
+		return fmt.Errorf("PIVB provider %s grants no authorisation window for credential bundle %q: max_grant_window_s is 0",
+			req.Manifest.PIVB.ProviderResource, req.Bundle)
+	}
+	return nil
+}
+
+func credentialClaimMatchesManifest(claim *CredentialClaim, source, ownerNode, ownerAttachment, bundle string, windowSeconds int64, manifest credentialBundleManifest) bool {
 	if claim == nil || claim.ProviderSource != source || claim.OwnerNodeID != ownerNode || claim.OwnerAttachmentID != ownerAttachment || claim.Bundle != bundle || claim.State != "ready" ||
+		claim.WindowSeconds != windowSeconds ||
 		!sameStringSet(claim.OpenPGPKeys, manifestOpenPGPFingerprints(manifest.OpenPGP)) {
 		return false
 	}
@@ -667,6 +700,9 @@ func (d *Daemon) releaseWorkspaceCredentials(workspaceRef string) (workspaceCred
 		}
 		workspace.CredentialGeneration = base + 1
 	}
+	// The invalidation below runs outside every lock, so decide on it here
+	// while the released claim is still readable.
+	releasedLocalPIVB := previousClaim != nil && previousClaim.PIVB != nil && previousClaim.ProviderSource == "local"
 	workspace.CredentialClaim = nil
 	workspace.PIVBProvider = nil
 	workspace.UpdatedAt = time.Now().UTC()
@@ -680,6 +716,9 @@ func (d *Daemon) releaseWorkspaceCredentials(workspaceRef string) (workspaceCred
 	workspaceID := workspace.ID
 	d.mu.Unlock()
 	d.revokeCredentialRoutes(workspaceID, previousGeneration)
+	if releasedLocalPIVB {
+		d.invalidatePIVBReuse(workspaceID, 0)
+	}
 	return d.workspaceCredentialStatus(workspaceID)
 }
 
@@ -754,6 +793,7 @@ func credentialStatusFromWorkspaceVersion(workspace *Workspace, requiredVersion 
 
 	status.Bundle, status.OwnerNode, status.OwnerAttachment = claim.Bundle, claim.OwnerNodeID, claim.OwnerAttachmentID
 	status.Generation, status.State = claim.Generation, claim.State
+	status.WindowSeconds, status.WindowGranted, status.WindowDeadline = credentialClaimWindow(claim)
 	for name, capability := range claim.Capabilities {
 		status.Capabilities[name] = credentialCapabilityView{State: capability.State, Available: capability.Available, Detail: capability.Detail}
 	}
@@ -971,8 +1011,12 @@ func (d *Daemon) reconcileCredentialProviderSources(req remoteDaemonRequest, res
 			d.credentialOpenPGP[key] = cloneCredentialOpenPGPManifest(request.Manifest.OpenPGP)
 			d.credentialMu.Unlock()
 		}
+		// Purging up to the new generation retires every grant the superseded
+		// claims left behind while leaving the claim just made reusable.
+		d.invalidatePIVBReuse(request.Workspace, status.Generation)
 	case "credentials_release":
 		d.clearCredentialProviderSources(req.Host, request.Workspace)
+		d.invalidatePIVBReuse(request.Workspace, 0)
 	}
 }
 

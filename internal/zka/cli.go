@@ -213,6 +213,7 @@ func runKitty(args []string, paths Paths, stdout, stderr io.Writer) (int, error)
 	cwd := fs.String("cwd", "", "default pane working directory")
 	templatePath := fs.String("template", "", "topology-only Kitty session template")
 	credentialBundle := fs.String("credential-bundle", "", "credential bundle to bind at creation")
+	credentialWindow := fs.String("credential-window", "", credentialWindowFlagHelp)
 	noCredentials := fs.Bool("no-credentials", false, "leave managed credential endpoints unclaimed and fail-closed")
 	if err := parseInterspersed(fs, args); err != nil {
 		return 2, err
@@ -250,6 +251,10 @@ func runKitty(args []string, paths Paths, stdout, stderr io.Writer) (int, error)
 	if err != nil {
 		return 2, err
 	}
+	windowSeconds, err := resolveCredentialWindowSeconds(*credentialWindow, cfg)
+	if err != nil {
+		return 2, err
+	}
 	api := NewAPI(paths)
 	refreshCredentialSessionForCLI(api, bundle, "create", "", stderr)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -280,9 +285,11 @@ func runKitty(args []string, paths Paths, stdout, stderr io.Writer) (int, error)
 	}
 	workspace = launchedWorkspace
 	if bundle != "" {
-		if _, err := api.ActivateLocalCredentials(ctx, workspace.ID, bundle, attachmentID, false); err != nil {
+		status, err := api.ActivateLocalCredentials(ctx, workspace.ID, bundle, attachmentID, false, windowSeconds)
+		if err != nil {
 			return 1, fmt.Errorf("workspace %s attached but credentials were not claimed by attachment %s: %w", workspace.Name, attachmentID, err)
 		}
+		warnClampedCredentialWindow(stderr, status, windowSeconds)
 	}
 	fmt.Fprintf(stdout, "%s\t%s\n", workspace.ID, workspace.Name)
 	return 0, nil
@@ -350,8 +357,8 @@ func printWorkspaceUsage(w io.Writer) {
   list [--origin SSH_ALIAS] [--json]
   inspect [SSH_ALIAS:]REF [--json]
   reconcile [SSH_ALIAS:]REF [--attachment ID] [--recreate-backends]
-  create [SSH_ALIAS:]NAME [--template FILE] [--cwd DIR] [--attach] [--credential-bundle NAME] [--no-credentials]
-  attach [SSH_ALIAS:]REF [--pane PANE] [--claim-credentials] [--credential-bundle NAME]
+  create [SSH_ALIAS:]NAME [--template FILE] [--cwd DIR] [--attach] [--credential-bundle NAME] [--credential-window DUR] [--no-credentials]
+  attach [SSH_ALIAS:]REF [--pane PANE] [--claim-credentials] [--credential-bundle NAME] [--credential-window DUR]
   move [SSH_ALIAS:]REF [--pane PANE]
   detach REF
   forget [SSH_ALIAS:]REF
@@ -359,8 +366,8 @@ func printWorkspaceUsage(w io.Writer) {
   kill [SSH_ALIAS:]REF
   focus REF [--pane PANE]
   seen REF [--pane PANE]
-  credentials claim [--bundle NAME] [--attachment ID] [SSH_ALIAS:]REF
-  credentials activate-local [--bundle NAME] [--attachment ID] [--if-unclaimed] REF
+  credentials claim [--bundle NAME] [--attachment ID] [--window DUR] [SSH_ALIAS:]REF
+  credentials activate-local [--bundle NAME] [--attachment ID] [--window DUR] [--if-unclaimed] REF
   credentials endpoint [--json] REF
   credentials release [SSH_ALIAS:]REF
   credentials status [--json] [[SSH_ALIAS:]REF]`)
@@ -376,6 +383,7 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		fs := newFlagSet("workspace credentials claim", stderr)
 		bundleName := fs.String("bundle", "", "credential bundle to claim")
 		attachmentID := fs.String("attachment", "", "active controlling attachment id")
+		window := fs.String("window", "", credentialWindowFlagHelp)
 		if err := parseInterspersed(fs, args[1:]); err != nil {
 			return 2, err
 		}
@@ -391,6 +399,10 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		}
 		if *bundleName == "" {
 			return 2, fmt.Errorf("--bundle is required because credentials.default_bundle is not set")
+		}
+		windowSeconds, err := resolveCredentialWindowSeconds(*window, cfg)
+		if err != nil {
+			return 2, err
 		}
 		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		host, _ := splitWorkspaceRef(fs.Arg(0))
@@ -418,19 +430,21 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		defer cancel()
 		var status workspaceCredentialStatus
 		err = api.RemoteCall(ctx, host, "credentials_claim", workspaceCredentialRequest{
-			Workspace: workspace.ID, Bundle: *bundleName, OwnerAttachmentID: *attachmentID,
+			Workspace: workspace.ID, Bundle: *bundleName, OwnerAttachmentID: *attachmentID, WindowSeconds: windowSeconds,
 		}, &status)
 		if err != nil {
 			return 1, err
 		}
 		var refreshed Workspace
 		_ = api.RemoteCall(ctx, host, "get", refRequest{Ref: workspace.ID}, &refreshed)
+		warnClampedCredentialWindow(stderr, status, windowSeconds)
 		writeWorkspaceCredentialStatus(stdout, status)
 		return 0, nil
 	case "activate-local":
 		fs := newFlagSet("workspace credentials activate-local", stderr)
 		bundleName := fs.String("bundle", "", "local credential bundle to activate")
 		attachmentID := fs.String("attachment", "", "active controlling attachment id")
+		window := fs.String("window", "", credentialWindowFlagHelp)
 		ifUnclaimed := fs.Bool("if-unclaimed", false, "leave an existing workspace credential binding unchanged")
 		if err := parseInterspersed(fs, args[1:]); err != nil {
 			return 2, err
@@ -447,6 +461,10 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		}
 		if *bundleName == "" {
 			return 2, fmt.Errorf("--bundle is required because credentials.default_bundle is not set")
+		}
+		windowSeconds, err := resolveCredentialWindowSeconds(*window, cfg)
+		if err != nil {
+			return 2, err
 		}
 		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		workspace, err := resolveWorkspace(resolveCtx, api, fs.Arg(0))
@@ -470,10 +488,11 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		status, err := api.ActivateLocalCredentials(ctx, workspace.ID, *bundleName, *attachmentID, *ifUnclaimed)
+		status, err := api.ActivateLocalCredentials(ctx, workspace.ID, *bundleName, *attachmentID, *ifUnclaimed, windowSeconds)
 		if err != nil {
 			return 1, err
 		}
+		warnClampedCredentialWindow(stderr, status, windowSeconds)
 		writeWorkspaceCredentialStatus(stdout, status)
 		return 0, nil
 	case "endpoint":
@@ -583,6 +602,34 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 	}
 }
 
+const credentialWindowFlagHelp = "PIVB grant window (Go duration; 0 disables; empty uses credentials.pivb.grant_window)"
+
+func credentialWindowDuration(seconds int64) time.Duration {
+	return time.Duration(seconds) * time.Second
+}
+
+// credentialWindowRemaining renders how much of a grant is left. Expiry is not
+// a failure — the next mint simply costs a touch again — so it reads as a
+// state, not an error.
+func credentialWindowRemaining(deadline int64) string {
+	remaining := deadline - time.Now().Unix()
+	if remaining <= 0 {
+		return "expired"
+	}
+	return credentialWindowDuration(remaining).String()
+}
+
+// warnClampedCredentialWindow reports a grant the provider shortened. The
+// claim still succeeded and still records what was asked for, so this is a
+// warning about how long the window really lasts, not a failure.
+func warnClampedCredentialWindow(w io.Writer, status workspaceCredentialStatus, requested int64) {
+	if w == nil || requested <= 0 || status.WindowGranted <= 0 || status.WindowGranted >= requested {
+		return
+	}
+	fmt.Fprintf(w, "zka: credential provider granted a %s window, not the %s requested; its max_grant_window_s is the shorter value\n",
+		credentialWindowDuration(status.WindowGranted), credentialWindowDuration(requested))
+}
+
 func writeWorkspaceCredentialStatus(w io.Writer, status workspaceCredentialStatus) {
 	fmt.Fprintf(w, "credentials=%s workspace=%s", status.State, status.WorkspaceName)
 	if status.Bundle != "" {
@@ -590,6 +637,13 @@ func writeWorkspaceCredentialStatus(w io.Writer, status workspaceCredentialStatu
 	}
 	if status.OwnerNode != "" {
 		fmt.Fprintf(w, " node=%s", shortID(status.OwnerNode))
+	}
+	if status.WindowSeconds > 0 {
+		fmt.Fprintf(w, " window=%s", credentialWindowDuration(status.WindowSeconds))
+		if status.WindowGranted != status.WindowSeconds {
+			fmt.Fprintf(w, " window_granted=%s", credentialWindowDuration(status.WindowGranted))
+		}
+		fmt.Fprintf(w, " window_remaining=%s", credentialWindowRemaining(status.WindowDeadline))
 	}
 	capabilities := make([]string, 0, len(status.Capabilities))
 	for name, capability := range status.Capabilities {
@@ -623,6 +677,7 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 	attach := fs.Bool("attach", false, "attach the workspace here after creating it")
 	claimCredentials := fs.Bool("claim-credentials", false, "deprecated alias for binding the creation credential bundle")
 	credentialBundle := fs.String("credential-bundle", "", "credential bundle to bind at creation")
+	credentialWindow := fs.String("credential-window", "", credentialWindowFlagHelp)
 	noCredentials := fs.Bool("no-credentials", false, "leave managed credential endpoints unclaimed and fail-closed")
 	if err := parseInterspersed(fs, args); err != nil {
 		return 2, err
@@ -684,6 +739,9 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 	if err != nil {
 		return 2, err
 	}
+	if _, err := resolveCredentialWindowSeconds(*credentialWindow, cfg); err != nil {
+		return 2, err
+	}
 	// Even for a remote workspace, the credentials originate at this node. The
 	// local daemon owns both the provider and the peer-derived graphical session.
 	refreshCredentialSessionForCLI(api, bundle, "create", "", stderr)
@@ -717,6 +775,9 @@ func runWorkspaceCreate(args []string, paths Paths, stdout, stderr io.Writer) (i
 	attachArgs := []string{ref}
 	if bundle != "" {
 		attachArgs = append([]string{"--claim-credentials", "--credential-bundle", bundle}, attachArgs...)
+		if *credentialWindow != "" {
+			attachArgs = append([]string{"--credential-window", *credentialWindow}, attachArgs...)
+		}
 	}
 	code, err := runWorkspaceAttach(attachArgs, paths, false, stdout, stderr)
 	if err != nil {
@@ -869,6 +930,7 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	paneRef := fs.String("pane", "", "pane to focus after attaching")
 	claimCredentials := fs.Bool("claim-credentials", false, "claim a credential bundle after attaching")
 	credentialBundle := fs.String("credential-bundle", "", "credential bundle to claim")
+	credentialWindow := fs.String("credential-window", "", credentialWindowFlagHelp)
 	if err := parseInterspersed(fs, args); err != nil {
 		return 2, err
 	}
@@ -882,13 +944,22 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	if *credentialBundle != "" && !*claimCredentials {
 		return 2, fmt.Errorf("--credential-bundle requires --claim-credentials")
 	}
-	if *claimCredentials && *credentialBundle == "" {
+	if *credentialWindow != "" && !*claimCredentials {
+		return 2, fmt.Errorf("--credential-window requires --claim-credentials")
+	}
+	var credentialWindowSeconds int64
+	if *claimCredentials {
 		cfg, err := LoadConfig()
 		if err != nil {
 			return 1, err
 		}
-		if cfg.Credentials.DefaultBundle == "" {
+		if *credentialBundle == "" && cfg.Credentials.DefaultBundle == "" {
 			return 2, fmt.Errorf("--claim-credentials requires --credential-bundle because credentials.default_bundle is not set")
+		}
+		// Resolve the window before anything is launched: a malformed duration
+		// must not surface only after the workspace already has a view.
+		if credentialWindowSeconds, err = resolveCredentialWindowSeconds(*credentialWindow, cfg); err != nil {
+			return 2, err
 		}
 	}
 	var workspace *Workspace
@@ -971,7 +1042,7 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 			return 1, err
 		}
 		if *claimCredentials {
-			if err := claimAttachedWorkspaceCredentials(api, host, workspace, existing.ID, *credentialBundle, stderr); err != nil {
+			if err := claimAttachedWorkspaceCredentials(api, host, workspace, existing.ID, *credentialBundle, credentialWindowSeconds, stderr); err != nil {
 				return 1, err
 			}
 		}
@@ -1054,7 +1125,7 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 		return 1, err
 	}
 	if *claimCredentials {
-		if err := claimAttachedWorkspaceCredentials(api, host, workspace, attachmentID, *credentialBundle, stderr); err != nil {
+		if err := claimAttachedWorkspaceCredentials(api, host, workspace, attachmentID, *credentialBundle, credentialWindowSeconds, stderr); err != nil {
 			return 1, err
 		}
 	}
@@ -1062,7 +1133,7 @@ func runWorkspaceAttach(args []string, paths Paths, move bool, stdout, stderr io
 	return 0, nil
 }
 
-func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspace, ownerAttachmentID, bundleName string, stderr io.Writer) error {
+func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspace, ownerAttachmentID, bundleName string, windowSeconds int64, stderr io.Writer) error {
 	if workspace == nil {
 		return fmt.Errorf("workspace attached but its credential owner could not be verified: workspace is unavailable")
 	}
@@ -1105,17 +1176,19 @@ func claimAttachedWorkspaceCredentials(api API, host string, workspace *Workspac
 	defer cancel()
 	var status workspaceCredentialStatus
 	if host == "" {
-		_, err := api.ActivateLocalCredentials(ctx, workspace.ID, bundleName, ownerAttachment, false)
+		local, err := api.ActivateLocalCredentials(ctx, workspace.ID, bundleName, ownerAttachment, false, windowSeconds)
 		if err != nil {
 			return fmt.Errorf("workspace %s attached but credential bundle %s was not claimed: %w", workspace.Name, bundleName, err)
 		}
+		warnClampedCredentialWindow(stderr, local, windowSeconds)
 		return nil
 	}
 	if err := api.RemoteCall(ctx, host, "credentials_claim", workspaceCredentialRequest{
-		Workspace: workspace.ID, Bundle: bundleName, OwnerAttachmentID: ownerAttachment,
+		Workspace: workspace.ID, Bundle: bundleName, OwnerAttachmentID: ownerAttachment, WindowSeconds: windowSeconds,
 	}, &status); err != nil {
 		return fmt.Errorf("workspace %s attached but credential bundle %s was not claimed: %w", workspace.Name, bundleName, err)
 	}
+	warnClampedCredentialWindow(stderr, status, windowSeconds)
 	return nil
 }
 

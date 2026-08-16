@@ -12,6 +12,7 @@ import (
 
 const (
 	stateSchemaVersion = 10
+	// 15 carries an operator grant window on workspace credential claims.
 	// 14 restores attachment-owned credential claims and adds versioned PIVB
 	// attachment routing for managed panes.
 	// 13 made credential ownership workspace- and node-scoped, independently
@@ -23,7 +24,8 @@ const (
 	// 10 replaces the workspace-agent API with credential bundles. There is no
 	// compatibility shim: every CLI and daemon on a node must be upgraded
 	// together.
-	daemonProtocolVersion = 14
+	daemonProtocolVersion = 15
+	// 15 forwards the operator grant window a credential claim requests.
 	// 14 requires an authenticated active attachment for credential claims.
 	// 13 replaced attachment-owned claims with node-owned credential bindings.
 	// 12 adds the PIVB credential manifest and stream capability.
@@ -39,7 +41,7 @@ const (
 	// remote pane, and sends the source pane instead. An origin that predates
 	// this would quietly place every remote pane in the home directory, so the
 	// version check turns that into an explicit upgrade prompt.
-	remoteProtocolVersion = 14
+	remoteProtocolVersion = 15
 	remoteProtocolName    = "zka.workspace"
 	remoteProtocolMax     = 1 << 20
 )
@@ -327,16 +329,42 @@ type Workspace struct {
 }
 
 type CredentialClaim struct {
-	ProviderSource    string                                `json:"provider_source"` // local or remote
-	Bundle            string                                `json:"bundle"`
-	OwnerAttachmentID string                                `json:"owner_attachment_id"`
-	OwnerNodeID       string                                `json:"owner_node_id"`
-	Generation        uint64                                `json:"generation"`
-	State             string                                `json:"state"`
-	Capabilities      map[string]CredentialCapabilityStatus `json:"capabilities"`
-	OpenPGPKeys       []string                              `json:"openpgp_keys,omitempty"`
-	PIVB              *CredentialPIVBManifest               `json:"pivb,omitempty"`
-	UpdatedAt         time.Time                             `json:"updated_at"`
+	ProviderSource    string `json:"provider_source"` // local or remote
+	Bundle            string `json:"bundle"`
+	OwnerAttachmentID string `json:"owner_attachment_id"`
+	OwnerNodeID       string `json:"owner_node_id"`
+	Generation        uint64 `json:"generation"`
+	// WindowSeconds is the authorisation window the operator asked this grant
+	// to cover, as requested rather than as clamped: the provider maximum can
+	// move underneath a live claim, so the request and the effect are recorded
+	// separately. Zero means every mint costs its own touch.
+	WindowSeconds int64                                 `json:"window_s,omitempty"`
+	State         string                                `json:"state"`
+	Capabilities  map[string]CredentialCapabilityStatus `json:"capabilities"`
+	OpenPGPKeys   []string                              `json:"openpgp_keys,omitempty"`
+	PIVB          *CredentialPIVBManifest               `json:"pivb,omitempty"`
+	UpdatedAt     time.Time                             `json:"updated_at"`
+}
+
+// credentialClaimWindow reports the window a claim requested, the window it
+// actually carries, and the unix second that window closes. The grant is
+// anchored to the claim itself: it opens when the claim was last written and
+// is clamped to the maximum the provider published in the claimed manifest, so
+// a provider that grants nothing leaves an already-closed window behind rather
+// than an unbounded one.
+func credentialClaimWindow(claim *CredentialClaim) (requested, granted, deadline int64) {
+	if claim == nil || claim.WindowSeconds <= 0 {
+		return 0, 0, 0
+	}
+	granted = claim.WindowSeconds
+	maximum := int64(0)
+	if claim.PIVB != nil {
+		maximum = claim.PIVB.MaxGrantWindowS
+	}
+	if maximum < granted {
+		granted = maximum
+	}
+	return claim.WindowSeconds, granted, claim.UpdatedAt.Add(time.Duration(granted) * time.Second).Unix()
 }
 
 type CredentialPIVBCard struct {

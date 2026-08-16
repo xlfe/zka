@@ -1461,6 +1461,19 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 			}
 		}
 	}
+	// An origin can release or re-grant a claim this node provides without ever
+	// calling back here; the refreshed mirror is the only notice the provider
+	// gets. Treat a claim of ours that vanished or changed generation as the
+	// release it is, and retire the reuse state behind it.
+	invalidatePIVBGeneration, invalidatePIVB := uint64(0), false
+	if existing != nil && existing.CredentialClaim != nil &&
+		existing.CredentialClaim.PIVB != nil && existing.CredentialClaim.OwnerNodeID == d.state.Node.ID {
+		if clone.CredentialClaim == nil {
+			invalidatePIVB = true
+		} else if clone.CredentialClaim.Generation != existing.CredentialClaim.Generation {
+			invalidatePIVBGeneration, invalidatePIVB = clone.CredentialClaim.Generation, true
+		}
+	}
 	d.state.Workspaces[clone.ID] = clone
 	cache := d.state.Remotes[host]
 	if cache == nil {
@@ -1473,6 +1486,9 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 	_ = d.store.Save(d.state)
 	result := clone.Clone()
 	d.mu.Unlock()
+	if invalidatePIVB {
+		d.invalidatePIVBReuse(result.ID, invalidatePIVBGeneration)
+	}
 	if existing != nil {
 		sort.Strings(changedKittyPanes)
 		sort.Strings(transitionedPanes)

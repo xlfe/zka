@@ -122,6 +122,74 @@ func TestConfigRejectsUnimplementedPIVBProvenanceMode(t *testing.T) {
 	}
 }
 
+func TestCredentialGrantWindowConfigIsValidated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("ZKA_CONFIG", path)
+	for _, test := range []struct {
+		name            string
+		value           string
+		want            string
+		wantErrContains string
+	}{
+		{name: "unset leaves every claim windowless"},
+		{name: "whole window", value: "30m", want: "30m"},
+		{name: "explicit disable", value: "0", want: "0"},
+		{name: "below the floor", value: "59s", wantErrContains: "must be 0 or between 1m0s and 12h0m0s"},
+		{name: "above the ceiling", value: "13h", wantErrContains: "must be 0 or between 1m0s and 12h0m0s"},
+		{name: "sub-second precision", value: "1m0.5s", wantErrContains: "whole number of seconds"},
+		{name: "not a duration", value: "soon", wantErrContains: "must be a Go duration"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(`{"credentials":{"pivb":{"grant_window":"`+test.value+`"}}}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig()
+			if test.wantErrContains != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErrContains) ||
+					!strings.Contains(err.Error(), "credentials.pivb.grant_window") {
+					t.Fatalf("grant_window %q error = %v", test.value, err)
+				}
+				return
+			}
+			if err != nil || cfg.Credentials.PIVB.GrantWindow != test.want {
+				t.Fatalf("grant_window %q = %q, %v; want %q", test.value, cfg.Credentials.PIVB.GrantWindow, err, test.want)
+			}
+		})
+	}
+}
+
+func TestResolveCredentialWindowSecondsPrefersTheFlag(t *testing.T) {
+	var configured Config
+	configured.Credentials.PIVB.GrantWindow = "30m"
+	for _, test := range []struct {
+		name            string
+		flag            string
+		cfg             Config
+		want            int64
+		wantErrContains string
+	}{
+		{name: "no flag and no default"},
+		{name: "no flag inherits the default", cfg: configured, want: 1800},
+		{name: "flag overrides the default", flag: "2h", cfg: configured, want: 7200},
+		{name: "explicit zero closes a configured window", flag: "0", cfg: configured},
+		{name: "flag without a default", flag: "1m", want: 60},
+		{name: "invalid flag", flag: "10s", cfg: configured, wantErrContains: "--window"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := resolveCredentialWindowSeconds(test.flag, test.cfg)
+			if test.wantErrContains != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErrContains) {
+					t.Fatalf("resolveCredentialWindowSeconds(%q) error = %v", test.flag, err)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("resolveCredentialWindowSeconds(%q) = %d, %v; want %d", test.flag, got, err, test.want)
+			}
+		})
+	}
+}
+
 func TestOpenPGPTargetBundleDoesNotRequireProviderFingerprints(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"credentials":{"bundles":{"work":{"openpgp":{"enable":true}}}}}`), 0o600); err != nil {

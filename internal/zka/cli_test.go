@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLocalAndRemotePaneBackendCommandsUseStableCredentialEnvironment(t *testing.T) {
@@ -260,6 +261,95 @@ func TestWorkspaceCreateDispatchAndUsage(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "\n  create ") || !strings.Contains(stdout.String(), "--claim-credentials") {
 		t.Fatalf("workspace usage does not advertise create and credential claiming: %q", stdout.String())
+	}
+}
+
+func TestCredentialWindowFlagsAreValidatedBeforeAnyRPC(t *testing.T) {
+	// Paths{} has no reachable socket, so a window error proves the flag was
+	// parsed and rejected before the claim left this machine.
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"credentials":{"default_bundle":"work","pivb":{"grant_window":"30m"},"bundles":{"work":{"pivb":{"enable":true,"aliases":["ro"]}}}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZKA_CONFIG", path)
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "claim", args: []string{"credentials", "claim", "--window", "5s", "devbox.example:api"}, want: "--window must be 0 or between"},
+		{name: "activate-local", args: []string{"credentials", "activate-local", "--window", "13h", "api"}, want: "--window must be 0 or between"},
+		{name: "create", args: []string{"create", "api", "--attach", "--credential-window", "soon"}, want: "--window must be a Go duration"},
+		{name: "attach", args: []string{"attach", "api", "--claim-credentials", "--credential-window", "5s"}, want: "--window must be 0 or between"},
+		{
+			name: "attach without a claim",
+			args: []string{"attach", "api", "--credential-window", "30m"},
+			want: "--credential-window requires --claim-credentials",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code, err := runWorkspace(test.args, Paths{}, &stdout, &stderr)
+			if code != 2 || err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("code=%d err=%v; want 2 and %q", code, err, test.want)
+			}
+		})
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code, err := runWorkspace([]string{"help"}, Paths{}, &stdout, &stderr); code != 0 || err != nil {
+		t.Fatalf("help: code=%d err=%v", code, err)
+	}
+	if !strings.Contains(stdout.String(), "--window DUR") || !strings.Contains(stdout.String(), "--credential-window DUR") {
+		t.Fatalf("workspace usage does not advertise the grant window: %q", stdout.String())
+	}
+}
+
+func TestCredentialWindowStatusAndClampWarning(t *testing.T) {
+	var out bytes.Buffer
+	status := workspaceCredentialStatus{
+		State: "ready", WorkspaceName: "reviewer", Bundle: "work",
+		WindowSeconds: 1800, WindowGranted: 1800, WindowDeadline: time.Now().Add(29 * time.Minute).Unix(),
+		Capabilities: map[string]credentialCapabilityView{},
+	}
+	writeWorkspaceCredentialStatus(&out, status)
+	// The remaining time is quoted to the second, so a boundary crossed
+	// between building the status and rendering it lands on either side.
+	if line := out.String(); !strings.Contains(line, "window=30m0s") || strings.Contains(line, "window_granted=") ||
+		!strings.Contains(line, "window_remaining=29m0s") && !strings.Contains(line, "window_remaining=28m59s") {
+		t.Fatalf("unclamped status line = %q", line)
+	}
+
+	// A clamped grant reports both numbers: what was asked for stays visible,
+	// and what actually holds is stated next to it.
+	out.Reset()
+	status.WindowGranted = 600
+	status.WindowDeadline = time.Now().Add(9 * time.Minute).Unix()
+	writeWorkspaceCredentialStatus(&out, status)
+	if line := out.String(); !strings.Contains(line, "window=30m0s") || !strings.Contains(line, "window_granted=10m0s") {
+		t.Fatalf("clamped status line = %q", line)
+	}
+
+	out.Reset()
+	status.WindowDeadline = time.Now().Add(-time.Minute).Unix()
+	writeWorkspaceCredentialStatus(&out, status)
+	if line := out.String(); !strings.Contains(line, "window_remaining=expired") {
+		t.Fatalf("expired status line = %q", line)
+	}
+
+	out.Reset()
+	warnClampedCredentialWindow(&out, status, 1800)
+	if warning := out.String(); !strings.Contains(warning, "granted a 10m0s window") ||
+		!strings.Contains(warning, "not the 30m0s requested") || !strings.Contains(warning, "max_grant_window_s") {
+		t.Fatalf("clamp warning = %q", warning)
+	}
+
+	out.Reset()
+	status.WindowGranted = 1800
+	warnClampedCredentialWindow(&out, status, 1800)
+	warnClampedCredentialWindow(&out, workspaceCredentialStatus{}, 0)
+	if warning := out.String(); warning != "" {
+		t.Fatalf("unclamped claim warned: %q", warning)
 	}
 }
 

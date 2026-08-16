@@ -6,17 +6,26 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestCredentialSSHSourceIsScopedToClaimGeneration(t *testing.T) {
-	d := &Daemon{
-		sshAgent:             sshAgentInfo{EffectiveSocket: "/daemon-agent"},
-		credentialSSHSources: map[string]string{},
+	root := testRoot(t)
+	d, journal, err := newTestDaemonWithLog(t, root, quietRunner())
+	if err != nil {
+		t.Fatal(err)
 	}
+	d.sshAgent = sshAgentInfo{EffectiveSocket: "/daemon-agent"}
+	// Every provider-source change also asks pivbd to retire the reuse state
+	// behind it. Pointing that at a dead socket proves the bookkeeping below
+	// survives an unreachable pivbd, and that the failure is journalled.
+	d.config.Credentials.PIVB.ForwardSocket = deadUnixSocket(t, filepath.Join(root, "dead-forward.sock"))
 	request := workspaceCredentialRequest{Workspace: "workspace", Bundle: "work"}
 	payload, err := json.Marshal(request)
 	if err != nil {
@@ -54,6 +63,23 @@ func TestCredentialSSHSourceIsScopedToClaimGeneration(t *testing.T) {
 	if len(d.credentialSSHSources) != 0 {
 		t.Fatalf("release retained SSH sources: %#v", d.credentialSSHSources)
 	}
+	waitFor(t, func() bool { return strings.Count(journal.String(), "PIVB reuse invalidation failed") == 3 })
+}
+
+// deadUnixSocket leaves a bound socket file behind with nothing accepting on
+// it, which is what a crashed daemon leaves and what a missing one does not.
+func deadUnixSocket(t *testing.T, path string) string {
+	t.Helper()
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	return path
 }
 
 func TestMissingCredentialSSHSourceDegradesAfterProviderRestart(t *testing.T) {
@@ -394,14 +420,14 @@ func TestActivateLocalIfUnclaimedDoesNotMutateExistingProviderSources(t *testing
 	t.Cleanup(func() { _ = personalAgent.Close() })
 	go serveCredentialTestByte(personalAgent, 'P')
 
-	bound, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, workPath, localOwner.ID)
+	bound, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, workPath, localOwner.ID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := credentialTestRoundTrip(t, agentRelaySocketPath(d.paths.AgentDir, workspace.ID), 'a'); got != 'W' {
 		t.Fatalf("initial provider reply = %q", got)
 	}
-	untouched, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "personal", true, personalPath, localOwner.ID)
+	untouched, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "personal", true, personalPath, localOwner.ID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +468,7 @@ func TestActivateLocalIfUnclaimedDoesNotRequireOwnerOrProbeProvider(t *testing.T
 
 	untouched, err := d.activateLocalCredentialBundle(
 		context.Background(), workspace.ID, "personal", true,
-		filepath.Join(d.paths.RuntimeDir, "missing-agent.sock"), "",
+		filepath.Join(d.paths.RuntimeDir, "missing-agent.sock"), "", 0,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -471,9 +497,260 @@ func TestActivateLocalCredentialBundleRequiresExplicitOwnerAttachment(t *testing
 	workspace := createTestWorkspace(t, d, 1)
 	readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
 
-	_, err = d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", "")
+	_, err = d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", "", 0)
 	if err == nil || !strings.Contains(err.Error(), "owner attachment is required") {
 		t.Fatalf("activation without explicit owner = %v", err)
+	}
+}
+
+// windowedCredentialDaemon returns an origin whose only bundle is PIVB-backed
+// by a provider granting maxGrantWindow, plus the local attachment that owns
+// its claims.
+func windowedCredentialDaemon(t *testing.T, maxGrantWindow int64) (*Daemon, *fakePIVBProvider, *Workspace, *Attachment) {
+	t.Helper()
+	provider := newFakePIVBProvider(t, maxGrantWindow)
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": pivbCredentialBundle(), "ssh": sshCredentialBundle()}
+	d.config.Credentials.PIVB.ForwardSocket = provider.socket
+	workspace := createTestWorkspace(t, d, 1)
+	owner := readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
+	return d, provider, workspace, owner
+}
+
+func credentialClaimSnapshot(t *testing.T, d *Daemon, workspaceID string) CredentialClaim {
+	t.Helper()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	claim := d.state.Workspaces[workspaceID].CredentialClaim
+	if claim == nil {
+		t.Fatal("workspace has no credential claim")
+	}
+	return *claim
+}
+
+func TestCredentialClaimRecordsGrantWindowAndProvisionalDeadline(t *testing.T) {
+	d, _, workspace, owner := windowedCredentialDaemon(t, 3600)
+	status, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", owner.ID, 1800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.WindowSeconds != 1800 || status.WindowGranted != 1800 {
+		t.Fatalf("windowed claim status = %#v", status)
+	}
+	claim := credentialClaimSnapshot(t, d, workspace.ID)
+	if claim.WindowSeconds != 1800 {
+		t.Fatalf("persisted claim window = %d, want 1800", claim.WindowSeconds)
+	}
+	if want := claim.UpdatedAt.Add(1800 * time.Second).Unix(); status.WindowDeadline != want {
+		t.Fatalf("window deadline = %d, want %d (claim written at %s)", status.WindowDeadline, want, claim.UpdatedAt)
+	}
+
+	// The window is recorded as requested and clamped only in effect, so an
+	// operator can still see what they asked for after the provider trims it.
+	clamped, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", owner.ID, 7200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clamped.WindowSeconds != 7200 || clamped.WindowGranted != 3600 {
+		t.Fatalf("clamped claim status = %#v, want 7200 requested and 3600 granted", clamped)
+	}
+	clampedClaim := credentialClaimSnapshot(t, d, workspace.ID)
+	if want := clampedClaim.UpdatedAt.Add(3600 * time.Second).Unix(); clamped.WindowDeadline != want {
+		t.Fatalf("clamped deadline = %d, want %d", clamped.WindowDeadline, want)
+	}
+}
+
+func TestWindowedReclaimRegrantsWhileWindowlessReclaimStaysANoOp(t *testing.T) {
+	d, _, workspace, owner := windowedCredentialDaemon(t, 3600)
+	windowed, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", owner.ID, 600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := credentialClaimSnapshot(t, d, workspace.ID)
+
+	// Renewing a window is a re-grant even when nothing else about the claim
+	// moved: the deadline is anchored to the claim, and only a new generation
+	// makes the provider re-read it.
+	time.Sleep(10 * time.Millisecond)
+	renewed, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", owner.ID, 600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewed.Generation <= windowed.Generation {
+		t.Fatalf("windowed renewal generation = %d, want > %d", renewed.Generation, windowed.Generation)
+	}
+	second := credentialClaimSnapshot(t, d, workspace.ID)
+	if !second.UpdatedAt.After(first.UpdatedAt) {
+		t.Fatalf("windowed renewal left the anchor at %s", second.UpdatedAt)
+	}
+	if want := second.UpdatedAt.Add(600 * time.Second).Unix(); renewed.WindowDeadline != want {
+		t.Fatalf("windowed renewal deadline = %d, want %d re-anchored to %s", renewed.WindowDeadline, want, second.UpdatedAt)
+	}
+
+	// Dropping the window is a real change, so it re-grants windowlessly.
+	closed, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", owner.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closed.Generation <= renewed.Generation || closed.WindowSeconds != 0 || closed.WindowDeadline != 0 {
+		t.Fatalf("windowless re-claim over a windowed claim = %#v", closed)
+	}
+	if got := credentialClaimSnapshot(t, d, workspace.ID); got.WindowSeconds != 0 {
+		t.Fatalf("persisted claim kept window %d after a windowless re-claim", got.WindowSeconds)
+	}
+
+	// A windowless claim over a windowless claim keeps today's no-op.
+	repeated, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", owner.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated.Generation != closed.Generation {
+		t.Fatalf("windowless re-claim changed generation from %d to %d", closed.Generation, repeated.Generation)
+	}
+}
+
+func TestGrantWindowIsRefusedWithoutAProviderThatGrantsOne(t *testing.T) {
+	d, _, workspace, owner := windowedCredentialDaemon(t, 0)
+	_, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", owner.ID, 600)
+	if err == nil || !strings.Contains(err.Error(), "max_grant_window_s is 0") ||
+		!strings.Contains(err.Error(), fakePIVBProviderResource) {
+		t.Fatalf("window against a provider that grants none = %v", err)
+	}
+	if claim := d.state.Workspaces[workspace.ID].CredentialClaim; claim != nil {
+		t.Fatalf("refused window still published a claim: %#v", claim)
+	}
+
+	sshPath := filepath.Join(d.paths.RuntimeDir, "ssh-agent.sock")
+	sshAgent, err := listenUnix(sshPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sshAgent.Close() })
+	_, err = d.activateLocalCredentialBundle(context.Background(), workspace.ID, "ssh", false, sshPath, owner.ID, 600)
+	if err == nil || !strings.Contains(err.Error(), "does not enable PIVB") {
+		t.Fatalf("window on a bundle without PIVB = %v", err)
+	}
+
+	_, err = d.claimWorkspaceCredentials(context.Background(), workspaceCredentialRequest{
+		Workspace: workspace.ID, Provider: d.state.Node, ProviderSource: "local", Bundle: "ssh",
+		OwnerAttachmentID: owner.ID, WindowSeconds: -1,
+		Manifest: credentialBundleManifest{Bundle: "ssh", SSH: true},
+	})
+	if err == nil || !strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("negative window = %v", err)
+	}
+}
+
+func TestReleasingALocalPIVBClaimInvalidatesProviderReuse(t *testing.T) {
+	d, provider, workspace, owner := windowedCredentialDaemon(t, 3600)
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", owner.ID, 600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.releaseWorkspaceCredentials(workspace.ID); err != nil {
+		t.Fatal(err)
+	}
+	request := provider.nextInvalidation(t)
+	if request.Version != pivbForwardProtocolVersion || request.WorkspaceID != workspace.ID || request.ClaimGeneration != 0 {
+		t.Fatalf("release invalidation = %#v", request)
+	}
+}
+
+func TestPIVBReuseInvalidationIsSilentWithoutAProvider(t *testing.T) {
+	root := testRoot(t)
+	d, journal, err := newTestDaemonWithLog(t, root, quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Credentials.PIVB.ForwardSocket = filepath.Join(root, "absent-forward.sock")
+	// No pivbd means no reuse state to retire, so this reports nothing at all:
+	// an SSH-only deployment must not journal a PIVB failure per claim.
+	d.invalidatePIVBReuse("workspace", 0)
+	if entry := journal.String(); entry != "" {
+		t.Fatalf("absent PIVB provider was journalled: %q", entry)
+	}
+}
+
+func TestOwnerDetachInvalidatesLocalPIVBReuse(t *testing.T) {
+	d, provider, workspace, owner := windowedCredentialDaemon(t, 3600)
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", owner.ID, 600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.detachAttachment(workspace.ID, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	request := provider.nextInvalidation(t)
+	if request.WorkspaceID != workspace.ID || request.ClaimGeneration != 0 {
+		t.Fatalf("owner detach invalidation = %#v", request)
+	}
+}
+
+func TestProviderSideReconcileInvalidatesSupersededGenerations(t *testing.T) {
+	provider := newFakePIVBProvider(t, 3600)
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Credentials.PIVB.ForwardSocket = provider.socket
+	payload, err := json.Marshal(workspaceCredentialRequest{Workspace: "workspace", Bundle: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := json.Marshal(workspaceCredentialStatus{
+		Generation:   7,
+		Capabilities: map[string]credentialCapabilityView{credentialCapabilityPIVB: {State: "ready", Available: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.reconcileCredentialProviderSources(remoteDaemonRequest{Host: "devbox", Op: "credentials_claim", Payload: payload}, claimed)
+	if request := provider.nextInvalidation(t); request.WorkspaceID != "workspace" || request.ClaimGeneration != 7 {
+		t.Fatalf("claim invalidation = %#v, want generation 7 retained", request)
+	}
+	d.reconcileCredentialProviderSources(remoteDaemonRequest{Host: "devbox", Op: "credentials_release", Payload: payload}, []byte(`{}`))
+	if request := provider.nextInvalidation(t); request.WorkspaceID != "workspace" || request.ClaimGeneration != 0 {
+		t.Fatalf("release invalidation = %#v, want every generation purged", request)
+	}
+}
+
+func TestMirroredOriginClaimChangeInvalidatesProviderReuse(t *testing.T) {
+	provider := newFakePIVBProvider(t, 3600)
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Credentials.PIVB.ForwardSocket = provider.socket
+	remote := &Workspace{
+		ID: "0123456789abcdef0123456789abcdef", Name: "reviewer",
+		Origin: Host{ID: "origin-node", Name: "devbox"},
+		Panes:  map[string]*Pane{}, Attachments: map[string]*Attachment{},
+		CredentialClaim: &CredentialClaim{
+			ProviderSource: "remote", Bundle: "work", OwnerNodeID: d.state.Node.ID, Generation: 4,
+			State: "ready", Capabilities: map[string]CredentialCapabilityStatus{}, PIVB: provider.manifest(),
+		},
+	}
+	if _, err := d.cacheRemoteWorkspace("devbox", remote); err != nil {
+		t.Fatal(err)
+	}
+
+	regranted := remote.Clone()
+	regranted.CredentialClaim.Generation = 5
+	if _, err := d.cacheRemoteWorkspace("devbox", regranted); err != nil {
+		t.Fatal(err)
+	}
+	if request := provider.nextInvalidation(t); request.WorkspaceID != remote.ID || request.ClaimGeneration != 5 {
+		t.Fatalf("mirrored re-grant invalidation = %#v", request)
+	}
+
+	released := regranted.Clone()
+	released.CredentialClaim = nil
+	if _, err := d.cacheRemoteWorkspace("devbox", released); err != nil {
+		t.Fatal(err)
+	}
+	if request := provider.nextInvalidation(t); request.WorkspaceID != remote.ID || request.ClaimGeneration != 0 {
+		t.Fatalf("mirrored release invalidation = %#v", request)
 	}
 }
 

@@ -162,7 +162,7 @@ func (d *Daemon) ensureCredentialMigrationBinding(ctx context.Context, workspace
 		if claimSource == "local" {
 			migrationCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
-			if _, err := d.activateLocalCredentialBundle(migrationCtx, workspaceID, claimBundle, false, "", ownerAttachment); err != nil {
+			if _, err := d.activateLocalCredentialBundle(migrationCtx, workspaceID, claimBundle, false, "", ownerAttachment, 0); err != nil {
 				return fmt.Errorf("refresh local credential binding before migration: %w", err)
 			}
 		}

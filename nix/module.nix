@@ -190,6 +190,7 @@ let
         forward_socket = if cfg.credentials.pivb.forwardSocket == null then "" else cfg.credentials.pivb.forwardSocket;
         command = pivbCommand;
         routing_mode = cfg.credentials.pivb.routingMode;
+        grant_window = cfg.credentials.pivb.grantWindow;
       };
       bundles = lib.mapAttrs (_: bundle: {
         ssh_agent.enable = bundle.sshAgent.enable;
@@ -394,6 +395,20 @@ in
           type = lib.types.enum [ "environment" ];
           default = "environment";
           description = "Managed PIVB route binding. Protocol 1 is cooperative; enforced provenance remains future work.";
+        };
+
+        grantWindow = lib.mkOption {
+          type = lib.types.str;
+          default = "";
+          description = ''
+            Default authorisation window a workspace credential claim requests,
+            as a Go duration. Inside the window one YubiKey touch authorises
+            every byte-identical request the claim makes; once it closes, the
+            next mint costs a touch again. Empty requests no window, so every
+            mint is touched individually. Non-empty values must be 0, or
+            between 1m and 12h in whole seconds, and are clamped to the
+            provider pivbd's own maximum.
+          '';
         };
       };
 

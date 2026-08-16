@@ -104,6 +104,21 @@ type pivbMintResponse struct {
 	GrantedWindowDeadline int64 `json:"granted_window_deadline,omitempty"`
 }
 
+// pivbInvalidateRequest retires the reuse state pivbd holds for a claim.
+// ClaimGeneration zero means every generation of the workspace, which is what
+// a release asks for; a non-zero generation purges everything before it and
+// leaves that generation's own grant intact.
+type pivbInvalidateRequest struct {
+	Version         int    `json:"version"`
+	WorkspaceID     string `json:"workspace_id"`
+	ClaimGeneration uint64 `json:"claim_generation"`
+}
+
+type pivbInvalidateResponse struct {
+	Version int `json:"version"`
+	Purged  int `json:"purged"`
+}
+
 func credentialPIVBForwardSocket(cfg Config) string {
 	if cfg.Credentials.PIVB.ForwardSocket != "" {
 		return cfg.Credentials.PIVB.ForwardSocket
@@ -174,6 +189,72 @@ func buildPIVBManifest(ctx context.Context, cfg Config, aliases []string) (*Cred
 		IssuerURI: description.IssuerURI, Aliases: allowed, Card: description.Card,
 		MaxGrantWindowS: description.MaxGrantWindowS,
 	}, nil
+}
+
+// invalidatePIVBReuse tells the local pivbd to stop reusing a claim's
+// authorisation. It is deliberately advisory and asynchronous: by the time it
+// runs the claim change is already durable, so a pivbd that is absent, older,
+// or failing must cost the caller nothing beyond a journal line. The worst
+// case is a grant that outlives its claim inside pivbd until it expires on its
+// own, which is why the caller never waits on this and never fails for it.
+func (d *Daemon) invalidatePIVBReuse(workspaceID string, generation uint64) {
+	socket := credentialPIVBForwardSocket(d.config)
+	if workspaceID == "" || socket == "" || !filepath.IsAbs(socket) {
+		return
+	}
+	// A node with no pivbd holds no reuse state to retire, and claims there are
+	// routine. Skip it silently so an SSH-only or OpenPGP-only deployment does
+	// not journal a PIVB failure for every claim it makes; a socket that is
+	// present but dead is a real fault and still reports below.
+	if info, err := os.Lstat(socket); err != nil || info.Mode()&os.ModeSocket == 0 {
+		return
+	}
+	d.startWorker(func(ctx context.Context) {
+		callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		purged, err := postPIVBInvalidate(callCtx, socket, workspaceID, generation)
+		if err != nil {
+			d.logger.Printf("PIVB reuse invalidation failed workspace=%s generation=%d: %v", workspaceID, generation, err)
+			return
+		}
+		d.logger.Printf("PIVB reuse invalidated workspace=%s generation=%d purged=%d", workspaceID, generation, purged)
+	})
+}
+
+func postPIVBInvalidate(ctx context.Context, socket, workspaceID string, generation uint64) (int, error) {
+	encoded, err := json.Marshal(pivbInvalidateRequest{
+		Version: pivbForwardProtocolVersion, WorkspaceID: workspaceID, ClaimGeneration: generation,
+	})
+	if err != nil {
+		return 0, err
+	}
+	client := newPIVBHTTPClient(socket, 5*time.Second)
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://pivb-forward/v1/invalidate", bytes.NewReader(encoded))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, pivbForwardResponseMax+1))
+	if err != nil || len(body) > pivbForwardResponseMax {
+		return 0, errors.New("PIVB invalidate response is invalid")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, errors.New(strings.TrimSpace(string(body)))
+	}
+	var decoded pivbInvalidateResponse
+	if err := decodeStrictJSON(body, &decoded); err != nil {
+		return 0, fmt.Errorf("decode PIVB invalidate response: %w", err)
+	}
+	if decoded.Version != pivbForwardProtocolVersion {
+		return 0, errors.New(pivbForwardVersionSkew("PIVB invalidate response", decoded.Version))
+	}
+	return decoded.Purged, nil
 }
 
 func validatePIVBClaimAgainstLocalPolicy(ctx context.Context, cfg Config, manifest *CredentialPIVBManifest) error {

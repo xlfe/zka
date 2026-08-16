@@ -16,7 +16,7 @@ type pivbEndpointResponse struct {
 	Detail      string `json:"detail,omitempty"`
 }
 
-func (d *Daemon) activateLocalCredentialBundle(ctx context.Context, workspaceRef, bundleName string, ifUnclaimed bool, callerSSHAuthSock, ownerAttachment string) (workspaceCredentialStatus, error) {
+func (d *Daemon) activateLocalCredentialBundle(ctx context.Context, workspaceRef, bundleName string, ifUnclaimed bool, callerSSHAuthSock, ownerAttachment string, windowSeconds int64) (workspaceCredentialStatus, error) {
 	bundle, ok := d.config.credentialBundle(bundleName)
 	if !ok {
 		return workspaceCredentialStatus{}, fmt.Errorf("credential bundle %q is not configured on this node", bundleName)
@@ -78,7 +78,7 @@ func (d *Daemon) activateLocalCredentialBundle(ctx context.Context, workspaceRef
 		return workspaceCredentialStatus{}, err
 	}
 	status, err := d.claimWorkspaceCredentials(ctx, workspaceCredentialRequest{
-		Workspace: workspaceID, Bundle: bundleName, IfUnclaimed: ifUnclaimed,
+		Workspace: workspaceID, Bundle: bundleName, IfUnclaimed: ifUnclaimed, WindowSeconds: windowSeconds,
 		Provider: provider, ProviderSource: "local", OwnerAttachmentID: ownerAttachment, Manifest: manifest,
 	})
 	if err != nil {

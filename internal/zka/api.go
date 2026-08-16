@@ -163,11 +163,11 @@ func (a API) ReleaseWorkspaceCredentials(ctx context.Context, workspace string) 
 	return out, err
 }
 
-func (a API) ActivateLocalCredentials(ctx context.Context, workspace, bundle, ownerAttachment string, ifUnclaimed bool) (workspaceCredentialStatus, error) {
+func (a API) ActivateLocalCredentials(ctx context.Context, workspace, bundle, ownerAttachment string, ifUnclaimed bool, windowSeconds int64) (workspaceCredentialStatus, error) {
 	var out workspaceCredentialStatus
 	err := a.client.Call(ctx, "credentials_activate_local", workspaceCredentialRequest{
 		Workspace: workspace, Bundle: bundle, OwnerAttachmentID: ownerAttachment,
-		IfUnclaimed: ifUnclaimed, CallerSSHAuthSock: os.Getenv("SSH_AUTH_SOCK"),
+		IfUnclaimed: ifUnclaimed, WindowSeconds: windowSeconds, CallerSSHAuthSock: os.Getenv("SSH_AUTH_SOCK"),
 	}, &out)
 	return out, err
 }

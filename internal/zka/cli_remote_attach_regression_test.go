@@ -183,7 +183,7 @@ func TestRemoteAttachImmediatelyClaimsCredentialsFromReadyAttachment(t *testing.
 	}
 
 	if err := claimAttachedWorkspaceCredentials(
-		NewAPI(provider.paths), host, finalized, attachmentID, "work", io.Discard,
+		NewAPI(provider.paths), host, finalized, attachmentID, "work", 0, io.Discard,
 	); err != nil {
 		t.Fatalf("immediate credential claim after successful remote readiness: %v", err)
 	}

@@ -483,7 +483,12 @@ func credentialsClaimDoctorCheck(status credentialStatusResponse, err error) doc
 			capabilities = append(capabilities, capability+":"+view.State)
 		}
 		sort.Strings(capabilities)
-		claimed = append(claimed, fmt.Sprintf("%s=%s@%s[%s]", workspace.WorkspaceName, workspace.Bundle, shortID(workspace.OwnerNode), strings.Join(capabilities, ",")))
+		entry := fmt.Sprintf("%s=%s@%s[%s]", workspace.WorkspaceName, workspace.Bundle, shortID(workspace.OwnerNode), strings.Join(capabilities, ","))
+		if workspace.WindowSeconds > 0 {
+			entry += fmt.Sprintf(" window=%s remaining=%s",
+				credentialWindowDuration(workspace.WindowSeconds), credentialWindowRemaining(workspace.WindowDeadline))
+		}
+		claimed = append(claimed, entry)
 	}
 	if len(claimed) == 0 {
 		return doctorCheck{Name: name, OK: true, Detail: "no workspaces currently claim credentials"}

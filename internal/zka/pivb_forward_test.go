@@ -55,6 +55,91 @@ func serveFakePIVB(t *testing.T, handler http.Handler) string {
 	return socket
 }
 
+// fakePIVBProvider is a pivbd stand-in that answers the two documents a claim
+// reads and records every reuse invalidation aimed at it, so a test can prove
+// both what a claim recorded and what the daemon asked the provider to forget.
+type fakePIVBProvider struct {
+	socket         string
+	card           CredentialPIVBCard
+	maxGrantWindow int64
+	invalidated    chan pivbInvalidateRequest
+}
+
+const fakePIVBProviderResource = "projects/1/locations/global/workloadIdentityPools/pool/providers/provider"
+
+func newFakePIVBProvider(t *testing.T, maxGrantWindowSeconds int64) *fakePIVBProvider {
+	t.Helper()
+	provider := &fakePIVBProvider{
+		card: testPIVBCard(t), maxGrantWindow: maxGrantWindowSeconds,
+		invalidated: make(chan pivbInvalidateRequest, 8),
+	}
+	aliases := map[string]CredentialPIVBAlias{"ro": {Target: "ro@example.iam.gserviceaccount.com"}}
+	handler := http.NewServeMux()
+	handler.HandleFunc("GET /v1/describe", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(pivbForwardDescription{
+			Version: pivbForwardProtocolVersion, ProviderResource: fakePIVBProviderResource,
+			IssuerURI: "https://issuer.example", Card: provider.card, Aliases: aliases,
+			MaxGrantWindowS: maxGrantWindowSeconds,
+		})
+	})
+	handler.HandleFunc("GET /v1/policy", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(pivbForwardPolicy{
+			Version: pivbForwardProtocolVersion, ProviderResource: fakePIVBProviderResource,
+			IssuerURI: "https://issuer.example", Aliases: aliases,
+			EnrolledKeys:    []pivbEnrolledKey{{Serial: provider.card.Serial, KeyID: provider.card.KeyID}},
+			MaxGrantWindowS: maxGrantWindowSeconds,
+		})
+	})
+	handler.HandleFunc("POST /v1/invalidate", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(io.LimitReader(r.Body, pivbForwardBodyMax))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var request pivbInvalidateRequest
+		if err := decodeStrictJSON(body, &request); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		select {
+		case provider.invalidated <- request:
+		default:
+		}
+		_ = json.NewEncoder(w).Encode(pivbInvalidateResponse{Version: pivbForwardProtocolVersion, Purged: 1})
+	})
+	provider.socket = serveFakePIVB(t, handler)
+	return provider
+}
+
+func (p *fakePIVBProvider) manifest() *CredentialPIVBManifest {
+	return &CredentialPIVBManifest{
+		ProtocolVersion: pivbForwardProtocolVersion, ProviderResource: fakePIVBProviderResource,
+		IssuerURI: "https://issuer.example", Card: p.card,
+		Aliases:         map[string]CredentialPIVBAlias{"ro": {Target: "ro@example.iam.gserviceaccount.com"}},
+		MaxGrantWindowS: p.maxGrantWindow,
+	}
+}
+
+// nextInvalidation waits for one invalidation. Invalidation is fire-and-forget
+// by design, so a test can only observe it by waiting for it to arrive.
+func (p *fakePIVBProvider) nextInvalidation(t *testing.T) pivbInvalidateRequest {
+	t.Helper()
+	select {
+	case request := <-p.invalidated:
+		return request
+	case <-time.After(3 * time.Second):
+		t.Fatal("PIVB provider received no reuse invalidation")
+		return pivbInvalidateRequest{}
+	}
+}
+
+func pivbCredentialBundle() CredentialBundleConfig {
+	var bundle CredentialBundleConfig
+	bundle.PIVB.Enable = true
+	bundle.PIVB.Aliases = []string{"ro"}
+	return bundle
+}
+
 func TestPIVBBundleConfigRequiresAliasAllowlist(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	t.Setenv("ZKA_CONFIG", path)
@@ -646,7 +731,7 @@ func TestPIVBBindingTransfersWithoutReplacingStableWorkspaceRoute(t *testing.T) 
 	d.config.Credentials.PIVB.ForwardSocket = serveFakePIVB(t, handler)
 	workspace := createTestWorkspace(t, d, 1)
 	localOwner := readyCredentialAttachment(t, d, workspace, "local-owner", d.state.Node.ID)
-	status, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID)
+	status, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,7 +747,7 @@ func TestPIVBBindingTransfersWithoutReplacingStableWorkspaceRoute(t *testing.T) 
 	d.mu.Lock()
 	firstGeneration := d.state.Workspaces[workspace.ID].CredentialClaim.Generation
 	d.mu.Unlock()
-	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID); err != nil {
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID, 0); err != nil {
 		t.Fatal(err)
 	}
 	d.mu.Lock()
@@ -703,7 +788,7 @@ func TestPIVBBindingTransfersWithoutReplacingStableWorkspaceRoute(t *testing.T) 
 	if currentRoute != stableRoute {
 		t.Fatal("provider transfer replaced the pane-facing workspace route")
 	}
-	if noOp, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", true, "", localOwner.ID); err != nil || noOp.OwnerNode != attachment.Node.ID {
+	if noOp, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", true, "", localOwner.ID, 0); err != nil || noOp.OwnerNode != attachment.Node.ID {
 		t.Fatalf("if-unclaimed activation changed or rejected remote route: status=%#v err=%v", noOp, err)
 	}
 	d.credentialMu.Lock()
@@ -718,7 +803,7 @@ func TestPIVBBindingTransfersWithoutReplacingStableWorkspaceRoute(t *testing.T) 
 	if err != nil || endpoint.State != "degraded" || !strings.Contains(endpoint.Detail, "credential transport is unavailable") {
 		t.Fatalf("disconnected provider endpoint = %#v, %v", endpoint, err)
 	}
-	localAgain, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID)
+	localAgain, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID, 0)
 	if err != nil || localAgain.OwnerNode != d.state.Node.ID {
 		t.Fatalf("explicit local transfer = %#v, %v", localAgain, err)
 	}
@@ -767,7 +852,7 @@ func TestPIVBEndpointReflectsWholeBundleHealthAndLocalRefresh(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = sshAgent.Close() })
 
-	status, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, sshPath, localOwner.ID)
+	status, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, sshPath, localOwner.ID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -803,7 +888,7 @@ func TestPIVBEndpointReflectsWholeBundleHealthAndLocalRefresh(t *testing.T) {
 		t.Fatalf("missing SSH source endpoint = %#v, %v", endpoint, err)
 	}
 
-	refreshed, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, sshPath, localOwner.ID)
+	refreshed, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, sshPath, localOwner.ID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -830,7 +915,7 @@ func TestPIVBEndpointRejectsBundleWithoutPIVB(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = sshAgent.Close() })
-	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, sshPath, localOwner.ID); err != nil {
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, sshPath, localOwner.ID, 0); err != nil {
 		t.Fatal(err)
 	}
 	endpoint, err := d.pivbEndpoint(workspace.ID)
@@ -884,7 +969,7 @@ func TestLocalPIVBListenerFailureIsPersistedAsDegraded(t *testing.T) {
 	}
 	defer blocker.Close()
 
-	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID); err == nil {
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", localOwner.ID, 0); err == nil {
 		t.Fatal("local activation reported success while another live listener owned the route")
 	}
 	d.mu.Lock()

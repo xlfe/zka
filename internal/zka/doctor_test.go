@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCurrentPaneCredentialEnvironmentDoctorCheck(t *testing.T) {
@@ -82,6 +83,38 @@ func TestCredentialEnvironmentInventoryDoctorCheck(t *testing.T) {
 	}
 	if healthy := credentialEnvironmentInventoryDoctorCheck(credentialStatusResponse{}, nil); !healthy.OK {
 		t.Fatalf("healthy inventory check = %#v", healthy)
+	}
+}
+
+func TestCredentialsClaimDoctorCheckReportsGrantWindows(t *testing.T) {
+	status := credentialStatusResponse{Workspaces: []workspaceCredentialStatus{
+		{
+			WorkspaceName: "windowed", State: "ready", Bundle: "work", OwnerNode: "0123456789abcdef0123456789abcdef",
+			Capabilities:  map[string]credentialCapabilityView{credentialCapabilityPIVB: {State: "ready"}},
+			WindowSeconds: 1800, WindowGranted: 1800, WindowDeadline: time.Now().Add(29 * time.Minute).Unix(),
+		},
+		{
+			WorkspaceName: "expired", State: "ready", Bundle: "work", OwnerNode: "0123456789abcdef0123456789abcdef",
+			Capabilities:  map[string]credentialCapabilityView{credentialCapabilityPIVB: {State: "ready"}},
+			WindowSeconds: 1800, WindowGranted: 1800, WindowDeadline: time.Now().Add(-time.Minute).Unix(),
+		},
+		{
+			WorkspaceName: "windowless", State: "ready", Bundle: "work", OwnerNode: "0123456789abcdef0123456789abcdef",
+			Capabilities: map[string]credentialCapabilityView{credentialCapabilityPIVB: {State: "ready"}},
+		},
+	}}
+	check := credentialsClaimDoctorCheck(status, nil)
+	// An expired window is a state, not a fault: the claim still stands and
+	// the next mint simply costs a touch again.
+	if !check.OK || !strings.Contains(check.Detail, "expired=work@01234567[pivb:ready] window=30m0s remaining=expired") {
+		t.Fatalf("expired window check = %#v", check)
+	}
+	if !strings.Contains(check.Detail, "windowed=work@01234567[pivb:ready] window=30m0s remaining=2") {
+		t.Fatalf("live window check = %#v", check)
+	}
+	if !strings.Contains(check.Detail, "windowless=work@01234567[pivb:ready];") &&
+		!strings.HasSuffix(check.Detail, "windowless=work@01234567[pivb:ready]") {
+		t.Fatalf("windowless claim gained window text: %#v", check)
 	}
 }
 
