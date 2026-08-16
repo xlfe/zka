@@ -16,11 +16,13 @@ sandbox fixed-alias session.sock
 ```
 
 The route is semantic. It accepts only `POST /v1/mint` with a complete PIVB
-forwarding protocol v2 request. PIVB and ZKA strictly decode the same versioned
+forwarding protocol v3 request. PIVB and ZKA strictly decode the same versioned
 request and response contract; a mixed-version deployment fails closed and
-requires upgrading both peers. The route does not carry raw digests, APDUs,
-PINs, unlock requests, PC/SC, configuration, STS calls, IAM calls, or Google
-access tokens.
+requires upgrading both peers. Both sides read the `version` field before strict
+decoding so skew is reported as skew rather than as a malformed request, and a
+PIVB manifest persisted under v2 fails closed until its bundle is released and
+re-claimed. The route does not carry raw digests, APDUs, PINs, unlock requests,
+PC/SC, configuration, STS calls, IAM calls, or Google access tokens.
 
 ## Configure the bundle
 
@@ -30,6 +32,8 @@ Declare the same bundle name and PIVB alias allowlist on each ZKA peer:
 services.zka.credentials = {
   defaultBundle = "work";
   pivb.routingMode = "environment";
+  # Default grant window claims from this node request; empty requests none.
+  pivb.grantWindow = "";
   bundles.work.pivb = {
     enable = true;
     aliases = [ "ro" "deploy" ];
@@ -168,6 +172,7 @@ session:
 
 ```fish
 zka workspace credentials claim --bundle work devbox:example-project
+zka workspace credentials claim --bundle work --window 30m devbox:example-project
 ```
 
 The origin queries its card-free PIVB policy and checks the provider, issuer,
@@ -176,7 +181,47 @@ atomically replaces any local route with the provider-node route. Each mint is c
 the claim's alias allowlist and pinned card. ZKA injects authenticated origin,
 workspace, bundle, generation, provider node, and operation
 IDs. Provider-side pivbd then revalidates alias, target, audience, enrollment,
-and pinned card identity before signing. Origin-side pivbd independently checks
+and pinned card identity before signing.
+
+### The grant window on the claim
+
+`--window` records an operator authorisation window on the claim itself, and
+`credentials.pivb.grantWindow` supplies the default when the flag is omitted; an
+explicit `--window 0` always closes it. The window is claim-anchored: it opens at
+the claim's `UpdatedAt` and runs for `min(requested, max_grant_window_s)`, using
+the maximum published in the claimed manifest. A window is refused at claim time
+on a bundle that does not enable PIVB and on a provider publishing
+`max_grant_window_s = 0`, rather than being recorded as a window that could never
+open.
+
+The daemon, never the pane, stamps the window into each forwarded mint's trusted
+context: `window_s` as the operator *requested* it, plus the absolute
+`window_deadline` the claim anchored it to, both or neither. The requested value
+travels because the provider clamps against its own live configuration, which can
+move underneath a claim; a window that has already closed is stamped as no window
+at all, and the provider treats an expired deadline as windowless rather than as a
+refusal. Both the local route and the remote credential stream stamp the same
+pair, so the forward context a pane reads back describes the mint that actually
+happened. What the provider granted comes back top-level, outside the forwarded
+context, because binding a response to the active route replaces that context
+wholesale.
+
+A windowed claim always advances the claim generation, even when it is otherwise
+identical to the claim it replaces. Renewal is re-granting: a provider re-reads a
+claim only when its generation changes, so refreshing in place would leave it
+authorising against a stale anchor.
+
+Four paths retire a claim, and between them they reach the provider's pivbd on
+whichever node is holding the reuse state. Two run where the card is because the
+claim was locally provided: explicit `credentials release`, and detaching the
+owning attachment. Two run on a provider serving a remote origin: observing a
+`credentials_claim` or `credentials_release` it just served (purging up to the
+new generation, which retires superseded grants and leaves the claim just made
+reusable), and refreshing a workspace mirror in which a claim this node provides
+has vanished or changed generation. All four call `POST /v1/invalidate`
+best-effort and asynchronously — the claim change is already durable, so an
+absent, older, or failing pivbd costs one journal line and never fails the
+operation. A node with no pivbd socket is skipped silently. Origin-side pivbd independently checks
 the returned JWT claims, SPKI, signature, lifetime, local enrollment, and the
 active route's pinned serial/key/SPKI. The origin relay, rather than the remote
 provider, stamps that route pin into the response envelope.
@@ -245,3 +290,26 @@ distinguish a remote workspace mint from a direct-local mint. It never logs the 
 access token, ID token, or Authorization header. Source labels and operation IDs
 are audit correlation only; authorization comes from the fixed alias, bundle
 policy, authenticated ZKA session, claim generation, and pinned card.
+
+Every mint response carries what the provider actually granted, in top-level
+`granted_window_s` and `granted_window_deadline`. They are absent when no window
+applies: a mint that asked for none, and a claim whose window had already closed
+when the mint arrived. A mint that asks for a window the provider does not grant
+is refused with `403 PIVB_WINDOW_NOT_ALLOWED` rather than downgraded silently.
+
+The origin announces a closing grant window twice: about two minutes before the
+deadline, and again at expiry. The pre-notice is skipped for granted windows
+shorter than four minutes, which would otherwise announce their own opening, and
+a window first seen already closed is never announced at all, so a restarted
+daemon does not report grants that ended while it was down. Both notices are
+per workspace and per generation — a renewed grant is a new generation and earns
+its own pair — and both honour the ordinary notification policy on each channel,
+because missing one costs a touch and nothing else. They are journalled either
+way as `PIVB grant window closing|expired workspace=… bundle=…`, which is the
+only record a headless origin has.
+
+A pane whose claimed PIVB manifest no longer matches the provider's bundle policy
+or forwarding protocol — the shape a v2-era manifest has after a lockstep upgrade
+— now receives `403 PIVB_CONFIG` telling it to release and re-claim the bundle.
+Only the operator can repair that, so dropping the connection left the pane with a
+transport error and no remedy to act on.

@@ -24,7 +24,7 @@ and provider socket paths on the provider.
 </p>
 
 > [!NOTE]
-> zka 0.9.3 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
+> zka 0.10.0 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
 > builds on Kitty, zmx, OpenSSH, systemd user services, and coding-agent hooks
 > instead of replacing them.
 
@@ -427,6 +427,9 @@ services.zka.credentials = {
   defaultBundle = "work"; # selected only by an explicit create/attach claim
   # Protocol 1 is cooperative. Enforced provenance is not yet available.
   pivb.routingMode = "environment";
+  # Default PIVB grant window a claim from this node requests. Empty (the
+  # default) requests none, so every mint costs its own YubiKey touch.
+  pivb.grantWindow = "";
   bundles.work = {
     sshAgent.enable = true;
     openpgp.enable = true;
@@ -541,7 +544,9 @@ zka workspace create devbox:public-project --attach --no-credentials
 `defaultBundle` supplies the creation default and the name used when `--bundle`
 is omitted. `--credential-bundle` overrides it; `--no-credentials` creates an
 unclaimed workspace whose managed endpoints fail closed. It does not restore
-ambient `SSH_AUTH_SOCK` or `GNUPGHOME` inside the pane.
+ambient `SSH_AUTH_SOCK` or `GNUPGHOME` inside the pane. `zka kitty` and
+`workspace create` also take `--credential-window DUR`, which binds the new
+workspace's bundle with a [PIVB grant window](#pivb-grant-windows).
 
 For remote creation the graphical-session refresh still targets the local
 daemon, because that machine owns both the provider and the CLI peer; only the
@@ -555,8 +560,13 @@ an explicit claim when the attaching machine should take over the whole bundle:
 ```fish
 zka workspace attach devbox:example-project
 zka workspace attach devbox:example-project --claim-credentials --credential-bundle work
+zka workspace attach devbox:example-project --claim-credentials --credential-bundle work --credential-window 30m
 zka workspace credentials status --json devbox:example-project
 ```
+
+`--credential-window` (and `--window` on `credentials claim` and
+`activate-local`) asks for a [PIVB grant window](#pivb-grant-windows); without
+it, and without `credentials.pivb.grantWindow`, every mint costs its own touch.
 
 A binding is workspace-wide and has exactly one controlling attachment. The
 attachment must be ready, authenticated by the control path, and belong to the
@@ -612,6 +622,62 @@ response to that active route pin, which origin-side pivbd verifies alongside
 the signed token and local enrollment. See
 [PIVB credential bundles](docs/pivb-credential-bundles.md) for the launcher,
 PIVB service, timeout, and smart-card lease contract.
+
+### PIVB grant windows
+
+A claim normally says nothing about how often the card may be asked: every mint
+through it costs a YubiKey touch. A grant window is the operator saying, on the
+claim itself, that one touch may cover the next span of identical work:
+
+```fish
+zka workspace credentials claim --bundle work --window 30m devbox:example-project
+zka workspace credentials activate-local --bundle work --window 30m example-project
+```
+
+The window belongs to the claim, not to the mint. It opens at the claim's own
+`UpdatedAt` and runs for `min(requested, provider max_grant_window_s)`, so the
+provider's operator always has the last word and re-asking near the end cannot
+push the deadline out. Because the two numbers can differ, both are reported:
+`window=` is what was asked for, `window_granted=` appears only when the
+provider shortened it, and `window_remaining=` counts down the real deadline.
+`zka doctor` appends `window=… remaining=…` to each claimed workspace, and
+`credentials status --json` carries `window_s`, `window_granted_s`, and the
+absolute `window_deadline`. The CLI also warns on the spot when a grant came
+back short.
+
+`credentials.pivb.grantWindow` supplies the default for claims made from this
+node. An explicit flag always wins, including `--window 0`, so a node whose
+configuration opens a window by default can still make a windowless claim.
+Values are Go durations: `0`, or between `1m` and `12h`, in whole seconds.
+
+Windowed claims fail closed rather than degrading quietly. A bundle that does
+not enable PIVB cannot carry a window, and neither can a provider publishing
+`max_grant_window_s = 0`; either is refused at claim time, naming the bundle or
+the provider that blocked it, instead of succeeding into a window that would
+never open. Touch-free minting inside an open window is still bounded by the
+provider alias's own `assertion_reuse_s`: a window can only shorten reuse, never
+create it.
+
+Renewal is re-granting. A windowed claim always advances the claim generation,
+even when it is byte-identical to the one it replaces, because providers re-read
+a claim only when its generation changes and would otherwise keep authorising
+against the old anchor.
+
+Expiry is a state, not a failure: when the window closes the next mint simply
+costs a touch again. Nothing is released, nothing is refused, and the claim
+stays exactly as it was. The origin says so out loud — a desktop and ntfy notice
+two minutes before the close (skipped for grants shorter than four minutes,
+which would announce their own opening) and another at expiry, both honouring
+the ordinary notification policy and both journalled either way.
+
+Releasing the claim closes the window at both ends. Every path that retires a
+claim — explicit release, owner detach, a provider observing the change on its
+own side, and a refreshed workspace mirror whose claim vanished or changed
+generation — tells the provider's pivbd to drop the assertions it still holds
+for that claim. That call is best-effort and asynchronous: the claim change is
+already durable when it runs, so a pivbd that is absent, older, or failing costs
+a journal line and nothing else, and the worst case is a grant that expires on
+its own inside the provider.
 
 The credential environment is fixed when the zmx backend is created, not when a
 view attaches or a provider changes. Every new local or remote pane receives the
@@ -832,8 +898,9 @@ may contain source code, prompts, paths, or secrets.
    pivbd to zka's cooperative card lease when both use the same smart card.
 4. Keep desktop notification delivery or the mandatory ntfy fallback working;
    check it before relying on remote signing.
-5. Claim the smallest bundle only while needed, release it afterward, and never
-   combine zka bundles with OpenSSH `ForwardAgent`.
+5. Claim the smallest bundle, with the shortest grant window that covers the
+   task, only while needed; release it afterward, and never combine zka bundles
+   with OpenSSH `ForwardAgent`.
 6. Use `zka workspace credentials status --json`, `zka doctor --origin HOST`,
    and `journalctl --user-unit zkad` to audit claims, key backing, transport,
    active credential operations, and degraded paths.
@@ -1314,14 +1381,20 @@ routing the new pane through zka.
 
 ## Project status
 
-Version 0.9.3 combines three systems: durable Kitty-native workspaces, Codex and
+Version 0.10.0 combines three systems: durable Kitty-native workspaces, Codex and
 Claude Code attention routing, and reconnect-safe remote credential bundles.
 The current tree extends those bundles with workspace-owned PIVB routes while
 preserving the fixed-alias sandbox ABI. It also includes remote mirrors and two-phase
 moves, headless origins, Waybar streaming, desktop/ntfy notifications, and
-durable cleanup after partial failures. Version 0.9.3 makes repeated local
-activation a true no-op for an existing claim and reports whole-bundle endpoint
-health before a launcher starts its sandbox. It retains inherited SSH and GnuPG
+durable cleanup after partial failures. Version 0.10.0 adds operator grant
+windows to PIVB credential claims — a claim-anchored, provider-clamped span in
+which one YubiKey touch covers identical mints — and speaks PIVB forwarding
+protocol 3 and daemon/remote protocol 15, so pivb 0.5.0 and zka 0.10.0 must be
+deployed together and every PIVB bundle released and re-claimed afterward.
+Repeated local activation of an existing claim remains a true no-op unless it
+carries a window, which is always a fresh grant, and endpoint health is still
+reported for the whole bundle before a launcher starts its sandbox. It retains
+inherited SSH and GnuPG
 credentials in locally created panes, inventories ambiguous v0.8.0 pane
 environments before recreation, and recovers Focus actions from stale compositor
 environment hints while keeping the underlying session problem visible as a

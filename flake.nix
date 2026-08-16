@@ -11,7 +11,7 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      releaseVersion = "0.9.3";
+      releaseVersion = "0.10.0";
     in
     {
       # kitty and python3 are what the differential session-parser oracle in
