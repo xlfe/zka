@@ -388,10 +388,30 @@ func samePIVBPolicy(bundle CredentialBundleConfig, manifest *CredentialPIVBManif
 	return sameStringSet(want, got) && validatePIVBCard(manifest.Card) == nil
 }
 
+// pivbGrantWindow resolves a claim's operator grant into the pair the wire
+// carries. The requested window travels, not the clamped one: the provider
+// computes its own minimum against its live configuration, so the request is
+// what the wire has to say and the response is what actually happened. A grant
+// that has already closed is stamped as no window at all — the provider treats
+// an expired deadline as windowless anyway, and sending the pair only while it
+// is live keeps the both-or-neither wire rule true without a second clock.
+func pivbGrantWindow(windowSeconds int64, anchor, now time.Time) (int64, int64) {
+	if windowSeconds <= 0 {
+		return 0, 0
+	}
+	deadline := anchor.Add(time.Duration(windowSeconds) * time.Second)
+	if !deadline.After(now) {
+		return 0, 0
+	}
+	return windowSeconds, deadline.Unix()
+}
+
 // proxyPIVBMint is ZKA's semantic adapter. It accepts exactly one mint
 // request, enforces the bundle alias allowlist, injects authenticated route
-// and card identity, and forwards it to the local networkless pivbd.
-func (d *Daemon) proxyPIVBMint(ctx context.Context, stream net.Conn, workspace, bundleName string, generation uint64, ownerAttachment, originNode string, manifest *CredentialPIVBManifest) error {
+// and card identity, and forwards it to the local networkless pivbd. The
+// window pair is the claim's, never the caller's: windowSeconds is what the
+// operator asked for and grantAnchor is the claim write the grant opens from.
+func (d *Daemon) proxyPIVBMint(ctx context.Context, stream net.Conn, workspace, bundleName string, generation uint64, ownerAttachment, originNode string, manifest *CredentialPIVBManifest, windowSeconds int64, grantAnchor time.Time) error {
 	if manifest == nil {
 		return errors.New("PIVB claim has no manifest")
 	}
@@ -438,10 +458,12 @@ func (d *Daemon) proxyPIVBMint(ctx context.Context, stream net.Conn, workspace, 
 	d.mu.Lock()
 	providerNode := d.state.Node.ID
 	d.mu.Unlock()
+	grantWindow, grantDeadline := pivbGrantWindow(windowSeconds, grantAnchor, time.Now())
 	mint.ForwardContext = pivbForwardContext{
 		OriginNodeID: originNode, WorkspaceID: workspace, Bundle: bundleName,
 		ClaimGeneration: generation, ProviderNodeID: providerNode,
 		ProviderAttachID: ownerAttachment, OperationID: operationID,
+		WindowSeconds: grantWindow, WindowDeadline: grantDeadline,
 	}
 	encoded, err := json.Marshal(mint)
 	if err != nil {

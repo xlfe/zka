@@ -49,6 +49,7 @@ func (d *Daemon) credentialRouteLoop(ctx context.Context) {
 	defer d.closeAllCredentialRoutes()
 	for {
 		d.reconcileCredentialRoutes(ctx)
+		d.checkCredentialWindowNotices(time.Now())
 		select {
 		case <-ctx.Done():
 			return
@@ -349,7 +350,7 @@ func (d *Daemon) serveLocalCredentialRoute(ctx context.Context, client net.Conn,
 		_ = d.filterOpenPGPStream(ctx, "", hello, manifest, client)
 	case credentialCapabilityPIVB:
 		if claim.PIVB != nil {
-			_ = d.proxyPIVBMint(ctx, client, hello.Workspace, hello.Bundle, hello.Generation, claim.OwnerAttachmentID, claim.OwnerNodeID, claim.PIVB)
+			_ = d.proxyPIVBMint(ctx, client, hello.Workspace, hello.Bundle, hello.Generation, claim.OwnerAttachmentID, claim.OwnerNodeID, claim.PIVB, claim.WindowSeconds, claim.UpdatedAt)
 		}
 	}
 }
@@ -376,9 +377,14 @@ func (d *Daemon) serveRemoteCredentialRoute(ctx context.Context, client net.Conn
 		// has to travel to the provider concurrently (HTTP clients do not close
 		// the connection after writing a request).
 		go func() { _, _ = io.Copy(stream, client) }()
+		// The origin stamps the same window pair the provider will stamp from its
+		// mirror of this claim, so the forward context the pane reads back reports
+		// the grant the mint was actually made under.
+		grantWindow, grantDeadline := pivbGrantWindow(claim.WindowSeconds, claim.UpdatedAt, time.Now())
 		ctx := pivbForwardContext{
 			OriginNodeID: originNodeID, WorkspaceID: hello.Workspace, Bundle: hello.Bundle,
 			ClaimGeneration: hello.Generation, ProviderNodeID: claim.OwnerNodeID, ProviderAttachID: claim.OwnerAttachmentID,
+			WindowSeconds: grantWindow, WindowDeadline: grantDeadline,
 		}
 		if bound, succeeded := proxyRemotePIVBResponse(stream, client, claim.PIVB.Card, ctx); succeeded {
 			d.logger.Printf("PIVB route mint succeeded attachment_mode=route-required protocol=%d route=remote workspace=%s bundle=%s generation=%d provider_node=%s provider_attachment=%s operation=%s",

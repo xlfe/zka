@@ -63,6 +63,7 @@ type fakePIVBProvider struct {
 	card           CredentialPIVBCard
 	maxGrantWindow int64
 	invalidated    chan pivbInvalidateRequest
+	minted         chan pivbMintRequest
 }
 
 const fakePIVBProviderResource = "projects/1/locations/global/workloadIdentityPools/pool/providers/provider"
@@ -71,7 +72,7 @@ func newFakePIVBProvider(t *testing.T, maxGrantWindowSeconds int64) *fakePIVBPro
 	t.Helper()
 	provider := &fakePIVBProvider{
 		card: testPIVBCard(t), maxGrantWindow: maxGrantWindowSeconds,
-		invalidated: make(chan pivbInvalidateRequest, 8),
+		invalidated: make(chan pivbInvalidateRequest, 8), minted: make(chan pivbMintRequest, 8),
 	}
 	aliases := map[string]CredentialPIVBAlias{"ro": {Target: "ro@example.iam.gserviceaccount.com"}}
 	handler := http.NewServeMux()
@@ -89,6 +90,27 @@ func newFakePIVBProvider(t *testing.T, maxGrantWindowSeconds int64) *fakePIVBPro
 			EnrolledKeys:    []pivbEnrolledKey{{Serial: provider.card.Serial, KeyID: provider.card.KeyID}},
 			MaxGrantWindowS: maxGrantWindowSeconds,
 		})
+	})
+	// Minting a real token needs the card this fake does not have, so the mint
+	// endpoint records what a route forwarded and then refuses. Every caller of
+	// this provider is testing what reached it, not what came back.
+	handler.HandleFunc("POST /v1/mint", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(io.LimitReader(r.Body, pivbForwardBodyMax))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var request pivbMintRequest
+		if err := decodeStrictJSON(body, &request); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		select {
+		case provider.minted <- request:
+		default:
+		}
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":"locked","code":"PIVB_LOCKED"}`)
 	})
 	handler.HandleFunc("POST /v1/invalidate", func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(io.LimitReader(r.Body, pivbForwardBodyMax))
@@ -117,6 +139,17 @@ func (p *fakePIVBProvider) manifest() *CredentialPIVBManifest {
 		IssuerURI: "https://issuer.example", Card: p.card,
 		Aliases:         map[string]CredentialPIVBAlias{"ro": {Target: "ro@example.iam.gserviceaccount.com"}},
 		MaxGrantWindowS: p.maxGrantWindow,
+	}
+}
+
+func (p *fakePIVBProvider) nextMint(t *testing.T) pivbMintRequest {
+	t.Helper()
+	select {
+	case request := <-p.minted:
+		return request
+	case <-time.After(3 * time.Second):
+		t.Fatal("PIVB provider received no mint request")
+		return pivbMintRequest{}
 	}
 }
 
@@ -333,12 +366,11 @@ func TestPIVBProxyInjectsClaimedIdentityAndContext(t *testing.T) {
 	defer client.Close()
 	done := make(chan error, 1)
 	go func() {
-		done <- d.proxyPIVBMint(context.Background(), server, "workspace", "work", 7, "attachment", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", manifest)
+		done <- d.proxyPIVBMint(context.Background(), server, "workspace", "work", 7, "attachment", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", manifest, 0, time.Time{})
 	}()
 	// The pane supplies a card, a route context and a grant window; every one
 	// of them is the daemon's to stamp, so none may survive to the provider.
-	requestBody := `{"version":3,"alias":"ro","external_account_audience":"audience","impersonated_email":"ro@example","request_source":{"kind":"agent-session","label":"codex:project/ro","session_id":"0123456789abcdef0123456789abcdef"},"expected_card":{"serial":0,"jwk_kid":"","spki_der":null},"forward_context":{"origin_node_id":"attacker","workspace_id":"attacker","bundle":"attacker","claim_generation":99,"provider_node_id":"attacker","operation_id":"attacker","window_s":86400,"window_deadline":4102444800}}`
-	req, _ := http.NewRequest(http.MethodPost, "http://pivb-forward/v1/mint", strings.NewReader(requestBody))
+	req, _ := http.NewRequest(http.MethodPost, "http://pivb-forward/v1/mint", strings.NewReader(pivbGreedyMintRequest))
 	if err := req.Write(client); err != nil {
 		t.Fatal(err)
 	}
@@ -354,14 +386,103 @@ func TestPIVBProxyInjectsClaimedIdentityAndContext(t *testing.T) {
 	if got.ExpectedCard.Serial != card.Serial || got.ForwardContext.WorkspaceID != "workspace" || got.ForwardContext.ClaimGeneration != 7 || got.ForwardContext.OperationID == "" {
 		t.Fatalf("injected request = %#v", got)
 	}
-	// No claim window is plumbed through yet, so the stamped context carries
-	// none; what matters here is that the pane's window did not become one.
+	// This claim carries no window, so the stamped context carries none; what
+	// matters here is that the pane's window did not become one.
 	if got.ForwardContext.WindowSeconds != 0 || got.ForwardContext.WindowDeadline != 0 {
 		t.Fatalf("pane-supplied grant window survived into the forwarded request: %#v", got.ForwardContext)
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+}
+
+// The pane sends a mint request that asks for a day-long window anchored to
+// the year 2100. Every stamped test below reuses it: whatever the claim's grant
+// turns out to be, none of these values may reach the provider.
+const pivbGreedyMintRequest = `{"version":3,"alias":"ro","external_account_audience":"audience","impersonated_email":"ro@example","request_source":{"kind":"agent-session","label":"codex:project/ro","session_id":"0123456789abcdef0123456789abcdef"},"expected_card":{"serial":0,"jwk_kid":"","spki_der":null},"forward_context":{"origin_node_id":"attacker","workspace_id":"attacker","bundle":"attacker","claim_generation":99,"provider_node_id":"attacker","operation_id":"attacker","window_s":86400,"window_deadline":4102444800}}`
+
+func TestPIVBProxyStampsClaimGrantWindowNotThePanes(t *testing.T) {
+	live := time.Now().Add(-30 * time.Second)
+	tests := []struct {
+		name          string
+		windowSeconds int64
+		anchor        time.Time
+		wantWindow    int64
+		wantDeadline  int64
+	}{
+		{
+			name: "live grant", windowSeconds: 900, anchor: live,
+			// The request carries what the operator asked for, anchored to the
+			// claim. What the provider grants against its own live configuration
+			// comes back in the response, not from here.
+			wantWindow: 900, wantDeadline: live.Add(900 * time.Second).Unix(),
+		},
+		{
+			// An expired grant is stamped as no grant: pivbd treats a closed
+			// deadline as windowless anyway, and a half-filled pair would trip its
+			// both-or-neither check.
+			name: "expired grant", windowSeconds: 900, anchor: time.Now().Add(-2 * time.Hour),
+		},
+		{name: "no grant", anchor: time.Now()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := runPIVBProxyMint(t, pivbGreedyMintRequest, test.windowSeconds, test.anchor)
+			if got.ForwardContext.WindowSeconds != test.wantWindow || got.ForwardContext.WindowDeadline != test.wantDeadline {
+				t.Fatalf("stamped window = %d/%d, want %d/%d", got.ForwardContext.WindowSeconds,
+					got.ForwardContext.WindowDeadline, test.wantWindow, test.wantDeadline)
+			}
+			if got.ForwardContext.WorkspaceID != "workspace" || got.ForwardContext.ClaimGeneration != 7 {
+				t.Fatalf("stamped route identity = %#v", got.ForwardContext)
+			}
+		})
+	}
+}
+
+// runPIVBProxyMint drives one mint through the proxy and reports what the
+// provider received. The provider answers 409 rather than a token because only
+// the forwarded request is under test here.
+func runPIVBProxyMint(t *testing.T, requestBody string, windowSeconds int64, grantAnchor time.Time) pivbMintRequest {
+	t.Helper()
+	received := make(chan pivbMintRequest, 1)
+	handler := http.NewServeMux()
+	handler.HandleFunc("POST /v1/mint", func(w http.ResponseWriter, r *http.Request) {
+		var request pivbMintRequest
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		received <- request
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":"locked","code":"PIVB_LOCKED"}`)
+	})
+	var cfg Config
+	cfg.Credentials.PIVB.ForwardSocket = serveFakePIVB(t, handler)
+	d := &Daemon{config: cfg, state: StateData{Node: Host{ID: strings.Repeat("a", 32)}}, credentialActive: map[string]int{}}
+	manifest := &CredentialPIVBManifest{
+		ProtocolVersion: pivbForwardProtocolVersion,
+		Aliases:         map[string]CredentialPIVBAlias{"ro": {Target: "ro@example"}}, Card: testPIVBCard(t),
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- d.proxyPIVBMint(context.Background(), server, "workspace", "work", 7, "attachment",
+			strings.Repeat("b", 32), manifest, windowSeconds, grantAnchor)
+	}()
+	req, err := http.NewRequest(http.MethodPost, "http://pivb-forward/v1/mint", strings.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := req.Write(client); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(client), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	return <-received
 }
 
 // Version skew has one remedy — upgrade both sides — and it has to be the one
@@ -379,7 +500,7 @@ func TestPIVBProxyReportsVersionSkewAsAnUpgradeBeforeProvider(t *testing.T) {
 	defer client.Close()
 	done := make(chan error, 1)
 	go func() {
-		done <- d.proxyPIVBMint(context.Background(), server, "workspace", "work", 1, "", strings.Repeat("b", 32), manifest)
+		done <- d.proxyPIVBMint(context.Background(), server, "workspace", "work", 1, "", strings.Repeat("b", 32), manifest, 0, time.Time{})
 	}()
 	body := `{"version":2,"alias":"ro","external_account_audience":"audience","impersonated_email":"ro@example","request_source":{"kind":"agent-session","label":"codex:project/ro","session_id":"0123456789abcdef0123456789abcdef"},"retired_v2_field":true}`
 	req, _ := http.NewRequest(http.MethodPost, "http://pivb-forward/v1/mint", strings.NewReader(body))
@@ -426,7 +547,7 @@ func TestPIVBProxyRejectsAliasOutsideBundleBeforeProvider(t *testing.T) {
 	defer client.Close()
 	done := make(chan error, 1)
 	go func() {
-		done <- d.proxyPIVBMint(context.Background(), server, "workspace", "work", 1, "", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", manifest)
+		done <- d.proxyPIVBMint(context.Background(), server, "workspace", "work", 1, "", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", manifest, 0, time.Time{})
 	}()
 	body := `{"version":3,"alias":"deploy","external_account_audience":"audience","impersonated_email":"deploy@example","request_source":{"kind":"agent-session","label":"codex:project/deploy","session_id":"0123456789abcdef0123456789abcdef"}}`
 	req, _ := http.NewRequest(http.MethodPost, "http://pivb-forward/v1/mint", strings.NewReader(body))
@@ -669,7 +790,7 @@ func TestPIVBProxyCancelsLocalMintWhenClientDisconnects(t *testing.T) {
 	client, server := net.Pipe()
 	done := make(chan error, 1)
 	go func() {
-		done <- d.proxyPIVBMint(context.Background(), server, "workspace", "work", 7, "", strings.Repeat("b", 32), manifest)
+		done <- d.proxyPIVBMint(context.Background(), server, "workspace", "work", 7, "", strings.Repeat("b", 32), manifest, 0, time.Time{})
 	}()
 	body, err := json.Marshal(pivbMintRequest{
 		Version: pivbForwardProtocolVersion, Alias: "ro", ExternalAccountAudience: "audience", ImpersonatedEmail: "ro@example",
@@ -700,6 +821,127 @@ func TestPIVBProxyCancelsLocalMintWhenClientDisconnects(t *testing.T) {
 	case <-cancelled:
 	case <-time.After(3 * time.Second):
 		t.Fatal("local PIVB provider was not cancelled after client disconnect")
+	}
+}
+
+// The stamp has to survive the whole local route, not just the proxy: the pane
+// gets whatever window the claim carried at the moment of the mint.
+func TestLocalPIVBRouteStampsTheClaimedGrantWindow(t *testing.T) {
+	d, provider, workspace, owner := windowedCredentialDaemon(t, 3600)
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", owner.ID, 900); err != nil {
+		t.Fatal(err)
+	}
+	claim := credentialClaimSnapshot(t, d, workspace.ID)
+	windowed := runPIVBRouteMint(t, d, provider, workspace.ID)
+	if want := claim.UpdatedAt.Add(900 * time.Second).Unix(); windowed.ForwardContext.WindowSeconds != 900 || windowed.ForwardContext.WindowDeadline != want {
+		t.Fatalf("routed window = %d/%d, want 900/%d anchored to the claim written at %s",
+			windowed.ForwardContext.WindowSeconds, windowed.ForwardContext.WindowDeadline, want, claim.UpdatedAt)
+	}
+	if windowed.ForwardContext.ClaimGeneration != claim.Generation {
+		t.Fatalf("routed generation = %d, want the claim's %d", windowed.ForwardContext.ClaimGeneration, claim.Generation)
+	}
+
+	// Re-claiming windowlessly closes the window for the next mint immediately,
+	// without waiting for the old deadline to pass.
+	if _, err := d.activateLocalCredentialBundle(context.Background(), workspace.ID, "work", false, "", owner.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	closed := runPIVBRouteMint(t, d, provider, workspace.ID)
+	if closed.ForwardContext.WindowSeconds != 0 || closed.ForwardContext.WindowDeadline != 0 {
+		t.Fatalf("windowless re-claim still routed a window: %#v", closed.ForwardContext)
+	}
+}
+
+func runPIVBRouteMint(t *testing.T, d *Daemon, provider *fakePIVBProvider, workspaceID string) pivbMintRequest {
+	t.Helper()
+	client, server := net.Pipe()
+	defer client.Close()
+	listener := &credentialRouteListener{workspace: workspaceID, capability: credentialCapabilityPIVB, active: map[net.Conn]uint64{}}
+	go func() {
+		defer server.Close()
+		d.serveCredentialRoute(context.Background(), listener, server)
+	}()
+	req, err := http.NewRequest(http.MethodPost, "http://pivb-forward/v1/mint", strings.NewReader(pivbGreedyMintRequest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := req.Write(client); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(client), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("routed mint status = %d, want the fake provider's refusal", resp.StatusCode)
+	}
+	return provider.nextMint(t)
+}
+
+// A provider whose PIVB policy has moved out from under a claim used to drop
+// the connection, which reaches the pane as a transport error with no remedy.
+func TestRemotePIVBRouteRefusesAStaleClaimedManifest(t *testing.T) {
+	provider := newFakePIVBProvider(t, 3600)
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.config.Credentials.Bundles = map[string]CredentialBundleConfig{"work": pivbCredentialBundle()}
+	d.config.Credentials.PIVB.ForwardSocket = provider.socket
+	stale := provider.manifest()
+	stale.Aliases = map[string]CredentialPIVBAlias{"deploy": {Target: "deploy@example.iam.gserviceaccount.com"}}
+	remote := &Workspace{
+		ID: "0123456789abcdef0123456789abcdef", Name: "reviewer",
+		Origin: Host{ID: "origin-node", Name: "devbox"},
+		Panes:  map[string]*Pane{}, Attachments: map[string]*Attachment{},
+		CredentialClaim: &CredentialClaim{
+			ProviderSource: "remote", Bundle: "work", OwnerNodeID: d.state.Node.ID, Generation: 4, State: "ready",
+			Capabilities: map[string]CredentialCapabilityStatus{credentialCapabilityPIVB: {State: "ready", Available: true}},
+			PIVB:         stale,
+		},
+	}
+	if _, err := d.cacheRemoteWorkspace("devbox", remote); err != nil {
+		t.Fatal(err)
+	}
+
+	client, server := net.Pipe()
+	defer client.Close()
+	go func() {
+		defer server.Close()
+		d.handleCredentialStream(context.Background(), "devbox", server)
+	}()
+	hello := credentialStreamHello{Workspace: remote.ID, Bundle: "work", Capability: credentialCapabilityPIVB, Generation: 4}
+	if err := writeCredentialStreamHello(client, hello); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refusal struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := decodeStrictJSON(body, &refusal); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusForbidden || refusal.Code != "PIVB_CONFIG" ||
+		!strings.Contains(refusal.Error, "release and re-claim") {
+		t.Fatalf("stale manifest response = %d %s", resp.StatusCode, body)
+	}
+	select {
+	case request := <-provider.minted:
+		t.Fatalf("a stale claim reached the PIVB provider: %#v", request)
+	default:
 	}
 }
 

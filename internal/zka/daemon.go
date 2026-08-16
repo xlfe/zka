@@ -77,6 +77,7 @@ type Daemon struct {
 	credentialOpenPGP     map[string]*credentialOpenPGPManifest
 	credentialActive      map[string]int
 	credentialNotices     map[string]credentialNoticeState
+	credentialWindowState map[string]*credentialWindowNoticeState
 	credentialTransports  map[string]incomingCredentialTransport
 	credentialClaims      map[string]*sync.Mutex
 	credentialRoutes      map[string]*credentialRouteListener
@@ -192,6 +193,7 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 		credentialOpenPGP:         map[string]*credentialOpenPGPManifest{},
 		credentialActive:          map[string]int{},
 		credentialNotices:         map[string]credentialNoticeState{},
+		credentialWindowState:     map[string]*credentialWindowNoticeState{},
 		credentialTransports:      map[string]incomingCredentialTransport{},
 		credentialClaims:          map[string]*sync.Mutex{},
 		credentialRoutes:          map[string]*credentialRouteListener{},

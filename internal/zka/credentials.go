@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -916,6 +917,11 @@ func (d *Daemon) handleCredentialStream(ctx context.Context, host string, stream
 		return
 	case credentialCapabilityPIVB:
 		if !bundle.PIVB.Enable || claim.PIVB == nil || !samePIVBPolicy(bundle, claim.PIVB) {
+			// Only the operator can repair a claim this provider no longer honours,
+			// so the stream has to say so. Dropping the connection left the pane
+			// with a transport error and no remedy to act on.
+			_ = writePIVBProxyError(stream, http.StatusForbidden, "PIVB_CONFIG",
+				"claimed PIVB manifest does not match this provider's policy or protocol; release and re-claim the credential bundle")
 			return
 		}
 		d.mu.Lock()
@@ -929,7 +935,7 @@ func (d *Daemon) handleCredentialStream(ctx context.Context, host string, stream
 		if originNode == "" {
 			return
 		}
-		_ = d.proxyPIVBMint(ctx, stream, hello.Workspace, hello.Bundle, hello.Generation, "", originNode, claim.PIVB)
+		_ = d.proxyPIVBMint(ctx, stream, hello.Workspace, hello.Bundle, hello.Generation, "", originNode, claim.PIVB, claim.WindowSeconds, claim.UpdatedAt)
 		return
 	default:
 		return
