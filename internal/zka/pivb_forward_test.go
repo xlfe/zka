@@ -80,14 +80,32 @@ func TestPIVBBundleConfigRequiresAliasAllowlist(t *testing.T) {
 	}
 }
 
-func TestPIVBForwardProtocolV2GoldenFixture(t *testing.T) {
-	raw, err := os.ReadFile("testdata/pivb_forward_v2.json")
+// ZKA does not call POST /v1/invalidate yet, but the golden fixture is shared
+// byte-for-byte with PIVB's copy at internal/forwardapi/testdata, so its shape
+// is pinned here now to keep the two repos from drifting apart.
+type pivbInvalidateRequestGolden struct {
+	Version         int    `json:"version"`
+	WorkspaceID     string `json:"workspace_id"`
+	ClaimGeneration uint64 `json:"claim_generation"`
+}
+
+type pivbInvalidateResponseGolden struct {
+	Version int `json:"version"`
+	Purged  int `json:"purged"`
+}
+
+func TestPIVBForwardProtocolV3GoldenFixture(t *testing.T) {
+	raw, err := os.ReadFile("testdata/pivb_forward_v3.json")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var fixture struct {
-		MintRequest  json.RawMessage `json:"mint_request"`
-		MintResponse json.RawMessage `json:"mint_response"`
+		MintRequest        json.RawMessage `json:"mint_request"`
+		MintResponse       json.RawMessage `json:"mint_response"`
+		Policy             json.RawMessage `json:"policy"`
+		Description        json.RawMessage `json:"description"`
+		InvalidateRequest  json.RawMessage `json:"invalidate_request"`
+		InvalidateResponse json.RawMessage `json:"invalidate_response"`
 	}
 	if err := decodeStrictJSON(raw, &fixture); err != nil {
 		t.Fatal(err)
@@ -95,13 +113,33 @@ func TestPIVBForwardProtocolV2GoldenFixture(t *testing.T) {
 
 	var request pivbMintRequest
 	assertPIVBForwardGoldenValue(t, fixture.MintRequest, &request)
-	if request.Version != pivbForwardProtocolVersion {
-		t.Fatalf("golden request version = %d, want %d", request.Version, pivbForwardProtocolVersion)
-	}
 	var response pivbMintResponse
 	assertPIVBForwardGoldenValue(t, fixture.MintResponse, &response)
-	if response.Version != pivbForwardProtocolVersion {
-		t.Fatalf("golden response version = %d, want %d", response.Version, pivbForwardProtocolVersion)
+	var policy pivbForwardPolicy
+	assertPIVBForwardGoldenValue(t, fixture.Policy, &policy)
+	var description pivbForwardDescription
+	assertPIVBForwardGoldenValue(t, fixture.Description, &description)
+	var invalidateRequest pivbInvalidateRequestGolden
+	assertPIVBForwardGoldenValue(t, fixture.InvalidateRequest, &invalidateRequest)
+	var invalidateResponse pivbInvalidateResponseGolden
+	assertPIVBForwardGoldenValue(t, fixture.InvalidateResponse, &invalidateResponse)
+
+	for name, version := range map[string]int{
+		"mint request": request.Version, "mint response": response.Version,
+		"policy": policy.Version, "description": description.Version,
+		"invalidate request": invalidateRequest.Version, "invalidate response": invalidateResponse.Version,
+	} {
+		if version != pivbForwardProtocolVersion {
+			t.Errorf("golden %s version = %d, want %d", name, version, pivbForwardProtocolVersion)
+		}
+	}
+	// Every protocol 3 addition is omitempty, so only non-zero fixture values
+	// prove the fields reach the wire at all.
+	if request.ForwardContext.WindowSeconds == 0 || request.ForwardContext.WindowDeadline == 0 ||
+		response.GrantedWindowSeconds == 0 || response.GrantedWindowDeadline == 0 ||
+		policy.MaxGrantWindowS == 0 || description.MaxGrantWindowS == 0 ||
+		policy.Aliases["deploy"].AssertionLifetimeS == 0 || description.Aliases["deploy"].AssertionLifetimeS == 0 {
+		t.Fatal("golden fixture does not pin the protocol 3 window and assertion-lifetime fields")
 	}
 }
 
@@ -145,8 +183,11 @@ func TestBuildPIVBManifestFiltersAliasesAndPinsCard(t *testing.T) {
 	handler.HandleFunc("GET /v1/describe", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(pivbForwardDescription{
 			Version: pivbForwardProtocolVersion, ProviderResource: "projects/1/locations/global/workloadIdentityPools/pool/providers/provider",
-			IssuerURI: "https://issuer.example", Card: card,
-			Aliases: map[string]CredentialPIVBAlias{"ro": {Target: "ro@example.iam.gserviceaccount.com"}, "deploy": {Target: "deploy@example.iam.gserviceaccount.com"}},
+			IssuerURI: "https://issuer.example", Card: card, MaxGrantWindowS: 3600,
+			Aliases: map[string]CredentialPIVBAlias{
+				"ro":     {Target: "ro@example.iam.gserviceaccount.com", AssertionLifetimeS: 900},
+				"deploy": {Target: "deploy@example.iam.gserviceaccount.com", AssertionLifetimeS: 60},
+			},
 		})
 	})
 	var cfg Config
@@ -157,6 +198,12 @@ func TestBuildPIVBManifestFiltersAliasesAndPinsCard(t *testing.T) {
 	}
 	if manifest.Card.Serial != card.Serial || manifest.Card.KeyID != card.KeyID || len(manifest.Aliases) != 1 || manifest.Aliases["ro"].Target == "" {
 		t.Fatalf("manifest = %#v", manifest)
+	}
+	// What the provider advertises about windows and assertion reuse has to
+	// survive into the persisted claim; a later mint is authorised against the
+	// manifest, not against a fresh describe.
+	if manifest.MaxGrantWindowS != 3600 || manifest.Aliases["ro"].AssertionLifetimeS != 900 {
+		t.Fatalf("manifest dropped the protocol 3 advertisements: %#v", manifest)
 	}
 }
 
@@ -203,7 +250,9 @@ func TestPIVBProxyInjectsClaimedIdentityAndContext(t *testing.T) {
 	go func() {
 		done <- d.proxyPIVBMint(context.Background(), server, "workspace", "work", 7, "attachment", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", manifest)
 	}()
-	requestBody := `{"version":2,"alias":"ro","external_account_audience":"audience","impersonated_email":"ro@example","request_source":{"kind":"agent-session","label":"codex:project/ro","session_id":"0123456789abcdef0123456789abcdef"},"expected_card":{"serial":0,"jwk_kid":"","spki_der":null},"forward_context":{"origin_node_id":"","workspace_id":"","bundle":"","claim_generation":0,"provider_node_id":"","operation_id":""}}`
+	// The pane supplies a card, a route context and a grant window; every one
+	// of them is the daemon's to stamp, so none may survive to the provider.
+	requestBody := `{"version":3,"alias":"ro","external_account_audience":"audience","impersonated_email":"ro@example","request_source":{"kind":"agent-session","label":"codex:project/ro","session_id":"0123456789abcdef0123456789abcdef"},"expected_card":{"serial":0,"jwk_kid":"","spki_der":null},"forward_context":{"origin_node_id":"attacker","workspace_id":"attacker","bundle":"attacker","claim_generation":99,"provider_node_id":"attacker","operation_id":"attacker","window_s":86400,"window_deadline":4102444800}}`
 	req, _ := http.NewRequest(http.MethodPost, "http://pivb-forward/v1/mint", strings.NewReader(requestBody))
 	if err := req.Write(client); err != nil {
 		t.Fatal(err)
@@ -219,6 +268,61 @@ func TestPIVBProxyInjectsClaimedIdentityAndContext(t *testing.T) {
 	got := <-received
 	if got.ExpectedCard.Serial != card.Serial || got.ForwardContext.WorkspaceID != "workspace" || got.ForwardContext.ClaimGeneration != 7 || got.ForwardContext.OperationID == "" {
 		t.Fatalf("injected request = %#v", got)
+	}
+	// No claim window is plumbed through yet, so the stamped context carries
+	// none; what matters here is that the pane's window did not become one.
+	if got.ForwardContext.WindowSeconds != 0 || got.ForwardContext.WindowDeadline != 0 {
+		t.Fatalf("pane-supplied grant window survived into the forwarded request: %#v", got.ForwardContext)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Version skew has one remedy — upgrade both sides — and it has to be the one
+// the operator reads. Before the version peek, a protocol 2 body failed strict
+// decoding first and was reported as a malformed request.
+func TestPIVBProxyReportsVersionSkewAsAnUpgradeBeforeProvider(t *testing.T) {
+	providerCalled := make(chan struct{}, 1)
+	handler := http.NewServeMux()
+	handler.HandleFunc("POST /v1/mint", func(http.ResponseWriter, *http.Request) { providerCalled <- struct{}{} })
+	var cfg Config
+	cfg.Credentials.PIVB.ForwardSocket = serveFakePIVB(t, handler)
+	d := &Daemon{config: cfg, state: StateData{Node: Host{ID: strings.Repeat("a", 32)}}, credentialActive: map[string]int{}}
+	manifest := &CredentialPIVBManifest{ProtocolVersion: pivbForwardProtocolVersion, Aliases: map[string]CredentialPIVBAlias{"ro": {Target: "ro@example"}}, Card: testPIVBCard(t)}
+	client, server := net.Pipe()
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- d.proxyPIVBMint(context.Background(), server, "workspace", "work", 1, "", strings.Repeat("b", 32), manifest)
+	}()
+	body := `{"version":2,"alias":"ro","external_account_audience":"audience","impersonated_email":"ro@example","request_source":{"kind":"agent-session","label":"codex:project/ro","session_id":"0123456789abcdef0123456789abcdef"},"retired_v2_field":true}`
+	req, _ := http.NewRequest(http.MethodPost, "http://pivb-forward/v1/mint", strings.NewReader(body))
+	if err := req.Write(client); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(client), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	var result struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := decodeStrictJSON(responseBody, &result); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || result.Code != "PIVB_CONFIG" ||
+		!strings.Contains(result.Error, "speaks forwarding protocol 2") ||
+		!strings.Contains(result.Error, "upgrade PIVB and ZKA together") {
+		t.Fatalf("version-skew response = %d %s", resp.StatusCode, responseBody)
+	}
+	select {
+	case <-providerCalled:
+		t.Fatal("a skewed mint request reached the PIVB provider")
+	default:
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -239,7 +343,7 @@ func TestPIVBProxyRejectsAliasOutsideBundleBeforeProvider(t *testing.T) {
 	go func() {
 		done <- d.proxyPIVBMint(context.Background(), server, "workspace", "work", 1, "", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", manifest)
 	}()
-	body := `{"version":2,"alias":"deploy","external_account_audience":"audience","impersonated_email":"deploy@example","request_source":{"kind":"agent-session","label":"codex:project/deploy","session_id":"0123456789abcdef0123456789abcdef"}}`
+	body := `{"version":3,"alias":"deploy","external_account_audience":"audience","impersonated_email":"deploy@example","request_source":{"kind":"agent-session","label":"codex:project/deploy","session_id":"0123456789abcdef0123456789abcdef"}}`
 	req, _ := http.NewRequest(http.MethodPost, "http://pivb-forward/v1/mint", strings.NewReader(body))
 	if err := req.Write(client); err != nil {
 		t.Fatal(err)
@@ -273,6 +377,7 @@ func TestBindPIVBMintResponsePinsCardAndOriginContext(t *testing.T) {
 	raw, err := json.Marshal(pivbMintResponse{
 		Version: pivbForwardProtocolVersion, IDToken: "header.payload.signature", ExpirationTime: 123,
 		Card: providerCard, ExpectedCard: providerCard, ForwardContext: providerContext,
+		GrantedWindowSeconds: 600, GrantedWindowDeadline: 1785586470,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -297,6 +402,11 @@ func TestBindPIVBMintResponsePinsCardAndOriginContext(t *testing.T) {
 		response.ForwardContext.Bundle != trusted.Bundle || response.ForwardContext.ClaimGeneration != trusted.ClaimGeneration ||
 		response.ForwardContext.OperationID != providerContext.OperationID {
 		t.Fatalf("origin did not bind trusted route context: %#v", response.ForwardContext)
+	}
+	// Binding replaces the forwarded context wholesale, which is why what the
+	// provider granted is reported outside it.
+	if response.GrantedWindowSeconds != 600 || response.GrantedWindowDeadline != 1785586470 {
+		t.Fatalf("binding dropped the granted window: %#v", response)
 	}
 }
 

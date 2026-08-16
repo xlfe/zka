@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	pivbForwardProtocolVersion = 2
+	pivbForwardProtocolVersion = 3
 	pivbForwardBodyMax         = 16 << 10
 	pivbForwardResponseMax     = 96 << 10
 )
@@ -39,6 +39,7 @@ type pivbForwardDescription struct {
 	IssuerURI        string                         `json:"issuer_uri"`
 	Aliases          map[string]CredentialPIVBAlias `json:"aliases"`
 	Card             CredentialPIVBCard             `json:"card"`
+	MaxGrantWindowS  int64                          `json:"max_grant_window_s,omitempty"`
 }
 
 type pivbEnrolledKey struct {
@@ -52,6 +53,9 @@ type pivbForwardPolicy struct {
 	IssuerURI        string                         `json:"issuer_uri"`
 	Aliases          map[string]CredentialPIVBAlias `json:"aliases"`
 	EnrolledKeys     []pivbEnrolledKey              `json:"enrolled_keys"`
+	// MaxGrantWindowS is the longest authorisation window the provider will
+	// grant a claim. Zero means the provider grants no windows at all.
+	MaxGrantWindowS int64 `json:"max_grant_window_s,omitempty"`
 }
 
 type pivbForwardSource struct {
@@ -68,6 +72,12 @@ type pivbForwardContext struct {
 	ProviderNodeID   string `json:"provider_node_id"`
 	ProviderAttachID string `json:"provider_attachment_id,omitempty"`
 	OperationID      string `json:"operation_id"`
+	// WindowSeconds is the authorisation window the claim asks the mint to be
+	// covered by, and WindowDeadline is the absolute unix second the claim
+	// anchored it to. Both are stamped by this daemon from claim state, never
+	// accepted from the pane, and travel together or not at all.
+	WindowSeconds  int64 `json:"window_s,omitempty"`
+	WindowDeadline int64 `json:"window_deadline,omitempty"`
 }
 
 type pivbMintRequest struct {
@@ -87,6 +97,11 @@ type pivbMintResponse struct {
 	Card           CredentialPIVBCard `json:"card"`
 	ExpectedCard   CredentialPIVBCard `json:"expected_card"`
 	ForwardContext pivbForwardContext `json:"forward_context"`
+	// The granted window sits outside ForwardContext because binding a
+	// response to the active route replaces the forwarded context wholesale;
+	// what the provider granted has to survive that rewrite.
+	GrantedWindowSeconds  int64 `json:"granted_window_s,omitempty"`
+	GrantedWindowDeadline int64 `json:"granted_window_deadline,omitempty"`
 }
 
 func credentialPIVBForwardSocket(cfg Config) string {
@@ -137,8 +152,11 @@ func buildPIVBManifest(ctx context.Context, cfg Config, aliases []string) (*Cred
 	if err := decodeStrictJSON(body, &description); err != nil {
 		return nil, fmt.Errorf("decode PIVB provider description: %w", err)
 	}
-	if description.Version != pivbForwardProtocolVersion || description.ProviderResource == "" || description.IssuerURI == "" {
-		return nil, errors.New("PIVB provider description is incomplete or incompatible")
+	if description.Version != pivbForwardProtocolVersion {
+		return nil, errors.New(pivbForwardVersionSkew("PIVB provider", description.Version))
+	}
+	if description.ProviderResource == "" || description.IssuerURI == "" {
+		return nil, errors.New("PIVB provider description is incomplete")
 	}
 	if err := validatePIVBCard(description.Card); err != nil {
 		return nil, fmt.Errorf("PIVB provider card: %w", err)
@@ -154,6 +172,7 @@ func buildPIVBManifest(ctx context.Context, cfg Config, aliases []string) (*Cred
 	return &CredentialPIVBManifest{
 		ProtocolVersion: description.Version, ProviderResource: description.ProviderResource,
 		IssuerURI: description.IssuerURI, Aliases: allowed, Card: description.Card,
+		MaxGrantWindowS: description.MaxGrantWindowS,
 	}, nil
 }
 
@@ -184,7 +203,10 @@ func validatePIVBClaimAgainstLocalPolicy(ctx context.Context, cfg Config, manife
 	if err := decodeStrictJSON(body, &policy); err != nil {
 		return fmt.Errorf("decode origin PIVB policy: %w", err)
 	}
-	if policy.Version != pivbForwardProtocolVersion || policy.ProviderResource != manifest.ProviderResource || policy.IssuerURI != manifest.IssuerURI {
+	if policy.Version != pivbForwardProtocolVersion {
+		return errors.New(pivbForwardVersionSkew("origin PIVB provider", policy.Version))
+	}
+	if policy.ProviderResource != manifest.ProviderResource || policy.IssuerURI != manifest.IssuerURI {
 		return errors.New("remote PIVB provider or issuer does not match the origin PIVB configuration")
 	}
 	for alias, binding := range manifest.Aliases {
@@ -225,6 +247,24 @@ func validatePIVBCard(card CredentialPIVBCard) error {
 		return fmt.Errorf("SPKI derives key id %q, not %q", derived, card.KeyID)
 	}
 	return nil
+}
+
+// peekPIVBForwardVersion reads only the protocol version out of an already
+// captured forwarded document. It is deliberately tolerant of everything else:
+// a skewed peer is diagnosed by its version, before strict decoding rejects
+// the unknown fields that skew introduces.
+func peekPIVBForwardVersion(raw []byte) (int, bool) {
+	var peek struct {
+		Version *int `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &peek); err != nil || peek.Version == nil {
+		return 0, false
+	}
+	return *peek.Version, true
+}
+
+func pivbForwardVersionSkew(subject string, version int) string {
+	return fmt.Sprintf("%s speaks forwarding protocol %d, not %d; upgrade PIVB and ZKA together", subject, version, pivbForwardProtocolVersion)
 }
 
 func decodeStrictJSON(raw []byte, dst any) error {
@@ -289,12 +329,22 @@ func (d *Daemon) proxyPIVBMint(ctx context.Context, stream net.Conn, workspace, 
 	if err != nil || len(body) > pivbForwardBodyMax {
 		return writePIVBProxyError(stream, http.StatusBadRequest, "PIVB_CONFIG", "PIVB mint request exceeds the fixed size limit")
 	}
+	// A caller one protocol behind sends fields this build has never heard of,
+	// so strict decoding would report a malformed request and send an operator
+	// hunting the request shape instead of the version skew. Read the version
+	// out of the captured bytes first; the body is never read twice.
+	if version, ok := peekPIVBForwardVersion(body); ok && version != pivbForwardProtocolVersion {
+		return writePIVBProxyError(stream, http.StatusBadRequest, "PIVB_CONFIG", pivbForwardVersionSkew("PIVB mint request", version))
+	}
 	var mint pivbMintRequest
 	if err := decodeStrictJSON(body, &mint); err != nil {
 		return writePIVBProxyError(stream, http.StatusBadRequest, "PIVB_CONFIG", "invalid PIVB mint request: "+err.Error())
 	}
-	if mint.Version != pivbForwardProtocolVersion || mint.RequestSource == nil {
-		return writePIVBProxyError(stream, http.StatusBadRequest, "PIVB_CONFIG", "PIVB mint request has an invalid version or source")
+	if mint.Version != pivbForwardProtocolVersion {
+		return writePIVBProxyError(stream, http.StatusBadRequest, "PIVB_CONFIG", pivbForwardVersionSkew("PIVB mint request", mint.Version))
+	}
+	if mint.RequestSource == nil {
+		return writePIVBProxyError(stream, http.StatusBadRequest, "PIVB_CONFIG", "PIVB mint request has no request source")
 	}
 	if _, ok := manifest.Aliases[mint.Alias]; !ok {
 		return writePIVBProxyError(stream, http.StatusForbidden, "PIVB_CONFIG", fmt.Sprintf("PIVB alias %q is not allowed by bundle %q", mint.Alias, bundleName))
@@ -360,7 +410,10 @@ func bindPIVBMintResponse(raw []byte, expected CredentialPIVBCard, trusted pivbF
 	if err := decodeStrictJSON(raw, &response); err != nil {
 		return nil, err
 	}
-	if response.Version != pivbForwardProtocolVersion || response.IDToken == "" || response.ExpirationTime <= 0 ||
+	if response.Version != pivbForwardProtocolVersion {
+		return nil, errors.New(pivbForwardVersionSkew("PIVB mint response", response.Version))
+	}
+	if response.IDToken == "" || response.ExpirationTime <= 0 ||
 		response.Card.Serial == 0 || response.Card.KeyID == "" || len(response.Card.SPKIDER) == 0 {
 		return nil, errors.New("incomplete PIVB mint response")
 	}

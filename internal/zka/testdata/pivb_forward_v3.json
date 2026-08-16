@@ -1,0 +1,107 @@
+{
+  "mint_request": {
+    "version": 3,
+    "alias": "ro",
+    "external_account_audience": "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/pivb/providers/yubikey",
+    "impersonated_email": "readonly@example.iam.gserviceaccount.com",
+    "request_source": {
+      "kind": "agent-session",
+      "label": "codex:agentic/ro",
+      "session_id": "11111111111111111111111111111111"
+    },
+    "expected_card": {
+      "serial": 12345678,
+      "jwk_kid": "test-key-id",
+      "spki_der": "AQIDBA=="
+    },
+    "forward_context": {
+      "origin_node_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "workspace_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bundle": "work",
+      "claim_generation": 7,
+      "provider_node_id": "cccccccccccccccccccccccccccccccc",
+      "provider_attachment_id": "dddddddddddddddddddddddddddddddd",
+      "operation_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "window_s": 900,
+      "window_deadline": 1785586770
+    }
+  },
+  "mint_response": {
+    "version": 3,
+    "id_token": "header.payload.signature",
+    "expiration_time": 1785585870,
+    "card": {
+      "serial": 12345678,
+      "jwk_kid": "test-key-id",
+      "spki_der": "AQIDBA=="
+    },
+    "expected_card": {
+      "serial": 12345678,
+      "jwk_kid": "test-key-id",
+      "spki_der": "AQIDBA=="
+    },
+    "forward_context": {
+      "origin_node_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "workspace_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bundle": "work",
+      "claim_generation": 7,
+      "provider_node_id": "cccccccccccccccccccccccccccccccc",
+      "provider_attachment_id": "dddddddddddddddddddddddddddddddd",
+      "operation_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "window_s": 900,
+      "window_deadline": 1785586770
+    },
+    "granted_window_s": 600,
+    "granted_window_deadline": 1785586470
+  },
+  "policy": {
+    "version": 3,
+    "provider_resource": "projects/123456789/locations/global/workloadIdentityPools/pivb/providers/yubikey",
+    "issuer_uri": "https://auth.example.net/pivb/dep1",
+    "aliases": {
+      "deploy": {
+        "target": "deploy@example.iam.gserviceaccount.com",
+        "assertion_lifetime_s": 300
+      },
+      "ro": {
+        "target": "readonly@example.iam.gserviceaccount.com"
+      }
+    },
+    "enrolled_keys": [
+      {
+        "serial": 12345678,
+        "jwk_kid": "test-key-id"
+      }
+    ],
+    "max_grant_window_s": 3600
+  },
+  "description": {
+    "version": 3,
+    "provider_resource": "projects/123456789/locations/global/workloadIdentityPools/pivb/providers/yubikey",
+    "issuer_uri": "https://auth.example.net/pivb/dep1",
+    "aliases": {
+      "deploy": {
+        "target": "deploy@example.iam.gserviceaccount.com",
+        "assertion_lifetime_s": 300
+      },
+      "ro": {
+        "target": "readonly@example.iam.gserviceaccount.com"
+      }
+    },
+    "card": {
+      "serial": 12345678,
+      "jwk_kid": "test-key-id",
+      "spki_der": "AQIDBA=="
+    },
+    "max_grant_window_s": 3600
+  },
+  "invalidate_request": {
+    "version": 3,
+    "workspace_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "claim_generation": 7
+  },
+  "invalidate_response": {
+    "version": 3,
+    "purged": 2
+  }
+}

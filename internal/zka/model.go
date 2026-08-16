@@ -347,6 +347,9 @@ type CredentialPIVBCard struct {
 
 type CredentialPIVBAlias struct {
 	Target string `json:"target"`
+	// AssertionLifetimeS is how long the provider says one touch's assertion
+	// may be reused for this alias. Zero means every mint costs a touch.
+	AssertionLifetimeS int64 `json:"assertion_lifetime_s,omitempty"`
 }
 
 type CredentialPIVBManifest struct {
@@ -355,6 +358,9 @@ type CredentialPIVBManifest struct {
 	IssuerURI        string                         `json:"issuer_uri"`
 	Aliases          map[string]CredentialPIVBAlias `json:"aliases"`
 	Card             CredentialPIVBCard             `json:"card"`
+	// MaxGrantWindowS is the longest authorisation window the provider will
+	// grant this claim. Zero means the provider grants no windows at all.
+	MaxGrantWindowS int64 `json:"max_grant_window_s,omitempty"`
 }
 
 // WorkspacePIVBProvider is the schema-v8 split PIVB binding retained only so a
