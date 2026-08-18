@@ -504,7 +504,7 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, fmt.Errorf("credential claim requires an active controlling attachment")
 	}
-	if ownerAttachment.Status != AttachmentReady || ownerAttachment.Revoked {
+	if !attachmentOperational(ownerAttachment) {
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, fmt.Errorf("credential attachment %s is not active", req.OwnerAttachmentID)
 	}
@@ -568,7 +568,7 @@ func (d *Daemon) claimWorkspaceCredentials(ctx context.Context, req workspaceCre
 		return workspaceCredentialStatus{}, err
 	}
 	ownerAttachment = workspace.Attachments[req.OwnerAttachmentID]
-	if ownerAttachment == nil || ownerAttachment.Status != AttachmentReady || ownerAttachment.Revoked || ownerAttachment.Node.ID != ownerNode {
+	if !attachmentOperational(ownerAttachment) || ownerAttachment.Node.ID != ownerNode {
 		d.mu.Unlock()
 		return workspaceCredentialStatus{}, fmt.Errorf("credential controlling attachment changed while preparing claim")
 	}

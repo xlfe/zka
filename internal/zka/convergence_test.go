@@ -76,6 +76,39 @@ func TestStructuralDigestTracksStructure(t *testing.T) {
 	}
 }
 
+// Kitty and the compositor do not expose a commandable ordering for
+// independent OS windows, so their ls order must not create a new target.
+func TestStructuralDigestIgnoresOSWindowOrder(t *testing.T) {
+	left := []Node{
+		{ID: "os-a", Kind: "os-window", Children: []Node{{
+			ID: "tab-a", Kind: "tab", Children: []Node{{ID: "a", Kind: "pane", PaneID: "a"}},
+		}}},
+		{ID: "os-b", Kind: "os-window", Children: []Node{{
+			ID: "tab-b", Kind: "tab", Children: []Node{{ID: "b", Kind: "pane", PaneID: "b"}},
+		}}},
+	}
+	right := []Node{left[1], left[0]}
+	if topologyStructuralDigest(left) != topologyStructuralDigest(right) {
+		t.Fatal("uncommandable OS-window order changed structural identity")
+	}
+	workspace := &Workspace{
+		ID: "workspace", Panes: map[string]*Pane{
+			"a": {ID: "a", Phase: PaneAdmitted},
+			"b": {ID: "b", Phase: PaneAdmitted},
+		},
+	}
+	if _, err := installDesiredTopology(workspace, left, topologyInstallSystem); err != nil {
+		t.Fatal(err)
+	}
+	stored := cloneNodes(workspace.Topology.Roots)
+	if changed, err := installDesiredTopology(workspace, right, topologyInstallVerify); err != nil || changed {
+		t.Fatalf("reordered OS roots changed desired topology: changed=%v err=%v", changed, err)
+	}
+	if !nodesEqual(stored, workspace.Topology.Roots) {
+		t.Fatalf("OS-root observation order churned stored topology: %#v", workspace.Topology.Roots)
+	}
+}
+
 // Dragging a split divider must not ripple out to other attachments. Under the
 // old digest it bumped the generation, which demoted every peer and triggered a
 // full rebuild in each of them.
@@ -124,11 +157,10 @@ func TestSplitGeometryChangeDoesNotAdvanceGeneration(t *testing.T) {
 	}
 }
 
-// The liveness guarantee. Whatever the reason enforcement keeps failing, the
-// daemon must eventually accept what Kitty actually shows instead of fighting
-// it forever. Without this, one unreproducible node destroyed the session on a
-// timer indefinitely.
-func TestUnconvergedAttachmentAdoptsObservedTopology(t *testing.T) {
+// A failed enforcement pass may leave Kitty partially rearranged, but that
+// local state is never allowed to replace the desired topology. Persistent
+// failure stalls layout reconciliation for this generation instead.
+func TestUnconvergedAttachmentPreservesDesiredTopology(t *testing.T) {
 	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -148,43 +180,83 @@ func TestUnconvergedAttachmentAdoptsObservedTopology(t *testing.T) {
 	d.kitty.Runner = runner
 	d.kitty.Command = "kitten-test"
 
-	err = d.reconcileEndpointTopology(context.Background(), attachment.Endpoint)
-	if !errors.Is(err, errStructureNotConverged) {
-		t.Fatalf("reconcile error = %v, want errStructureNotConverged", err)
-	}
-	if classifyReconcileError(err, 1, maxEnforceAttempts) != reconcileRetryBackoff {
-		t.Fatal("first non-convergence should retry with backoff")
-	}
-	if classifyReconcileError(err, maxEnforceAttempts, maxEnforceAttempts) != reconcileAdopt {
-		t.Fatal("persistent non-convergence must escalate to adoption, not to a permanent error")
-	}
-
-	if err := d.adoptObservedTopology(context.Background(), attachment.Endpoint); err != nil {
-		t.Fatalf("adopt observed topology: %v", err)
+	for attempt := 1; attempt <= maxEnforceAttempts; attempt++ {
+		d.runTopologyReconcile(context.Background(), attachment.Endpoint)
+		got, getErr := d.getWorkspace(workspace.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if got.Topology.Generation != generation || got.Topology.Digest != workspace.Topology.Digest {
+			t.Fatalf("failed pass %d published observed topology: %#v", attempt, got.Topology)
+		}
 	}
 	got, err := d.getWorkspace(workspace.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Topology.Generation <= generation {
-		t.Fatalf("adoption did not advance the generation: %d", got.Topology.Generation)
+	stalled := got.Attachments[attachment.ID]
+	if stalled.Status != AttachmentLayoutStalled || stalled.ReconcileStatus != TopologyReconcileError {
+		t.Fatalf("persistent failure did not stall layout reconciliation: %#v", stalled)
 	}
-	if len(got.Topology.Roots[0].Children) != 2 {
-		t.Fatalf("adoption did not take the observed grouping: %#v", got.Topology.Roots)
+	if d.endpointNeedsTopologyReconcile(attachment.Endpoint) {
+		t.Fatal("layout-stalled generation was automatically re-armed")
 	}
-	// The pane set is the one thing adoption may never change.
-	if !samePaneSet(topologyPaneIDs(got.Topology.Roots), map[string]bool{panes[0].ID: true, panes[1].ID: true}) {
-		t.Fatalf("adoption changed the pane set: %#v", topologyPaneIDs(got.Topology.Roots))
+	// A delayed watcher capture of the same partial tree is also non-authoritative.
+	d.captureEndpoint(context.Background(), attachment.Endpoint)
+	afterCapture, _ := d.getWorkspace(workspace.ID)
+	if afterCapture.Topology.Generation != generation || afterCapture.Topology.Digest != workspace.Topology.Digest {
+		t.Fatalf("watcher published partial topology after stall: %#v", afterCapture.Topology)
 	}
-	// Having adopted, the very next pass converges.
-	if err := d.reconcileEndpointTopology(context.Background(), attachment.Endpoint); err != nil {
-		t.Fatalf("reconcile after adoption still failed: %v", err)
+	if afterCapture.Attachments[attachment.ID].Status != AttachmentLayoutStalled ||
+		afterCapture.Attachments[attachment.ID].ReconcileStatus != TopologyReconcileError {
+		t.Fatalf("watcher capture re-armed a stalled generation: %#v", afterCapture.Attachments[attachment.ID])
 	}
 }
 
-// Adoption is bounded by the pane set: a capture that has lost a live pane must
-// never become the desired state.
-func TestAdoptionRefusesToChangeThePaneSet(t *testing.T) {
+func TestOperatorAdoptionRequiresPreviewAndStableCandidate(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 2)
+	workspace, attachment := readyWorkspaceAttachment(t, d, workspace, "local")
+	panes := workspace.SortedPanes()
+	generation := workspace.Topology.Generation
+	tree := kittyTreeForTabs(workspace.ID, [][]string{{panes[0].ID}, {panes[1].ID}})
+	current, _ := d.getWorkspace(workspace.ID)
+	d.kitty.Runner = &fakeRunner{handler: func(_ context.Context, _ string, args ...string) (string, string, error) {
+		return kittyResponse(t, args, tree, current)
+	}}
+	d.kitty.Command = "kitten-test"
+
+	preview, err := d.adoptLayout(context.Background(), topologyAdoptRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Applied || preview.ConfirmToken == "" || preview.CandidateDigest == workspace.Topology.Digest {
+		t.Fatalf("invalid adoption preview: %#v", preview)
+	}
+	unchanged, _ := d.getWorkspace(workspace.ID)
+	if unchanged.Topology.Generation != generation {
+		t.Fatal("adoption preview mutated the desired topology")
+	}
+	applied, err := d.adoptLayout(context.Background(), topologyAdoptRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID, Confirm: preview.ConfirmToken,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied.Applied || applied.Workspace.Topology.Generation != generation+1 ||
+		applied.Workspace.Topology.Digest != preview.CandidateDigest {
+		t.Fatalf("confirmed adoption was not applied: %#v", applied)
+	}
+}
+
+// Operator adoption is still bounded by the pane set: a capture that has lost
+// a live pane must never become the desired state.
+func TestOperatorAdoptionRefusesToChangeThePaneSet(t *testing.T) {
 	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {
 		t.Fatal(err)
@@ -200,7 +272,9 @@ func TestAdoptionRefusesToChangeThePaneSet(t *testing.T) {
 	}}
 	d.kitty.Command = "kitten-test"
 
-	if err := d.adoptObservedTopology(context.Background(), attachment.Endpoint); err == nil {
+	if _, err := d.adoptLayout(context.Background(), topologyAdoptRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID,
+	}); err == nil {
 		t.Fatal("adoption accepted a capture that dropped a live pane")
 	}
 	got, _ := d.getWorkspace(workspace.ID)
@@ -230,6 +304,41 @@ func TestFatalReconcileStopsFallbackRearming(t *testing.T) {
 	d.markAttachmentReconcilePending(workspace.ID, attachment.ID)
 	if !d.endpointNeedsTopologyReconcile(attachment.Endpoint) {
 		t.Fatal("a pending attachment must be retried")
+	}
+}
+
+// The applying marker is persisted before Kitty is mutated. If the daemon
+// exits mid-pass, the next process must resume that generation rather than
+// treating the stale applied digest as proof of convergence.
+func TestApplyingAtCurrentGenerationResumesAfterRestart(t *testing.T) {
+	root := testRoot(t)
+	d, err := newTestDaemon(t, root, quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	workspace, attachment := readyWorkspaceAttachment(t, d, workspace, "local")
+
+	d.mu.Lock()
+	stored := d.state.Workspaces[workspace.ID].Attachments[attachment.ID]
+	stored.Status = AttachmentPreparing
+	stored.ReconcileStatus = TopologyReconcileApplying
+	stored.ReconcileTargetGeneration = workspace.Topology.Generation
+	if err := d.store.Save(d.state); err != nil {
+		d.mu.Unlock()
+		t.Fatal(err)
+	}
+	d.mu.Unlock()
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := newTestDaemon(t, root, quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restarted.endpointNeedsTopologyReconcile(attachment.Endpoint) {
+		t.Fatal("persisted applying state was not resumed after restart")
 	}
 }
 

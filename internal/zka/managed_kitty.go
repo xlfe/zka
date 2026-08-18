@@ -214,11 +214,16 @@ func waitForAttachmentReady(ctx context.Context, api API, kitty KittyClient, wor
 		}
 		cancel()
 		if err == nil {
-			updated, updateErr := api.UpdateManifest(ctx, manifestUpdateRequest{
+			request := manifestUpdateRequest{
 				Workspace: workspace.ID, Attachment: attachment.ID,
-				ExpectedRevision: workspace.Revision, BaseTopologyGeneration: workspace.Topology.Generation,
-				Manifest: manifest, Views: views,
-			})
+				ExpectedRevision: workspace.Revision, Manifest: manifest, Views: views,
+			}
+			intent := topologyUpdateVerify
+			if len(workspace.Topology.Roots) == 0 {
+				intent = topologyUpdateGenesis
+			}
+			populateManifestSource(&request, workspace, attachment, intent)
+			updated, updateErr := api.UpdateManifest(ctx, request)
 			if updateErr == nil {
 				workspace = updated
 				current := updated.Attachments[attachment.ID]

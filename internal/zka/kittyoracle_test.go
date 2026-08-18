@@ -153,7 +153,7 @@ func TestRealKittyReceivesPerOSWindowFocus(t *testing.T) {
 	roots := append(cloneNodes(workspace.Topology.Roots), Node{Kind: "os-window", Children: []Node{
 		{Kind: "tab", Layout: "splits", Children: paneNodes("b")},
 	}})
-	if _, err := installDesiredTopology(workspace, roots); err != nil {
+	if _, err := installDesiredTopology(workspace, roots, topologyInstallSystem); err != nil {
 		t.Fatal(err)
 	}
 	session, err := renderDesiredTopologySession(workspace, Transport{Kind: "local"}, "")

@@ -19,15 +19,13 @@ type launchTarget struct {
 }
 
 type windowMove struct {
-	PaneID      string
-	WindowID    int64
-	TargetTabID int64 // 0 means "a new tab"
+	PaneID       string
+	TargetPaneID string // empty means "a new tab"
 }
 
 type tabMove struct {
-	TabNodeID   string
-	TabID       int64
-	TargetTabID int64 // 0 means "a new OS window"
+	PaneID       string
+	TargetPaneID string // empty means "a new OS window"
 }
 
 type tabTitleAction struct {
@@ -70,6 +68,7 @@ type liveTab struct {
 	Title      string
 	Layout     string
 	Enabled    []string
+	TitleKnown bool
 }
 
 func observedTabs(nodes []Node, views map[string]RuntimeView) []liveTab {
@@ -80,9 +79,11 @@ func observedTabs(nodes []Node, views map[string]RuntimeView) []liveTab {
 				continue
 			}
 			view := views[tabNode.Children[0].PaneID]
+			titleKnown := tabNode.TitleKnown == nil || *tabNode.TitleKnown
 			tab := liveTab{
 				TabID: view.TabID, OSWindowID: view.OSWindowID,
 				Title: tabNode.Title, Layout: tabNode.Layout, Enabled: tabNode.EnabledLayouts,
+				TitleKnown: titleKnown,
 			}
 			for _, paneNode := range tabNode.Children {
 				tab.Panes = append(tab.Panes, paneNode.PaneID)
@@ -179,18 +180,16 @@ func planTopologyReconcile(workspace *Workspace, observed []Node, views map[stri
 			if claimed[tabID] || !topologyStringsEqual(actual.Panes, desiredPanes) {
 				// Rebuild this tab by pulling its first pane into a fresh tab
 				// and moving the rest in behind it, in order.
-				plan.MoveWindows = append(plan.MoveWindows, windowMove{
-					PaneID: desiredPanes[0], WindowID: views[desiredPanes[0]].WindowID,
-				})
+				plan.MoveWindows = append(plan.MoveWindows, windowMove{PaneID: desiredPanes[0]})
 				for _, paneID := range desiredPanes[1:] {
 					plan.MoveWindows = append(plan.MoveWindows, windowMove{
-						PaneID: paneID, WindowID: views[paneID].WindowID, TargetTabID: -1,
+						PaneID: paneID, TargetPaneID: desiredPanes[0],
 					})
 				}
 				continue
 			}
 			claimed[tabID] = true
-			if want := desiredTabName(workspace, tabNode); canonicalStrippedValue(actual.Title) != canonicalStrippedValue(want) {
+			if want := desiredTabName(workspace, tabNode); actual.TitleKnown && canonicalStrippedValue(actual.Title) != canonicalStrippedValue(tabNode.Title) {
 				plan.TabTitles = append(plan.TabTitles, tabTitleAction{
 					TabNodeID: tabNode.ID, TabID: tabID, Title: want,
 				})
@@ -204,6 +203,7 @@ func planTopologyReconcile(workspace *Workspace, observed []Node, views map[stri
 		}
 	}
 	if len(plan.MoveWindows) != 0 {
+		plan.TabTitles, plan.TabLayouts = nil, nil
 		return plan
 	}
 
@@ -227,10 +227,10 @@ func planTopologyReconcile(workspace *Workspace, observed []Node, views map[stri
 		if topologyStringsEqual(actual, leadPanes) {
 			continue
 		}
-		plan.MoveTabs = append(plan.MoveTabs, tabMove{TabID: views[leadPanes[0]].TabID})
+		plan.MoveTabs = append(plan.MoveTabs, tabMove{PaneID: leadPanes[0]})
 		for _, paneID := range leadPanes[1:] {
 			plan.MoveTabs = append(plan.MoveTabs, tabMove{
-				TabID: views[paneID].TabID, TargetTabID: -1,
+				PaneID: paneID, TargetPaneID: leadPanes[0],
 			})
 		}
 	}

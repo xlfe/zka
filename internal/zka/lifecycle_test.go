@@ -449,6 +449,60 @@ func TestMirrorPaneClosureKillsOnlyClosedBackend(t *testing.T) {
 	}
 }
 
+func TestPaneClosurePreservesSurvivorGroupingFromDesiredTopology(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 3)
+	workspace, attachment := readyWorkspaceAttachment(t, d, workspace, "local")
+	panes := workspace.SortedPanes()
+
+	desired := manifestForPanes(workspace, panes[0].ID, panes[1].ID, panes[2].ID)
+	desired.Topology[0].Children = []Node{
+		{Kind: "tab", Children: []Node{
+			{Kind: "pane", PaneID: panes[0].ID},
+			{Kind: "pane", PaneID: panes[1].ID},
+		}},
+		{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: panes[2].ID}}},
+	}
+	request := manifestUpdateRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID,
+		Manifest: desired, Views: viewsForPanes(panes[0].ID, panes[1].ID, panes[2].ID),
+	}
+	populateManifestSource(&request, workspace, attachment, topologyUpdateUserCapture)
+	workspace, err = d.updateManifest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachment = workspace.Attachments[attachment.ID]
+
+	// The pane disappeared while the observed survivors were temporarily in
+	// one tab. Closure may publish the pane-set delta, but not that grouping.
+	captured := manifestForPanes(workspace, panes[1].ID, panes[2].ID)
+	updated, pending, err := d.beginPaneClosure(closePanesRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID, ExpectedRevision: workspace.Revision,
+		BaseTopologyGeneration: workspace.Topology.Generation, BaseTopologyDigest: workspace.Topology.Digest,
+		Panes: []string{panes[0].ID}, Manifest: captured, Views: viewsForPanes(panes[1].ID, panes[2].ID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pending {
+		t.Fatal("pane closure was not scheduled")
+	}
+	if len(updated.Topology.Roots) != 1 || len(updated.Topology.Roots[0].Children) != 2 ||
+		len(updated.Topology.Roots[0].Children[0].Children) != 1 ||
+		updated.Topology.Roots[0].Children[0].Children[0].PaneID != panes[1].ID ||
+		updated.Topology.Roots[0].Children[1].Children[0].PaneID != panes[2].ID {
+		t.Fatalf("closure published captured survivor regrouping: %#v", updated.Topology.Roots)
+	}
+	if got := updated.Attachments[attachment.ID]; got.Status != AttachmentPreparing ||
+		got.ReconcileStatus != TopologyReconcilePending {
+		t.Fatalf("divergent closing attachment falsely claimed convergence: %#v", got)
+	}
+}
+
 func TestStalePaneClosureDoesNotSignalZMX(t *testing.T) {
 	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {

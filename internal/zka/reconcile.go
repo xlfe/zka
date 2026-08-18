@@ -80,7 +80,7 @@ func (d *Daemon) topologyLoop(ctx context.Context) {
 				if attachment != nil {
 					_, owned = attachment.Views[event.PaneID]
 				}
-				if workspace == nil || attachment == nil || attachment.Status != AttachmentReady || attachment.Revoked ||
+				if workspace == nil || attachment == nil || !attachmentOperational(attachment) ||
 					(event.Workspace != "" && event.Workspace != workspace.ID) || !owned {
 					delete(closing, event.Endpoint)
 				} else {
@@ -151,6 +151,9 @@ func (d *Daemon) scheduleCapture(endpoint string) {
 				d.scheduleCapture(endpoint)
 			}
 		}()
+		operation := d.endpointTopologyOperation(endpoint)
+		operation.Lock()
+		defer operation.Unlock()
 		d.captureEndpoint(ctx, endpoint)
 	})
 }
@@ -271,8 +274,11 @@ func (d *Daemon) captureEndpoint(ctx context.Context, endpoint string) {
 	if len(closed) != 0 {
 		request := closePanesRequest{
 			Workspace: workspace.ID, Attachment: attachment.ID,
-			ExpectedRevision: workspace.Revision, Panes: closed,
-			Manifest: manifest, Views: views,
+			ExpectedRevision:       workspace.Revision,
+			BaseTopologyGeneration: workspace.Topology.Generation,
+			BaseTopologyDigest:     workspace.Topology.Digest,
+			Panes:                  closed,
+			Manifest:               manifest, Views: views,
 		}
 		if workspace.RemoteHost != "" {
 			remoteCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -282,7 +288,8 @@ func (d *Daemon) captureEndpoint(ctx context.Context, endpoint string) {
 			_, err = d.closePanes(ctx, request)
 		}
 		if err != nil {
-			if errors.Is(err, errWorkspaceRevisionChanged) || errors.Is(err, errViewsNotReady) {
+			if errors.Is(err, errWorkspaceRevisionChanged) || errors.Is(err, errTopologyGenerationChanged) ||
+				errors.Is(err, errTopologyPaneSetMismatch) || errors.Is(err, errViewsNotReady) {
 				d.scheduleFreshCapture(endpoint)
 			} else {
 				d.markAttachmentUnhealthy(workspace.ID, attachment.ID, err)
@@ -303,25 +310,39 @@ func (d *Daemon) captureEndpoint(ctx context.Context, endpoint string) {
 		return
 	}
 	if workspace.RemoteHost != "" {
-		remoteCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_, err = d.remotes.Call(remoteCtx, workspace.RemoteHost, "update_manifest", manifestUpdateRequest{
+		request := manifestUpdateRequest{
 			Workspace: workspace.ID, Attachment: attachment.ID,
-			ExpectedRevision: workspace.Revision, BaseTopologyGeneration: workspace.Topology.Generation,
-			Manifest: manifest, Views: views,
-		})
+			ExpectedRevision: workspace.Revision, Manifest: manifest, Views: views,
+		}
+		intent := topologyUpdateUserCapture
+		if len(workspace.Topology.Roots) == 0 {
+			intent = topologyUpdateGenesis
+		}
+		populateManifestSource(&request, workspace, attachment, intent)
+		remoteCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, err = d.remotes.Call(remoteCtx, workspace.RemoteHost, "update_manifest", request)
 		cancel()
 	} else {
-		_, err = d.updateManifest(manifestUpdateRequest{
+		request := manifestUpdateRequest{
 			Workspace: workspace.ID, Attachment: attachment.ID,
-			ExpectedRevision: workspace.Revision, BaseTopologyGeneration: workspace.Topology.Generation,
-			Manifest: manifest, Views: views,
-		})
+			ExpectedRevision: workspace.Revision, Manifest: manifest, Views: views,
+		}
+		intent := topologyUpdateUserCapture
+		if len(workspace.Topology.Roots) == 0 {
+			intent = topologyUpdateGenesis
+		}
+		populateManifestSource(&request, workspace, attachment, intent)
+		_, err = d.updateManifest(request)
 	}
 	switch {
 	case err == nil:
 	case errors.Is(err, errTopologyGenerationChanged), errors.Is(err, errTopologyPaneSetMismatch),
-		errors.Is(err, errAttachmentTopologyStale), errors.Is(err, errPaneAdmissionPending):
-		d.scheduleTopologyReconcile(endpoint)
+		errors.Is(err, errAttachmentTopologyStale), errors.Is(err, errPaneAdmissionPending),
+		errors.Is(err, errStructuralPublicationRefused):
+		d.logger.Printf("refused structural capture from %s: %v", endpoint, err)
+		if d.endpointNeedsTopologyReconcile(endpoint) {
+			d.scheduleTopologyReconcile(endpoint)
+		}
 		return
 	case errors.Is(err, errWorkspaceRevisionChanged):
 		// Optimistic concurrency: another writer won, and the next capture
@@ -374,7 +395,7 @@ func closedPaneIDs(workspace *Workspace, attachment *Attachment, views map[strin
 
 func (d *Daemon) closeEventsCoverWorkspace(endpoint string, closed map[string]bool) bool {
 	workspace, attachment := d.endpointAttachment(endpoint)
-	if workspace == nil || attachment == nil || attachment.Status != AttachmentReady || attachment.Revoked {
+	if workspace == nil || attachment == nil || !attachmentOperational(attachment) {
 		return false
 	}
 	active := 0

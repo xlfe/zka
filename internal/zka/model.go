@@ -12,6 +12,8 @@ import (
 
 const (
 	stateSchemaVersion = 10
+	// 16 fences structural topology publication by intent, base digest, and
+	// source reconcile state, and adds explicit two-phase layout adoption.
 	// 15 carries an operator grant window on workspace credential claims.
 	// 14 restores attachment-owned credential claims and adds versioned PIVB
 	// attachment routing for managed panes.
@@ -24,7 +26,9 @@ const (
 	// 10 replaces the workspace-agent API with credential bundles. There is no
 	// compatibility shim: every CLI and daemon on a node must be upgraded
 	// together.
-	daemonProtocolVersion = 15
+	daemonProtocolVersion = 16
+	// 16 carries the same topology publication authority and adoption fields
+	// across origin/attachment boundaries.
 	// 15 forwards the operator grant window a credential claim requests.
 	// 14 requires an authenticated active attachment for credential claims.
 	// 13 replaced attachment-owned claims with node-owned credential bindings.
@@ -41,10 +45,16 @@ const (
 	// remote pane, and sends the source pane instead. An origin that predates
 	// this would quietly place every remote pane in the home directory, so the
 	// version check turns that into an explicit upgrade prompt.
-	remoteProtocolVersion = 15
+	remoteProtocolVersion = 16
 	remoteProtocolName    = "zka.workspace"
 	remoteProtocolMax     = 1 << 20
 )
+
+func attachmentOperational(attachment *Attachment) bool {
+	return attachment != nil &&
+		(attachment.Status == AttachmentReady || attachment.Status == AttachmentLayoutStalled) &&
+		!attachment.Revoked
+}
 
 type AgentState string
 
@@ -76,10 +86,11 @@ const (
 type AttachmentStatus string
 
 const (
-	AttachmentPreparing AttachmentStatus = "preparing"
-	AttachmentReady     AttachmentStatus = "ready"
-	AttachmentUnhealthy AttachmentStatus = "unhealthy"
-	AttachmentDetached  AttachmentStatus = "detached"
+	AttachmentPreparing     AttachmentStatus = "preparing"
+	AttachmentReady         AttachmentStatus = "ready"
+	AttachmentLayoutStalled AttachmentStatus = "layout-stalled"
+	AttachmentUnhealthy     AttachmentStatus = "unhealthy"
+	AttachmentDetached      AttachmentStatus = "detached"
 )
 
 type TopologyReconcileStatus string
@@ -233,6 +244,11 @@ type Node struct {
 	Active         bool            `json:"active,omitempty"`
 	Focused        bool            `json:"focused,omitempty"`
 	Children       []Node          `json:"children,omitempty"`
+	// TitleKnown is observation-only. A nil value means the caller supplied a
+	// logical node rather than a Kitty observation; false means Kitty omitted
+	// title_overridden, so its live program title must not be pinned as a tab
+	// name. It is deliberately excluded from persisted topology.
+	TitleKnown *bool `json:"-"`
 }
 
 // DesiredTopology is the origin-owned logical Kitty tree. Runtime Kitty IDs,
@@ -263,26 +279,28 @@ type RuntimeView struct {
 }
 
 type Attachment struct {
-	ID                        string                  `json:"id"`
-	Node                      Host                    `json:"node"`
-	Transport                 Transport               `json:"transport"`
-	Role                      AttachmentRole          `json:"role"`
-	Status                    AttachmentStatus        `json:"status"`
-	Endpoint                  string                  `json:"endpoint,omitempty"`
-	PID                       int                     `json:"pid,omitempty"`
-	AppliedRevision           uint64                  `json:"applied_revision"`
-	AppliedTopologyGeneration uint64                  `json:"applied_topology_generation,omitempty"`
-	AppliedTopologyDigest     string                  `json:"applied_topology_digest,omitempty"`
-	ObservedTopology          []Node                  `json:"observed_topology,omitempty"`
-	ReconcileTargetGeneration uint64                  `json:"reconcile_target_generation,omitempty"`
-	ReconcileStatus           TopologyReconcileStatus `json:"reconcile_status,omitempty"`
-	Views                     map[string]RuntimeView  `json:"views,omitempty"`
-	ClientHeartbeats          map[string]time.Time    `json:"client_heartbeats,omitempty"`
-	LastError                 string                  `json:"last_error,omitempty"`
-	CreatedAt                 time.Time               `json:"created_at"`
-	UpdatedAt                 time.Time               `json:"updated_at"`
-	Revoked                   bool                    `json:"revoked,omitempty"`
-	RevocationClosed          bool                    `json:"revocation_closed,omitempty"`
+	ID                         string                  `json:"id"`
+	Node                       Host                    `json:"node"`
+	Transport                  Transport               `json:"transport"`
+	Role                       AttachmentRole          `json:"role"`
+	Status                     AttachmentStatus        `json:"status"`
+	Endpoint                   string                  `json:"endpoint,omitempty"`
+	PID                        int                     `json:"pid,omitempty"`
+	AppliedRevision            uint64                  `json:"applied_revision"`
+	AppliedTopologyGeneration  uint64                  `json:"applied_topology_generation,omitempty"`
+	AppliedTopologyDigest      string                  `json:"applied_topology_digest,omitempty"`
+	ObservedTopology           []Node                  `json:"observed_topology,omitempty"`
+	ReconcileTargetGeneration  uint64                  `json:"reconcile_target_generation,omitempty"`
+	ReconcileStatus            TopologyReconcileStatus `json:"reconcile_status,omitempty"`
+	ReconcileFailures          int                     `json:"reconcile_failures,omitempty"`
+	ReconcileFailureGeneration uint64                  `json:"reconcile_failure_generation,omitempty"`
+	Views                      map[string]RuntimeView  `json:"views,omitempty"`
+	ClientHeartbeats           map[string]time.Time    `json:"client_heartbeats,omitempty"`
+	LastError                  string                  `json:"last_error,omitempty"`
+	CreatedAt                  time.Time               `json:"created_at"`
+	UpdatedAt                  time.Time               `json:"updated_at"`
+	Revoked                    bool                    `json:"revoked,omitempty"`
+	RevocationClosed           bool                    `json:"revocation_closed,omitempty"`
 }
 
 func (a *Attachment) Clone() *Attachment {

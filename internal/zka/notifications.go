@@ -212,7 +212,7 @@ func (d *Daemon) resumeAttentionNotifications(ctx context.Context) {
 
 func paneAttached(workspace *Workspace, paneID string) bool {
 	for _, attachment := range workspace.Attachments {
-		if attachment.Status != AttachmentReady {
+		if !attachmentOperational(attachment) {
 			continue
 		}
 		if attachment.Transport.Kind == "ssh" && !clientHeartbeatFresh(attachment.ClientHeartbeats[paneID], time.Now().UTC()) {
@@ -233,7 +233,7 @@ func isLocalUnixAttachment(attachment *Attachment, nodeID string) bool {
 
 func isReadyLocalKittyAttachment(attachment *Attachment, nodeID string) bool {
 	return isLocalUnixAttachment(attachment, nodeID) &&
-		attachment.Status == AttachmentReady &&
+		attachmentOperational(attachment) &&
 		!attachment.Revoked
 }
 

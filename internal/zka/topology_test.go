@@ -251,6 +251,191 @@ func TestTopologyDigestIgnoresRuntimeLayoutAndFocusIDs(t *testing.T) {
 	}
 }
 
+func TestStabilizeTopologyIDsRejectsAttachmentLocalContainerTags(t *testing.T) {
+	previous := []Node{{
+		ID: "canonical-os", Kind: "os-window", Children: []Node{{
+			ID: "canonical-tab", Kind: "tab", Children: []Node{
+				{ID: "a", Kind: "pane", PaneID: "a"},
+				{ID: "b", Kind: "pane", PaneID: "b"},
+			},
+		}},
+	}}
+	captured := cloneNodes(previous)
+	captured[0].ID = "attachment-os"
+	captured[0].Children[0].ID = "attachment-tab"
+
+	stable, err := stabilizeTopologyIDs("workspace", previous, captured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stable[0].ID != "canonical-os" || stable[0].Children[0].ID != "canonical-tab" {
+		t.Fatalf("attachment-local container tags displaced canonical identity: %#v", stable)
+	}
+}
+
+func TestReadyUserCaptureMayPublishStructuralChange(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 2)
+	workspace, attachment := readyWorkspaceAttachment(t, d, workspace, "local")
+	panes := workspace.SortedPanes()
+	baseGeneration := workspace.Topology.Generation
+	manifest := manifestForPanes(workspace, panes[0].ID, panes[1].ID)
+	manifest.Topology[0].Children = []Node{
+		{Kind: "tab", Layout: "splits", Children: []Node{{Kind: "pane", PaneID: panes[0].ID}}},
+		{Kind: "tab", Layout: "splits", Children: []Node{{Kind: "pane", PaneID: panes[1].ID}}},
+	}
+	request := manifestUpdateRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID,
+		Manifest: manifest, Views: viewsForPanes(panes[0].ID, panes[1].ID),
+	}
+	populateManifestSource(&request, workspace, attachment, topologyUpdateUserCapture)
+
+	updated, err := d.updateManifest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Topology.Generation != baseGeneration+1 || len(updated.Topology.Roots[0].Children) != 2 {
+		t.Fatalf("ready user capture did not publish its structural edit: %#v", updated.Topology)
+	}
+}
+
+func TestApplyingSourceDeclarationCannotPublishStructuralChange(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 2)
+	workspace, attachment := readyWorkspaceAttachment(t, d, workspace, "local")
+	panes := workspace.SortedPanes()
+	manifest := manifestForPanes(workspace, panes[0].ID, panes[1].ID)
+	manifest.Topology[0].Children = []Node{
+		{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: panes[0].ID}}},
+		{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: panes[1].ID}}},
+	}
+	request := manifestUpdateRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID,
+		Manifest: manifest, Views: viewsForPanes(panes[0].ID, panes[1].ID),
+	}
+	populateManifestSource(&request, workspace, attachment, topologyUpdateUserCapture)
+	request.SourceStatus = AttachmentPreparing
+	request.SourceReconcileStatus = TopologyReconcileApplying
+
+	if _, err := d.updateManifest(request); !errors.Is(err, errStructuralPublicationRefused) {
+		t.Fatalf("applying source publication error = %v", err)
+	}
+	current, _ := d.getWorkspace(workspace.ID)
+	if current.Topology.Generation != workspace.Topology.Generation || current.Topology.Digest != workspace.Topology.Digest {
+		t.Fatal("refused applying source changed the desired topology")
+	}
+}
+
+func TestAdmissionRefusesHalfAppliedExistingPaneProjection(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 2)
+	workspace, _ = readyWorkspaceAttachment(t, d, workspace, "local")
+	panes := workspace.SortedPanes()
+	allocated, err := testAllocatePane(d, workspace.ID, "new", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, _ = d.getWorkspace(workspace.ID)
+	attachment := workspace.Attachments["local"]
+	manifest := manifestForPanes(workspace, panes[0].ID, panes[1].ID, allocated.Pane.ID)
+	manifest.Topology[0].Children = []Node{
+		{Kind: "tab", Children: []Node{
+			{Kind: "pane", PaneID: panes[1].ID},
+			{Kind: "pane", PaneID: panes[0].ID},
+		}},
+		{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: allocated.Pane.ID}}},
+	}
+	request := manifestUpdateRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID,
+		Manifest: manifest, Views: viewsForPanes(panes[0].ID, panes[1].ID, allocated.Pane.ID),
+	}
+	populateManifestSource(&request, workspace, attachment, topologyUpdateAdmission)
+
+	if _, err := d.updateManifest(request); !errors.Is(err, errStructuralPublicationRefused) {
+		t.Fatalf("half-applied admission error = %v", err)
+	}
+	current, _ := d.getWorkspace(workspace.ID)
+	if !current.Panes[allocated.Pane.ID].Proposed() ||
+		current.Topology.Generation != workspace.Topology.Generation ||
+		current.Topology.Digest != workspace.Topology.Digest {
+		t.Fatalf("refused admission mutated canonical state: %#v", current)
+	}
+}
+
+func TestPresentationVerificationMayCompleteFromApplyingState(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	workspace, attachment := readyWorkspaceAttachment(t, d, workspace, "local")
+	pane := firstPane(workspace)
+
+	d.mu.Lock()
+	stored := d.state.Workspaces[workspace.ID].Attachments[attachment.ID]
+	stored.Status = AttachmentPreparing
+	stored.ReconcileStatus = TopologyReconcileApplying
+	stored.ReconcileTargetGeneration = workspace.Topology.Generation
+	if err := d.store.Save(d.state); err != nil {
+		d.mu.Unlock()
+		t.Fatal(err)
+	}
+	d.mu.Unlock()
+	workspace, _ = d.getWorkspace(workspace.ID)
+	attachment = workspace.Attachments[attachment.ID]
+	manifest := manifestForPanes(workspace, pane.ID)
+	manifest.Topology[0].Children[0].Title = "renamed"
+	request := manifestUpdateRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID,
+		VerifyTopologyGeneration: workspace.Topology.Generation,
+		Manifest:                 manifest, Views: viewsForPanes(pane.ID),
+	}
+	populateManifestSource(&request, workspace, attachment, topologyUpdateVerify)
+
+	updated, err := d.updateManifest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Topology.Generation != workspace.Topology.Generation ||
+		updated.Attachments[attachment.ID].ReconcileStatus != TopologyReconcileReady {
+		t.Fatalf("presentation-only verification did not converge applying state: %#v", updated.Attachments[attachment.ID])
+	}
+}
+
+func TestStoreRefusesSilentTopologyDigestRepair(t *testing.T) {
+	root := testRoot(t)
+	store := NewStore(testPaths(root))
+	workspace := &Workspace{
+		ID: "workspace", Panes: map[string]*Pane{
+			"pane": {ID: "pane", Phase: PaneAdmitted},
+		},
+		Topology: DesiredTopology{
+			Generation: 1,
+			Roots: []Node{{ID: "os", Kind: "os-window", Children: []Node{{
+				ID: "tab", Kind: "tab", Children: []Node{{ID: "pane", Kind: "pane", PaneID: "pane"}},
+			}}}},
+			Digest: "not-the-tree-digest",
+		},
+	}
+	state := newStateData()
+	state.Workspaces[workspace.ID] = workspace
+	if err := store.Save(state); err == nil || !strings.Contains(err.Error(), "digest disagrees") {
+		t.Fatalf("store digest invariant error = %v", err)
+	}
+	if workspace.Topology.Digest != "not-the-tree-digest" {
+		t.Fatal("store silently repaired the caller's inconsistent topology")
+	}
+}
+
 func TestConcurrentMirrorAddsAreRebasedWithoutDroppingEitherPane(t *testing.T) {
 	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {

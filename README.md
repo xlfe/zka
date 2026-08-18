@@ -24,7 +24,7 @@ and provider socket paths on the provider.
 </p>
 
 > [!NOTE]
-> zka 0.10.0 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
+> zka 0.10.1 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
 > builds on Kitty, zmx, OpenSSH, systemd user services, and coding-agent hooks
 > instead of replacing them.
 
@@ -256,6 +256,14 @@ scroll position, viewport size, and compositor geometry remain local so using a
 mirror does not steal focus on another machine. Disconnected attachments catch
 up from their last verified generation when they reconnect.
 
+Reconciliation persists an `applying` fence before issuing any structural
+Kitty command. Captures made while that fence is active cannot replace the
+canonical topology, so a failed or interrupted multi-command repair remains a
+local intermediate state. After repeated failure the attachment becomes
+`layout-stalled` for that generation while panes, credentials, and attention
+continue to operate; a later topology generation or an explicit reconcile
+re-arms it.
+
 ### Lifecycle semantics
 
 The difference between closing and detaching is intentional:
@@ -275,7 +283,8 @@ The difference between closing and detaching is intentional:
 
 Restoration recreates the logical OS-window/tab/split hierarchy, layout state,
 titles, working directories, and active focus. A watcher triggers topology
-capture and origin-pushed reconciliation, with a 30-second liveness fallback.
+capture and origin-pushed reconciliation. Persistent failure never
+automatically adopts the partially applied Kitty tree.
 
 ## Workspace commands
 
@@ -283,6 +292,8 @@ capture and origin-pushed reconciliation, with a 30-second liveness fallback.
 zka workspace list
 zka workspace inspect example-project
 zka workspace reconcile example-project
+zka workspace adopt-layout example-project
+zka workspace adopt-layout example-project --confirm TOKEN
 zka workspace create api --template ./quad.kitty-session
 zka workspace create devbox.example:api --attach
 zka workspace attach example-project
@@ -1338,9 +1349,16 @@ retained notification failures. `zka workspace reconcile WORKSPACE` forces a
 complete local recapture and repair without restarting pane backends. Backend
 replacement requires the separate `--recreate-backends` flag.
 
+`zka workspace adopt-layout WORKSPACE` is the deliberate escape hatch when the
+saved target should be replaced by what one local Kitty attachment currently
+shows. The first invocation is read-only and prints the desired and observed
+shapes plus a confirmation token. A second invocation with `--confirm TOKEN`
+recaptures the attachment and commits only if both the desired base and the
+observed candidate are unchanged and the pane set is exact.
+
 The current migration writes a unique private `.v9.<timestamp>.<nonce>.backup`
 before upgrading to schema 10. Both the local daemon and remote protocols are
-version 14. Upgrade the CLI and daemon fleet together, then restart zkad on all
+version 16. Upgrade the CLI and daemon fleet together, then restart zkad on all
 SSH peers. To roll back, first inventory and stop every live backend reporting
 credential environment v5; an old daemon would otherwise accept the
 restored v9 pane record while the newer route-required process keeps running.
@@ -1381,16 +1399,19 @@ routing the new pane through zka.
 
 ## Project status
 
-Version 0.10.0 combines three systems: durable Kitty-native workspaces, Codex and
+Version 0.10.1 combines three systems: durable Kitty-native workspaces, Codex and
 Claude Code attention routing, and reconnect-safe remote credential bundles.
 The current tree extends those bundles with workspace-owned PIVB routes while
 preserving the fixed-alias sandbox ABI. It also includes remote mirrors and two-phase
 moves, headless origins, Waybar streaming, desktop/ntfy notifications, and
-durable cleanup after partial failures. Version 0.10.0 adds operator grant
-windows to PIVB credential claims — a claim-anchored, provider-clamped span in
-which one YubiKey touch covers identical mints — and speaks PIVB forwarding
-protocol 3 and daemon/remote protocol 15, so pivb 0.5.0 and zka 0.10.0 must be
-deployed together and every PIVB bundle released and re-claimed afterward.
+durable cleanup after partial failures. Version 0.10.1 makes topology
+publication transactional across local and remote attachments: incomplete
+reconciliation is fenced from the canonical layout, runtime Kitty identities
+are re-resolved after moves, and deliberate recovery uses a two-capture
+operator confirmation. It speaks PIVB forwarding protocol 3 and daemon/remote
+protocol 16, so pivb 0.5.0 and zka 0.10.1 must be deployed together and every
+PIVB bundle released and re-claimed afterward; zka daemons must be upgraded as
+one fleet.
 Repeated local activation of an existing claim remains a true no-op unless it
 carries a window, which is always a fresh grant, and endpoint health is still
 reported for the whole bundle before a launcher starts its sandbox. It retains

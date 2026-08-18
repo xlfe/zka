@@ -127,6 +127,14 @@ func (a API) ReconcileTopology(ctx context.Context, workspace, attachment string
 	return &out, err
 }
 
+func (a API) AdoptLayout(ctx context.Context, req topologyAdoptRequest) (topologyAdoptResponse, error) {
+	var out topologyAdoptResponse
+	client := a.client
+	client.Timeout = 30 * time.Second
+	err := client.Call(ctx, "adopt_layout", req, &out)
+	return out, err
+}
+
 func (a API) RegisterAttachment(ctx context.Context, workspace string, attachment Attachment) (*Attachment, error) {
 	var out Attachment
 	err := a.client.Call(ctx, "register_attachment", attachmentRequest{Workspace: workspace, Attachment: attachment}, &out)

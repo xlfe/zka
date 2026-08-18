@@ -2,19 +2,22 @@ package zka
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
 	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	// After this many consecutive failed enforcement passes for one generation,
-	// the observed tree is adopted as the desired one. This is the liveness
-	// guarantee: because adoption installs exactly what was seen, the next pass
-	// converges by construction, so no desired topology can be permanently
-	// unsatisfiable.
+	// automatic layout reconciliation stalls for that attachment. The desired
+	// tree remains authoritative until a later generation or an explicit
+	// operator-confirmed adoption re-arms it.
 	maxEnforceAttempts = 3
 	backoffBase        = 500 * time.Millisecond
 	backoffCap         = 60 * time.Second
@@ -28,6 +31,17 @@ type endpointBackoff struct {
 	attempts    int
 	generation  uint64
 	nextAttempt time.Time
+}
+
+func (d *Daemon) endpointTopologyOperation(endpoint string) *sync.Mutex {
+	d.topologyMu.Lock()
+	defer d.topologyMu.Unlock()
+	operation := d.topologyOps[endpoint]
+	if operation == nil {
+		operation = &sync.Mutex{}
+		d.topologyOps[endpoint] = operation
+	}
+	return operation
 }
 
 func backoffDelay(attempts int) time.Duration {
@@ -113,6 +127,9 @@ func (d *Daemon) scheduleTopologyReconcile(endpoint string) {
 				d.scheduleTopologyReconcile(endpoint)
 			}
 		}()
+		operation := d.endpointTopologyOperation(endpoint)
+		operation.Lock()
+		defer operation.Unlock()
 		d.runTopologyReconcile(ctx, endpoint)
 	})
 }
@@ -157,6 +174,10 @@ func (d *Daemon) runTopologyReconcile(ctx context.Context, endpoint string) {
 		return
 	}
 	attempts := d.noteTopologyFailure(endpoint, workspace.Topology.Generation)
+	if (errors.Is(err, errStructureNotConverged) || errors.Is(err, errStructuralApplyFailed)) &&
+		!errors.Is(err, errTopologyGenerationChanged) {
+		attempts = d.recordAttachmentReconcileFailure(workspace.ID, attachment.ID, workspace.Topology.Generation, err)
+	}
 	switch classifyReconcileError(err, attempts, maxEnforceAttempts) {
 	case reconcileFatal:
 		d.markAttachmentReconcileError(workspace.ID, attachment.ID, err)
@@ -170,17 +191,36 @@ func (d *Daemon) runTopologyReconcile(ctx context.Context, endpoint string) {
 				d.scheduleTopologyReconcile(endpoint)
 			}
 		})
-	case reconcileAdopt:
-		d.markAttachmentReconcilePending(workspace.ID, attachment.ID)
-		if adoptErr := d.adoptObservedTopology(ctx, endpoint); adoptErr != nil {
-			d.logger.Printf("adopt observed topology at %s: %v", endpoint, adoptErr)
-			return
-		}
-		d.clearTopologyBackoff(endpoint)
-		d.scheduleTopologyReconcile(endpoint)
+	case reconcileStall:
+		d.markAttachmentReconcileError(workspace.ID, attachment.ID, err)
 	default:
 		d.markAttachmentReconcilePending(workspace.ID, attachment.ID)
 	}
+}
+
+func (d *Daemon) recordAttachmentReconcileFailure(workspaceID, attachmentID string, generation uint64, failure error) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	workspace := d.state.Workspaces[workspaceID]
+	if workspace == nil {
+		return maxEnforceAttempts
+	}
+	attachment := workspace.Attachments[attachmentID]
+	if attachment == nil {
+		return maxEnforceAttempts
+	}
+	if attachment.ReconcileFailureGeneration != generation {
+		attachment.ReconcileFailureGeneration = generation
+		attachment.ReconcileFailures = 0
+	}
+	attachment.ReconcileFailures++
+	attachment.LastError = failure.Error()
+	attachment.UpdatedAt = time.Now().UTC()
+	workspace.UpdatedAt = attachment.UpdatedAt
+	if err := d.store.Save(d.state); err != nil {
+		d.logger.Printf("persist topology failure for attachment %s: %v", attachmentID, err)
+	}
+	return attachment.ReconcileFailures
 }
 
 func (d *Daemon) resumeTopologyReconciliation() {
@@ -222,7 +262,10 @@ func (d *Daemon) reconcileTopology(ctx context.Context, req topologyReconcileReq
 		// An explicit request is a fresh intent, so any backoff or terminal
 		// error left by earlier automatic attempts is cleared first.
 		d.clearTopologyBackoff(attachment.Endpoint)
-		d.markAttachmentReconciling(workspaceID, attachment.ID, targetGeneration)
+		d.clearAttachmentReconcileFailures(workspaceID, attachment.ID)
+		if err := d.markAttachmentReconciling(workspaceID, attachment.ID, targetGeneration); err != nil {
+			return nil, err
+		}
 		d.scheduleTopologyReconcile(attachment.Endpoint)
 	}
 	ticker := time.NewTicker(50 * time.Millisecond)
@@ -292,27 +335,36 @@ func (d *Daemon) endpointNeedsTopologyReconcile(endpoint string) bool {
 	// "error" is terminal until something changes. A fatal reconcile means the
 	// desired state is malformed, and re-running it on a timer only repeats the
 	// damage; every other status stays retryable.
-	if attachment.ReconcileStatus == TopologyReconcileError {
+	if attachment.ReconcileStatus == TopologyReconcileError &&
+		attachment.ReconcileTargetGeneration == workspace.Topology.Generation {
 		return false
 	}
 	return attachment.AppliedTopologyGeneration != workspace.Topology.Generation ||
 		attachment.AppliedTopologyDigest != workspace.Topology.Digest ||
-		attachment.ReconcileStatus == TopologyReconcilePending
+		attachment.ReconcileStatus == TopologyReconcilePending ||
+		attachment.ReconcileStatus == TopologyReconcileApplying ||
+		attachment.ReconcileStatus == TopologyReconcileError
 }
 
-func (d *Daemon) markAttachmentReconciling(workspaceID, attachmentID string, generation uint64) {
+func (d *Daemon) markAttachmentReconciling(workspaceID, attachmentID string, generation uint64) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	workspace := d.state.Workspaces[workspaceID]
 	if workspace == nil {
-		return
+		return nil
 	}
 	attachment := workspace.Attachments[attachmentID]
 	if attachment == nil {
-		return
+		return nil
 	}
 	if attachment.ReconcileStatus == TopologyReconcileApplying && attachment.ReconcileTargetGeneration == generation {
-		return
+		return nil
+	}
+	before := attachment.Clone()
+	previousUpdatedAt := workspace.UpdatedAt
+	if attachment.ReconcileFailureGeneration != generation {
+		attachment.ReconcileFailureGeneration = generation
+		attachment.ReconcileFailures = 0
 	}
 	attachment.Status = AttachmentPreparing
 	attachment.ReconcileStatus = TopologyReconcileApplying
@@ -320,6 +372,29 @@ func (d *Daemon) markAttachmentReconciling(workspaceID, attachmentID string, gen
 	attachment.LastError = ""
 	attachment.UpdatedAt = time.Now().UTC()
 	workspace.UpdatedAt = attachment.UpdatedAt
+	if err := d.store.Save(d.state); err != nil {
+		workspace.Attachments[attachmentID] = before
+		workspace.UpdatedAt = previousUpdatedAt
+		return err
+	}
+	return nil
+}
+
+func (d *Daemon) clearAttachmentReconcileFailures(workspaceID, attachmentID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	workspace := d.state.Workspaces[workspaceID]
+	if workspace == nil || workspace.Attachments[attachmentID] == nil {
+		return
+	}
+	attachment := workspace.Attachments[attachmentID]
+	attachment.ReconcileFailures = 0
+	attachment.ReconcileFailureGeneration = workspace.Topology.Generation
+	if attachment.ReconcileStatus == TopologyReconcileError {
+		attachment.ReconcileStatus = TopologyReconcilePending
+		attachment.Status = AttachmentPreparing
+		attachment.LastError = ""
+	}
 	_ = d.store.Save(d.state)
 }
 
@@ -335,12 +410,16 @@ func (d *Daemon) markAttachmentReconcileError(workspaceID, attachmentID string, 
 		return
 	}
 	message := failure.Error()
-	if attachment.Status == AttachmentUnhealthy && attachment.ReconcileStatus == TopologyReconcileError && attachment.LastError == message {
+	if attachment.Status == AttachmentLayoutStalled && attachment.ReconcileStatus == TopologyReconcileError && attachment.LastError == message {
 		return
 	}
-	attachment.Status = AttachmentUnhealthy
+	attachment.Status = AttachmentLayoutStalled
 	attachment.ReconcileStatus = TopologyReconcileError
 	attachment.ReconcileTargetGeneration = workspace.Topology.Generation
+	attachment.ReconcileFailureGeneration = workspace.Topology.Generation
+	if attachment.ReconcileFailures < maxEnforceAttempts {
+		attachment.ReconcileFailures = maxEnforceAttempts
+	}
 	attachment.LastError = message
 	attachment.UpdatedAt = time.Now().UTC()
 	workspace.UpdatedAt = attachment.UpdatedAt
@@ -367,6 +446,10 @@ func (d *Daemon) markAttachmentReconcilePending(workspaceID, attachmentID string
 	attachment.Status = AttachmentPreparing
 	attachment.ReconcileStatus = TopologyReconcilePending
 	attachment.ReconcileTargetGeneration = workspace.Topology.Generation
+	if attachment.ReconcileFailureGeneration != workspace.Topology.Generation {
+		attachment.ReconcileFailureGeneration = workspace.Topology.Generation
+		attachment.ReconcileFailures = 0
+	}
 	attachment.LastError = ""
 	attachment.UpdatedAt = time.Now().UTC()
 	workspace.UpdatedAt = attachment.UpdatedAt
@@ -394,6 +477,26 @@ func observeWorkspaceTopology(ctx context.Context, kitty KittyClient, endpoint s
 	return nodes, views, nil
 }
 
+func projectReconcileObserved(workspace *Workspace, nodes []Node, views map[string]RuntimeView) ([]Node, map[string]RuntimeView, bool, error) {
+	keep := desiredPaneIDs(workspace)
+	filteredViews := cloneViews(views)
+	hasProposed := false
+	for paneID := range views {
+		pane := workspace.Panes[paneID]
+		if pane != nil && pane.Proposed() {
+			hasProposed = true
+			delete(filteredViews, paneID)
+		}
+	}
+	projected := projectTopologyPanes(nodes, keep)
+	projected, err := stabilizeTopologyIDs(workspace.ID, workspace.Topology.Roots, projected)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	annotateRuntimeViews(projected, filteredViews)
+	return projected, filteredViews, hasProposed, nil
+}
+
 func (d *Daemon) reconcileEndpointTopology(ctx context.Context, endpoint string) error {
 	workspace, attachment := d.endpointAttachment(endpoint)
 	if workspace == nil || attachment == nil {
@@ -403,7 +506,9 @@ func (d *Daemon) reconcileEndpointTopology(ctx context.Context, endpoint string)
 		return nil
 	}
 	targetGeneration := workspace.Topology.Generation
-	d.markAttachmentReconciling(workspace.ID, attachment.ID, targetGeneration)
+	if err := d.markAttachmentReconciling(workspace.ID, attachment.ID, targetGeneration); err != nil {
+		return fmt.Errorf("persist reconcile start: %w", err)
+	}
 
 	focusedPane := ""
 	for paneID, view := range attachment.Views {
@@ -428,12 +533,10 @@ func (d *Daemon) reconcileEndpointTopology(ctx context.Context, endpoint string)
 			cancel()
 			return fmt.Errorf("%w: %s", errUnknownCapturedPane, paneID)
 		}
-		if pane.Proposed() {
-			// Admission owns this transition; retrying the reconcile against a
-			// half-created pane just fights it.
-			d.schedulePaneAdmission(endpoint)
-			return fmt.Errorf("%w: pane %s", errPaneAdmissionPending, paneID)
-		}
+	}
+	nodes, views, hasProposed, err := projectReconcileObserved(workspace, nodes, views)
+	if err != nil {
+		return err
 	}
 	if _, err := d.workspaceAtTopologyGeneration(workspace.ID, targetGeneration); err != nil {
 		return err
@@ -442,17 +545,27 @@ func (d *Daemon) reconcileEndpointTopology(ctx context.Context, endpoint string)
 	plan := planTopologyReconcile(workspace, nodes, views, focusedPane)
 	if !plan.empty() {
 		if err := d.applyTopologyPlan(ctx, endpoint, workspace, attachment, plan); err != nil {
+			if plan.structural() {
+				return fmt.Errorf("%w: %w", errStructuralApplyFailed, err)
+			}
 			return err
 		}
 		if plan.structural() {
 			if err := d.waitForDesiredPanes(ctx, endpoint, workspace, 10*time.Second); err != nil {
-				return err
+				return fmt.Errorf("%w: %w", errStructuralApplyFailed, err)
 			}
 		}
-		nodes, _, err = observeWorkspaceTopology(ctx, d.kitty, endpoint, workspace)
+		var observedViews map[string]RuntimeView
+		nodes, observedViews, err = observeWorkspaceTopology(ctx, d.kitty, endpoint, workspace)
 		if err != nil {
 			return err
 		}
+		var newlyProposed bool
+		nodes, views, newlyProposed, err = projectReconcileObserved(workspace, nodes, observedViews)
+		if err != nil {
+			return err
+		}
+		hasProposed = hasProposed || newlyProposed
 	}
 
 	current, err := d.workspaceAtTopologyGeneration(workspace.ID, targetGeneration)
@@ -460,21 +573,30 @@ func (d *Daemon) reconcileEndpointTopology(ctx context.Context, endpoint string)
 		return err
 	}
 	if !topologyMatchesDesired(current, nodes) {
-		// Not a permanent failure: after maxEnforceAttempts this classifies as
-		// "adopt", and the observed tree becomes the desired one.
+		// A repeated mismatch stalls this attachment for the current generation;
+		// it never grants the observed intermediate tree publication authority.
 		return fmt.Errorf("%w: generation %d", errStructureNotConverged, targetGeneration)
+	}
+	if err := d.refreshTopologyIdentities(ctx, endpoint, current, views); err != nil {
+		return err
+	}
+	if hasProposed {
+		d.schedulePaneAdmission(endpoint)
+		return fmt.Errorf("%w: admitted-pane projection converged", errPaneAdmissionPending)
 	}
 
 	manifest, capturedViews, err := d.captureConvergedManifest(ctx, endpoint, workspace, targetGeneration)
 	if err != nil {
 		return err
 	}
-	updated, err := d.updateManifest(manifestUpdateRequest{
+	request := manifestUpdateRequest{
 		Workspace: workspace.ID, Attachment: attachment.ID,
-		ExpectedRevision: workspace.Revision, BaseTopologyGeneration: targetGeneration,
+		ExpectedRevision:         workspace.Revision,
 		VerifyTopologyGeneration: targetGeneration,
 		Manifest:                 manifest, Views: capturedViews,
-	})
+	}
+	populateManifestSource(&request, workspace, attachment, topologyUpdateVerify)
+	updated, err := d.updateManifest(request)
 	if err != nil {
 		return err
 	}
@@ -494,6 +616,35 @@ func (d *Daemon) reconcileEndpointTopology(ctx context.Context, endpoint string)
 		cancel()
 		if remoteErr != nil {
 			return remoteErr
+		}
+	}
+	return nil
+}
+
+func (d *Daemon) refreshTopologyIdentities(ctx context.Context, endpoint string, workspace *Workspace, views map[string]RuntimeView) error {
+	for _, osNode := range workspace.Topology.Roots {
+		for _, tabNode := range osNode.Children {
+			for _, paneNode := range tabNode.Children {
+				view, ok := views[paneNode.PaneID]
+				if !ok {
+					return fmt.Errorf("%w: pane %s missing while refreshing topology identity", errViewsNotReady, paneNode.PaneID)
+				}
+				if view.TabNodeID == tabNode.ID && view.OSWindowNodeID == osNode.ID {
+					continue
+				}
+				// Legacy/unlabelled panes remain recoverable through descendant-pane
+				// stabilisation. Avoid turning every otherwise converged legacy pass
+				// into a write solely to introduce optional labels.
+				if view.TabNodeID == "" && view.OSWindowNodeID == "" {
+					continue
+				}
+				callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				err := d.kitty.SetTopologyIdentity(callCtx, endpoint, view.WindowID, tabNode.ID, osNode.ID)
+				cancel()
+				if err != nil {
+					return fmt.Errorf("%w: refresh pane %s topology identity: %v", errKittyCommand, paneNode.PaneID, err)
+				}
+			}
 		}
 	}
 	return nil
@@ -534,8 +685,25 @@ func (d *Daemon) captureConvergedManifest(ctx context.Context, endpoint string, 
 // structural difference is expressible as launch, close, detach-window or
 // detach-tab.
 func (d *Daemon) applyTopologyPlan(ctx context.Context, endpoint string, workspace *Workspace, attachment *Attachment, plan topologyPlan) error {
+	ensureTarget := func() error {
+		current, err := d.getWorkspace(workspace.ID)
+		if err != nil {
+			return err
+		}
+		// Some focused unit tests plan against an uncommitted synthetic target.
+		if current.Topology.Generation == 0 {
+			return nil
+		}
+		if current.Topology.Generation != workspace.Topology.Generation || current.Topology.Digest != workspace.Topology.Digest {
+			return fmt.Errorf("%w: structural target changed before Kitty command", errTopologyGenerationChanged)
+		}
+		return nil
+	}
 	sort.Slice(plan.Close, func(i, j int) bool { return plan.Close[i] < plan.Close[j] })
 	for _, windowID := range plan.Close {
+		if err := ensureTarget(); err != nil {
+			return err
+		}
 		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		err := d.kitty.CloseWindow(callCtx, endpoint, windowID)
 		cancel()
@@ -549,6 +717,9 @@ func (d *Daemon) applyTopologyPlan(ctx context.Context, endpoint string, workspa
 		transport = Transport{Kind: "ssh", Host: workspace.RemoteHost}
 	}
 	for _, target := range plan.Launch {
+		if err := ensureTarget(); err != nil {
+			return err
+		}
 		pane := workspace.Panes[target.PaneID]
 		if pane == nil || !pane.Admitted() {
 			return fmt.Errorf("%w: desired pane %s is not launchable", errTopologyInvalid, target.PaneID)
@@ -568,8 +739,10 @@ func (d *Daemon) applyTopologyPlan(ctx context.Context, endpoint string, workspa
 	// Moves shift the tree underneath themselves, so each step re-reads the
 	// runtime ids it needs.
 	if len(plan.MoveWindows) != 0 {
-		anchorTab := int64(0)
 		for _, move := range plan.MoveWindows {
+			if err := ensureTarget(); err != nil {
+				return err
+			}
 			_, views, err := observeWorkspaceTopology(ctx, d.kitty, endpoint, workspace)
 			if err != nil {
 				return err
@@ -579,8 +752,12 @@ func (d *Daemon) applyTopologyPlan(ctx context.Context, endpoint string, workspa
 				return fmt.Errorf("%w: pane %s vanished while regrouping", errKittyNotQuiescent, move.PaneID)
 			}
 			target := int64(0)
-			if move.TargetTabID == -1 {
-				target = anchorTab
+			if move.TargetPaneID != "" {
+				targetView, present := views[move.TargetPaneID]
+				if !present {
+					return fmt.Errorf("%w: target pane %s vanished while regrouping", errKittyNotQuiescent, move.TargetPaneID)
+				}
+				target = targetView.TabID
 				if target != 0 && view.TabID == target {
 					continue
 				}
@@ -591,31 +768,38 @@ func (d *Daemon) applyTopologyPlan(ctx context.Context, endpoint string, workspa
 			if err != nil {
 				return fmt.Errorf("%w: move pane %s: %v", errKittyCommand, move.PaneID, err)
 			}
-			if anchorTab == 0 {
-				_, views, err = observeWorkspaceTopology(ctx, d.kitty, endpoint, workspace)
-				if err != nil {
-					return err
-				}
-				anchorTab = views[move.PaneID].TabID
-			}
 		}
 	}
 
 	if len(plan.MoveTabs) != 0 {
-		anchorTab := int64(0)
 		for _, move := range plan.MoveTabs {
+			if err := ensureTarget(); err != nil {
+				return err
+			}
+			_, views, err := observeWorkspaceTopology(ctx, d.kitty, endpoint, workspace)
+			if err != nil {
+				return err
+			}
+			view, present := views[move.PaneID]
+			if !present {
+				return fmt.Errorf("%w: pane %s vanished while regrouping tabs", errKittyNotQuiescent, move.PaneID)
+			}
 			target := int64(0)
-			if move.TargetTabID == -1 {
-				target = anchorTab
+			if move.TargetPaneID != "" {
+				targetView, ok := views[move.TargetPaneID]
+				if !ok {
+					return fmt.Errorf("%w: target pane %s vanished while regrouping tabs", errKittyNotQuiescent, move.TargetPaneID)
+				}
+				target = targetView.TabID
+				if view.OSWindowID == targetView.OSWindowID {
+					continue
+				}
 			}
 			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			err := d.kitty.DetachTab(callCtx, endpoint, move.TabID, target)
+			err = d.kitty.DetachTab(callCtx, endpoint, view.TabID, target)
 			cancel()
 			if err != nil {
-				return fmt.Errorf("%w: move tab %d: %v", errKittyCommand, move.TabID, err)
-			}
-			if anchorTab == 0 {
-				anchorTab = move.TabID
+				return fmt.Errorf("%w: move tab containing pane %s: %v", errKittyCommand, move.PaneID, err)
 			}
 		}
 	}
@@ -647,53 +831,145 @@ func (d *Daemon) applyTopologyPlan(ctx context.Context, endpoint string, workspa
 	return nil
 }
 
-// adoptObservedTopology installs what Kitty actually shows as the new desired
-// topology. It is what makes non-convergence self-limiting: whatever the reason
-// enforcement kept failing, the next pass starts from a tree that is
-// reproducible by definition. Adoption may regroup or reorder; it may never
-// change the pane set.
-func (d *Daemon) adoptObservedTopology(ctx context.Context, endpoint string) error {
-	workspace, attachment := d.endpointAttachment(endpoint)
-	if workspace == nil || attachment == nil {
-		return nil
+func topologyAdoptToken(generation uint64, desiredDigest, candidateDigest string) string {
+	return strconv.FormatUint(generation, 10) + ":" + desiredDigest + ":" + candidateDigest
+}
+
+func parseTopologyAdoptToken(token string) (uint64, string, string, error) {
+	parts := strings.Split(token, ":")
+	if len(parts) != 3 || parts[1] == "" || parts[2] == "" {
+		return 0, "", "", fmt.Errorf("invalid layout adoption confirmation token")
+	}
+	generation, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return 0, "", "", fmt.Errorf("invalid layout adoption confirmation token")
+	}
+	return generation, parts[1], parts[2], nil
+}
+
+func topologyShape(nodes []Node) string {
+	roots := make([]string, 0, len(nodes))
+	for _, osNode := range nodes {
+		tabs := make([]string, 0, len(osNode.Children))
+		for _, tabNode := range osNode.Children {
+			panes := make([]string, 0, len(tabNode.Children))
+			for _, paneNode := range tabNode.Children {
+				panes = append(panes, shortID(paneNode.PaneID))
+			}
+			tabs = append(tabs, "["+strings.Join(panes, ",")+"]")
+		}
+		roots = append(roots, "["+strings.Join(tabs, ",")+"]")
+	}
+	return strings.Join(roots, " ")
+}
+
+func (d *Daemon) adoptionAttachment(workspaceRef, attachmentID string) (*Workspace, *Attachment, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
+	if err != nil {
+		return nil, nil, err
+	}
+	choose := func(attachment *Attachment) bool {
+		return isLocalUnixAttachment(attachment, d.state.Node.ID) &&
+			attachment.Status != AttachmentDetached && !attachment.Revoked
+	}
+	if attachmentID != "" {
+		attachment := workspace.Attachments[attachmentID]
+		if !choose(attachment) {
+			return nil, nil, fmt.Errorf("attachment %q is not an active local Kitty attachment", attachmentID)
+		}
+		return workspace.Clone(), attachment.Clone(), nil
+	}
+	for _, attachment := range workspace.SortedAttachments() {
+		if choose(attachment) {
+			return workspace.Clone(), attachment.Clone(), nil
+		}
+	}
+	return nil, nil, fmt.Errorf("workspace has no active local Kitty attachment")
+}
+
+// adoptLayout is the only path that may deliberately replace an unreachable
+// desired layout with an observed one. Preview and confirmation are separate
+// captures; the token binds the inspected candidate to the exact desired base.
+func (d *Daemon) adoptLayout(ctx context.Context, req topologyAdoptRequest) (topologyAdoptResponse, error) {
+	workspace, attachment, err := d.adoptionAttachment(req.Workspace, req.Attachment)
+	if err != nil {
+		return topologyAdoptResponse{}, err
+	}
+	operation := d.endpointTopologyOperation(attachment.Endpoint)
+	operation.Lock()
+	defer operation.Unlock()
+	workspace, attachment, err = d.adoptionAttachment(workspace.ID, attachment.ID)
+	if err != nil {
+		return topologyAdoptResponse{}, err
+	}
+	for _, pane := range workspace.Panes {
+		if pane.Proposed() || pane.Retiring() {
+			return topologyAdoptResponse{}, fmt.Errorf("layout adoption requires every pane to be fully admitted")
+		}
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	manifest, views, err := CaptureManifest(callCtx, d.kitty, endpoint, workspace)
+	manifest, views, err := CaptureManifest(callCtx, d.kitty, attachment.Endpoint, workspace)
 	cancel()
 	if err != nil {
-		return err
-	}
-	if workspace.RemoteHost != "" {
-		// A remote-cached workspace may not install a desired topology itself,
-		// so the observed tree goes to the origin, which adopts it and pushes
-		// the new generation back. Without this a replica can never escape.
-		d.logger.Printf("forwarding observed Kitty topology for workspace %s to origin %s",
-			shortID(workspace.ID), workspace.RemoteHost)
-		remoteCtx, remoteCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer remoteCancel()
-		_, err = d.remotes.Call(remoteCtx, workspace.RemoteHost, "update_manifest", manifestUpdateRequest{
-			Workspace: workspace.ID, Attachment: attachment.ID,
-			BaseTopologyGeneration: attachment.AppliedTopologyGeneration,
-			Manifest:               manifest, Views: views,
-		})
-		return err
+		return topologyAdoptResponse{}, err
 	}
 	stable, err := stabilizeTopologyIDs(workspace.ID, workspace.Topology.Roots, manifest.Topology)
 	if err != nil {
-		return err
+		return topologyAdoptResponse{}, err
 	}
+	stable = canonicalTopology(stable)
 	if !samePaneSet(topologyPaneIDs(stable), activeTopologyPaneIDs(workspace)) {
-		return fmt.Errorf("refusing to adopt a topology whose pane set differs from the workspace")
+		return topologyAdoptResponse{}, fmt.Errorf("refusing to adopt a topology whose pane set differs from the workspace")
+	}
+	candidateDigest := topologyStructuralDigest(stable)
+	response := topologyAdoptResponse{
+		Workspace: workspace, DesiredDigest: workspace.Topology.Digest, CandidateDigest: candidateDigest,
+		DesiredShape: topologyShape(workspace.Topology.Roots), CandidateShape: topologyShape(stable),
+	}
+	if req.Confirm == "" {
+		response.ConfirmToken = topologyAdoptToken(workspace.Topology.Generation, workspace.Topology.Digest, candidateDigest)
+		return response, nil
+	}
+	baseGeneration, baseDigest, confirmedCandidate, err := parseTopologyAdoptToken(req.Confirm)
+	if err != nil {
+		return topologyAdoptResponse{}, err
+	}
+	if baseGeneration != workspace.Topology.Generation || baseDigest != workspace.Topology.Digest {
+		return topologyAdoptResponse{}, fmt.Errorf("desired topology changed after layout adoption preview")
+	}
+	if confirmedCandidate != candidateDigest {
+		return topologyAdoptResponse{}, fmt.Errorf("observed topology changed after layout adoption preview")
 	}
 	manifest.Topology = stable
-	d.logger.Printf("adopting observed Kitty topology for workspace %s at %s after %d failed enforcement passes",
-		shortID(workspace.ID), endpoint, maxEnforceAttempts)
-	_, err = d.updateManifest(manifestUpdateRequest{
-		Workspace: workspace.ID, Attachment: attachment.ID,
-		ExpectedRevision: workspace.Revision, BaseTopologyGeneration: workspace.Topology.Generation,
-		Manifest: manifest, Views: views,
-	})
-	return err
+	request := manifestUpdateRequest{
+		Workspace: workspace.ID, Attachment: attachment.ID, ExpectedRevision: workspace.Revision,
+		Manifest: manifest, Views: views, ConfirmedTopologyDigest: candidateDigest,
+	}
+	populateManifestSource(&request, workspace, attachment, topologyUpdateOperator)
+	var updated *Workspace
+	if workspace.RemoteHost != "" {
+		remoteCtx, remoteCancel := context.WithTimeout(ctx, 10*time.Second)
+		raw, callErr := d.remotes.Call(remoteCtx, workspace.RemoteHost, "update_manifest", request)
+		remoteCancel()
+		if callErr != nil {
+			return topologyAdoptResponse{}, callErr
+		}
+		var authoritative Workspace
+		if err := json.Unmarshal(raw, &authoritative); err != nil {
+			return topologyAdoptResponse{}, fmt.Errorf("decode adopted remote workspace: %w", err)
+		}
+		updated = &authoritative
+	} else {
+		updated, err = d.updateManifest(request)
+		if err != nil {
+			return topologyAdoptResponse{}, err
+		}
+	}
+	response.Workspace = updated
+	response.Applied = true
+	return response, nil
 }
 
 func (d *Daemon) workspaceAtTopologyGeneration(workspaceID string, generation uint64) (*Workspace, error) {

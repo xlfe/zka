@@ -3,6 +3,7 @@ package zka
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +91,212 @@ func TestConvergedTopologyIssuesNoKittyMutations(t *testing.T) {
 				t.Fatalf("converged reconcile issued %q: %#v", mutation, call.Args)
 			}
 		}
+	}
+}
+
+// Kitty assigns a new runtime tab id when detach-tab creates an OS window.
+// A multi-tab regroup must therefore resolve the destination again after the
+// first detach. Reusing the old id makes the second detach fail, leaves the
+// workspace in the intermediate one-tab-per-OS-window state, and eventually
+// could previously let fallback adoption promote that broken state to every
+// attachment.
+func TestRegroupTabsResolvesRecreatedDestinationTab(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 2)
+	panes := workspace.SortedPanes()
+	if _, err := installDesiredTopology(workspace, []Node{{
+		Kind: "os-window",
+		Children: []Node{
+			{Kind: "tab", Layout: "splits", Children: []Node{{Kind: "pane", PaneID: panes[0].ID}}},
+			{Kind: "tab", Layout: "splits", Children: []Node{{Kind: "pane", PaneID: panes[1].ID}}},
+		},
+	}}, topologyInstallSystem); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same tabs exist in the same OS window, but in the opposite order.
+	// Reconciliation restores the desired order by detaching the desired lead
+	// tab into a new OS window, then moving the other tab beside it.
+	tree := kittyTreeForTabs(workspace.ID, [][]string{{panes[1].ID}, {panes[0].ID}})
+	observed, err := topologyFromKitty(tree, workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err = stabilizeTopologyIDs(workspace.ID, workspace.Topology.Roots, observed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	views, _ := findWorkspaceViews(tree, workspace.ID)
+	annotateRuntimeViews(observed, views)
+	plan := planTopologyReconcile(workspace, observed, views, "")
+	if len(plan.MoveTabs) != 2 {
+		t.Fatalf("tab regroup plan = %#v, want two moves", plan.MoveTabs)
+	}
+
+	runner := &fakeRunner{handler: func(_ context.Context, _ string, args ...string) (string, string, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case strings.HasSuffix(joined, " ls"):
+			return mustJSON(t, tree), "", nil
+		case strings.Contains(joined, "detach-tab --match id:101") &&
+			!strings.Contains(joined, "--target-tab"):
+			// Kitty destroys tab 101 while moving it to a new OS window and
+			// recreates it as tab 201. The old id is no longer addressable.
+			lead := tree[0].Tabs[1]
+			lead.ID = 201
+			tree[0].Tabs = tree[0].Tabs[:1]
+			tree = append(tree, kittyOSWindow{ID: 2, WMClass: "managed-kitty", Tabs: []kittyTab{lead}})
+			return "", "", nil
+		case strings.Contains(joined, "detach-tab --match id:100 --target-tab id:201"):
+			// A correct second move targets the recreated lead tab.
+			trailing := tree[0].Tabs[0]
+			trailing.ID = 202
+			tree[1].Tabs = append(tree[1].Tabs, trailing)
+			tree = tree[1:]
+			return "", "", nil
+		case strings.Contains(joined, "detach-tab"):
+			return "", "tab destination does not exist", errors.New("tab destination does not exist")
+		default:
+			return "", "", nil
+		}
+	}}
+	d.kitty.Runner = runner
+	d.kitty.Command = "kitten-test"
+
+	attachment := &Attachment{Transport: Transport{Kind: "local"}}
+	if err := d.applyTopologyPlan(context.Background(), "unix:/kitty", workspace, attachment, plan); err != nil {
+		t.Fatalf("regroup left a partially detached topology: %v", err)
+	}
+	if len(tree) != 1 || len(tree[0].Tabs) != 2 {
+		t.Fatalf("regroup did not converge to one OS window with two tabs: %#v", tree)
+	}
+}
+
+// Two independent regroup operations in one plan must each use their own
+// pane-derived destination. A shared mutable anchor makes the second group
+// attach to the first, which is how unrelated windows collapsed together.
+func TestIndependentRegroupAnchorsDoNotLeak(t *testing.T) {
+	tests := []struct {
+		name     string
+		desired  []Node
+		observed []Node
+		moves    func(topologyPlan) map[string]string
+		want     map[string]string
+	}{
+		{
+			name: "windows",
+			desired: []Node{{Kind: "os-window", Children: []Node{
+				{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "pane-0"}, {Kind: "pane", PaneID: "pane-1"}}},
+				{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "pane-2"}, {Kind: "pane", PaneID: "pane-3"}}},
+			}}},
+			observed: []Node{{Kind: "os-window", Children: []Node{
+				{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "pane-0"}, {Kind: "pane", PaneID: "pane-2"}}},
+				{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "pane-1"}, {Kind: "pane", PaneID: "pane-3"}}},
+			}}},
+			moves: func(plan topologyPlan) map[string]string {
+				result := map[string]string{}
+				for _, move := range plan.MoveWindows {
+					result[move.PaneID] = move.TargetPaneID
+				}
+				return result
+			},
+			want: map[string]string{
+				"pane-0": "", "pane-1": "pane-0",
+				"pane-2": "", "pane-3": "pane-2",
+			},
+		},
+		{
+			name: "tabs",
+			desired: []Node{
+				{Kind: "os-window", Children: []Node{
+					{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "pane-0"}}},
+					{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "pane-1"}}},
+				}},
+				{Kind: "os-window", Children: []Node{
+					{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "pane-2"}}},
+					{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "pane-3"}}},
+				}},
+			},
+			observed: []Node{
+				{Kind: "os-window", Children: []Node{
+					{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "pane-0"}}},
+					{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "pane-2"}}},
+				}},
+				{Kind: "os-window", Children: []Node{
+					{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "pane-1"}}},
+					{Kind: "tab", Children: []Node{{Kind: "pane", PaneID: "pane-3"}}},
+				}},
+			},
+			moves: func(plan topologyPlan) map[string]string {
+				result := map[string]string{}
+				for _, move := range plan.MoveTabs {
+					result[move.PaneID] = move.TargetPaneID
+				}
+				return result
+			},
+			want: map[string]string{
+				"pane-0": "", "pane-1": "pane-0",
+				"pane-2": "", "pane-3": "pane-2",
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			workspace, paneIDs := newTopologyFuzzWorkspace(4)
+			if _, err := installDesiredTopology(workspace, testCase.desired, topologyInstallSystem); err != nil {
+				t.Fatal(err)
+			}
+			stream := topologyFuzzBytes{data: []byte{0}}
+			model := newTopologyFuzzKitty(workspace.ID, testCase.observed, &stream)
+			client := KittyClient{Runner: model, Command: "kitten-test"}
+			daemon := &Daemon{kitty: client, state: StateData{Workspaces: map[string]*Workspace{workspace.ID: workspace}}}
+			attachment := &Attachment{Transport: Transport{Kind: "local"}}
+
+			observed, views, err := observeWorkspaceTopology(context.Background(), client, "unix:/kitty", workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan := planTopologyReconcile(workspace, observed, views, "")
+			if got := testCase.moves(plan); !reflect.DeepEqual(got, testCase.want) {
+				t.Fatalf("independent regroup plan = %#v, want %#v", got, testCase.want)
+			}
+			if err := daemon.applyTopologyPlan(context.Background(), "unix:/kitty", workspace, attachment, plan); err != nil {
+				t.Fatal(err)
+			}
+			observed, _, err = observeWorkspaceTopology(context.Background(), client, "unix:/kitty", workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !topologyMatchesDesired(workspace, observed) {
+				t.Fatalf("regroup converged to the wrong groups; panes=%v tree=%#v", paneIDs, model.tree)
+			}
+		})
+	}
+}
+
+func TestUnknownKittyTabTitleIsNotPinned(t *testing.T) {
+	workspace, _ := newTopologyFuzzWorkspace(1)
+	if _, err := installDesiredTopology(workspace, []Node{{
+		Kind: "os-window", Children: []Node{{
+			Kind: "tab", Title: "wanted", Children: []Node{{Kind: "pane", PaneID: "pane-0"}},
+		}},
+	}}, topologyInstallSystem); err != nil {
+		t.Fatal(err)
+	}
+	observed := cloneNodes(workspace.Topology.Roots)
+	known := false
+	observed[0].Children[0].Title = "kitty-derived-title"
+	observed[0].Children[0].TitleKnown = &known
+	views := map[string]RuntimeView{
+		"pane-0": {PaneID: "pane-0", WindowID: 1, TabID: 2, OSWindowID: 3, Ready: true},
+	}
+	plan := planTopologyReconcile(workspace, observed, views, "")
+	if len(plan.TabTitles) != 0 {
+		t.Fatalf("unknown old-Kitty title produced a permanent title action: %#v", plan.TabTitles)
 	}
 }
 

@@ -68,6 +68,7 @@ type Daemon struct {
 	captureHold           map[string]int
 	captureHoldUntil      map[string]time.Time
 	backoff               map[string]*endpointBackoff
+	topologyOps           map[string]*sync.Mutex
 	cleaning              map[string]bool
 	cleanups              map[string]*sync.Mutex
 	deleted               map[string]string
@@ -184,6 +185,7 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 		captureHold:               map[string]int{},
 		captureHoldUntil:          map[string]time.Time{},
 		backoff:                   map[string]*endpointBackoff{},
+		topologyOps:               map[string]*sync.Mutex{},
 		cleaning:                  map[string]bool{},
 		cleanups:                  map[string]*sync.Mutex{},
 		deleted:                   map[string]string{},
@@ -539,6 +541,22 @@ type topologyReconcileRequest struct {
 	Attachment string `json:"attachment,omitempty"`
 }
 
+type topologyAdoptRequest struct {
+	Workspace  string `json:"workspace"`
+	Attachment string `json:"attachment,omitempty"`
+	Confirm    string `json:"confirm,omitempty"`
+}
+
+type topologyAdoptResponse struct {
+	Workspace       *Workspace `json:"workspace,omitempty"`
+	DesiredDigest   string     `json:"desired_digest"`
+	CandidateDigest string     `json:"candidate_digest"`
+	DesiredShape    string     `json:"desired_shape"`
+	CandidateShape  string     `json:"candidate_shape"`
+	ConfirmToken    string     `json:"confirm_token,omitempty"`
+	Applied         bool       `json:"applied"`
+}
+
 type attachmentUpdateRequest struct {
 	Workspace          string                 `json:"workspace"`
 	Attachment         string                 `json:"attachment"`
@@ -559,13 +577,40 @@ type attachmentPaneReadyRequest struct {
 }
 
 type manifestUpdateRequest struct {
-	Workspace                string                 `json:"workspace"`
-	Attachment               string                 `json:"attachment"`
-	ExpectedRevision         uint64                 `json:"expected_revision,omitempty"`
-	BaseTopologyGeneration   uint64                 `json:"base_topology_generation,omitempty"`
-	VerifyTopologyGeneration uint64                 `json:"verify_topology_generation,omitempty"`
-	Manifest                 Manifest               `json:"manifest"`
-	Views                    map[string]RuntimeView `json:"views"`
+	Workspace                string                  `json:"workspace"`
+	Attachment               string                  `json:"attachment"`
+	Intent                   topologyUpdateIntent    `json:"intent,omitempty"`
+	ExpectedRevision         uint64                  `json:"expected_revision,omitempty"`
+	BaseTopologyGeneration   uint64                  `json:"base_topology_generation,omitempty"`
+	BaseTopologyDigest       string                  `json:"base_topology_digest,omitempty"`
+	VerifyTopologyGeneration uint64                  `json:"verify_topology_generation,omitempty"`
+	SourceStatus             AttachmentStatus        `json:"source_status,omitempty"`
+	SourceReconcileStatus    TopologyReconcileStatus `json:"source_reconcile_status,omitempty"`
+	SourceAppliedGeneration  uint64                  `json:"source_applied_generation,omitempty"`
+	SourceAppliedDigest      string                  `json:"source_applied_digest,omitempty"`
+	ConfirmedTopologyDigest  string                  `json:"confirmed_topology_digest,omitempty"`
+	Manifest                 Manifest                `json:"manifest"`
+	Views                    map[string]RuntimeView  `json:"views"`
+}
+
+type topologyUpdateIntent string
+
+const (
+	topologyUpdateUserCapture topologyUpdateIntent = "user-capture"
+	topologyUpdateAdmission   topologyUpdateIntent = "pane-admission"
+	topologyUpdateVerify      topologyUpdateIntent = "reconcile-verification"
+	topologyUpdateGenesis     topologyUpdateIntent = "genesis"
+	topologyUpdateOperator    topologyUpdateIntent = "operator-adopt"
+)
+
+func populateManifestSource(req *manifestUpdateRequest, workspace *Workspace, attachment *Attachment, intent topologyUpdateIntent) {
+	req.Intent = intent
+	req.BaseTopologyGeneration = workspace.Topology.Generation
+	req.BaseTopologyDigest = workspace.Topology.Digest
+	req.SourceStatus = attachment.Status
+	req.SourceReconcileStatus = attachment.ReconcileStatus
+	req.SourceAppliedGeneration = attachment.AppliedTopologyGeneration
+	req.SourceAppliedDigest = attachment.AppliedTopologyDigest
 }
 
 type renameWorkspaceRequest struct {
@@ -575,12 +620,14 @@ type renameWorkspaceRequest struct {
 }
 
 type closePanesRequest struct {
-	Workspace        string                 `json:"workspace"`
-	Attachment       string                 `json:"attachment"`
-	ExpectedRevision uint64                 `json:"expected_revision"`
-	Panes            []string               `json:"panes"`
-	Manifest         Manifest               `json:"manifest"`
-	Views            map[string]RuntimeView `json:"views"`
+	Workspace              string                 `json:"workspace"`
+	Attachment             string                 `json:"attachment"`
+	ExpectedRevision       uint64                 `json:"expected_revision"`
+	BaseTopologyGeneration uint64                 `json:"base_topology_generation,omitempty"`
+	BaseTopologyDigest     string                 `json:"base_topology_digest,omitempty"`
+	Panes                  []string               `json:"panes"`
+	Manifest               Manifest               `json:"manifest"`
+	Views                  map[string]RuntimeView `json:"views"`
 }
 
 type killWorkspaceRequest struct {
@@ -682,6 +729,12 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 			return nil, err
 		}
 		return d.reconcileTopology(ctx, req)
+	case "adopt_layout":
+		var req topologyAdoptRequest
+		if err := decodePayload(raw, &req); err != nil {
+			return nil, err
+		}
+		return d.adoptLayout(ctx, req)
 	case "register_attachment":
 		var req attachmentRequest
 		if err := decodePayload(raw, &req); err != nil {
@@ -1411,6 +1464,8 @@ func (d *Daemon) updateAttachment(req attachmentUpdateRequest) (*Workspace, erro
 				return nil, err
 			}
 			candidate.AppliedRevision = workspace.Revision
+			candidate.ReconcileFailures = 0
+			candidate.ReconcileFailureGeneration = workspace.Topology.Generation
 			if attachmentRuntimeEqual(attachment, candidate) {
 				return workspace.Clone(), nil
 			}
@@ -1446,6 +1501,8 @@ func (d *Daemon) updateAttachment(req attachmentUpdateRequest) (*Workspace, erro
 			annotateRuntimeViews(candidate.ObservedTopology, candidate.Views)
 			candidate.ReconcileStatus = "ready"
 			candidate.ReconcileTargetGeneration = workspace.Topology.Generation
+			candidate.ReconcileFailures = 0
+			candidate.ReconcileFailureGeneration = workspace.Topology.Generation
 		}
 		if candidate.Status != AttachmentReady {
 			err := fmt.Errorf("%s", candidate.LastError)
@@ -1624,6 +1681,8 @@ func attachmentRuntimeEqual(left, right *Attachment) bool {
 		left.AppliedTopologyDigest == right.AppliedTopologyDigest &&
 		left.ReconcileTargetGeneration == right.ReconcileTargetGeneration &&
 		left.ReconcileStatus == right.ReconcileStatus &&
+		left.ReconcileFailures == right.ReconcileFailures &&
+		left.ReconcileFailureGeneration == right.ReconcileFailureGeneration &&
 		left.LastError == right.LastError &&
 		nodesEqual(left.ObservedTopology, right.ObservedTopology) &&
 		runtimeViewsEqual(left.Views, right.Views)
@@ -1637,6 +1696,8 @@ func applyAttachmentRuntime(destination, source *Attachment) {
 	destination.ObservedTopology = cloneNodes(source.ObservedTopology)
 	destination.ReconcileTargetGeneration = source.ReconcileTargetGeneration
 	destination.ReconcileStatus = source.ReconcileStatus
+	destination.ReconcileFailures = source.ReconcileFailures
+	destination.ReconcileFailureGeneration = source.ReconcileFailureGeneration
 	destination.LastError = source.LastError
 	destination.Views = cloneViews(source.Views)
 }
@@ -1658,6 +1719,32 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 	if attachment.Status == AttachmentDetached || attachment.Revoked {
 		return nil, fmt.Errorf("attachment %s is detached or revoked", attachment.ID)
 	}
+	explicitIntent := req.Intent != ""
+	intent := req.Intent
+	if intent == "" {
+		// Direct in-package callers predate intent on the wire. Infer the narrowest
+		// authority; production callers always send it explicitly.
+		switch {
+		case req.VerifyTopologyGeneration != 0:
+			intent = topologyUpdateVerify
+		case len(workspace.Topology.Roots) == 0:
+			intent = topologyUpdateGenesis
+		default:
+			intent = topologyUpdateUserCapture
+			for paneID := range topologyPaneIDs(req.Manifest.Topology) {
+				if pane := workspace.Panes[paneID]; pane != nil && pane.Proposed() {
+					intent = topologyUpdateAdmission
+					break
+				}
+			}
+		}
+	}
+	switch intent {
+	case topologyUpdateUserCapture, topologyUpdateAdmission, topologyUpdateVerify,
+		topologyUpdateGenesis, topologyUpdateOperator:
+	default:
+		return nil, fmt.Errorf("unknown topology update intent %q", intent)
+	}
 	if req.VerifyTopologyGeneration != 0 && req.VerifyTopologyGeneration != workspace.Topology.Generation {
 		return nil, fmt.Errorf("%w: have %d, reconciling %d",
 			errTopologyGenerationChanged, workspace.Topology.Generation, req.VerifyTopologyGeneration)
@@ -1675,16 +1762,15 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 		req.BaseTopologyGeneration != workspace.Topology.Generation
 	previousTopology := workspace.Topology.Roots
 	if staleTopologyBase {
-		if attachment.AppliedTopologyGeneration != req.BaseTopologyGeneration ||
-			len(attachment.ObservedTopology) == 0 {
-			// No verified baseline to rebase against. Rather than refusing --
-			// which used to close the last escape hatch for a wedged
-			// attachment -- treat the capture as a fresh base. The pane-set
-			// check below is the safety property the baseline was protecting.
-			staleTopologyBase = false
-			previousTopology = workspace.Topology.Roots
-		} else {
+		if intent == topologyUpdateAdmission &&
+			attachment.AppliedTopologyGeneration == req.BaseTopologyGeneration &&
+			len(attachment.ObservedTopology) != 0 {
 			previousTopology = attachment.ObservedTopology
+		} else {
+			// Stale ordinary captures are stabilised against the current target.
+			// They may still verify it or update presentation, but can never be
+			// structurally rebased.
+			staleTopologyBase = false
 		}
 	}
 	stableTopology, err := stabilizeTopologyIDs(workspace.ID, previousTopology, req.Manifest.Topology)
@@ -1692,6 +1778,27 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 		return nil, err
 	}
 	capturedPanes := topologyPaneIDs(stableTopology)
+	if intent == topologyUpdateAdmission {
+		baselinePanes := topologyPaneIDs(previousTopology)
+		projected := projectTopologyPanes(stableTopology, baselinePanes)
+		projected, err = stabilizeTopologyIDs(workspace.ID, previousTopology, projected)
+		if err != nil {
+			return nil, fmt.Errorf("stabilize pane-admission baseline: %w", err)
+		}
+		if !topologyStructureEqual(projected, previousTopology) ||
+			!samePaneSet(topologyPaneIDs(projected), baselinePanes) {
+			return nil, fmt.Errorf("%w: pane admission existing-pane projection differs from its verified baseline", errStructuralPublicationRefused)
+		}
+		for paneID := range capturedPanes {
+			if baselinePanes[paneID] {
+				continue
+			}
+			pane := workspace.Panes[paneID]
+			if pane == nil || !pane.Proposed() {
+				return nil, fmt.Errorf("%w: pane admission capture added non-proposed pane %s", errStructuralPublicationRefused, paneID)
+			}
+		}
+	}
 	if staleTopologyBase {
 		for paneID := range topologyPaneIDs(attachment.ObservedTopology) {
 			pane := workspace.Panes[paneID]
@@ -1708,9 +1815,11 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 		}
 	} else {
 		expectedPanes := activeTopologyPaneIDs(workspace)
-		for paneID := range capturedPanes {
-			if pane := workspace.Panes[paneID]; pane != nil && pane.Proposed() {
-				expectedPanes[paneID] = true
+		if intent == topologyUpdateAdmission {
+			for paneID := range capturedPanes {
+				if pane := workspace.Panes[paneID]; pane != nil && pane.Proposed() {
+					expectedPanes[paneID] = true
+				}
 			}
 		}
 		if !samePaneSet(capturedPanes, expectedPanes) {
@@ -1772,6 +1881,8 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 			candidate.AppliedTopologyGeneration = workspace.Topology.Generation
 			candidate.AppliedTopologyDigest = workspace.Topology.Digest
 			candidate.ReconcileStatus = TopologyReconcileReady
+			candidate.ReconcileFailures = 0
+			candidate.ReconcileFailureGeneration = workspace.Topology.Generation
 			candidate.AppliedRevision = workspace.Revision
 		} else {
 			candidate.Status = AttachmentPreparing
@@ -1802,8 +1913,52 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 				req.BaseTopologyGeneration, workspace.Topology.Generation, err)
 		}
 	}
+	structuralChanged := topologyStructuralDigest(stableTopology) != workspace.Topology.Digest
+	installAuthority := topologyInstallVerify
+	if structuralChanged {
+		switch intent {
+		case topologyUpdateGenesis:
+			if len(workspace.Topology.Roots) != 0 {
+				return nil, fmt.Errorf("%w: genesis capture over an existing desired topology", errStructuralPublicationRefused)
+			}
+			installAuthority = topologyInstallGenesis
+		case topologyUpdateAdmission:
+			installAuthority = topologyInstallAdmission
+		case topologyUpdateOperator:
+			if req.ConfirmedTopologyDigest != topologyStructuralDigest(stableTopology) ||
+				req.BaseTopologyGeneration != workspace.Topology.Generation ||
+				req.BaseTopologyDigest != workspace.Topology.Digest {
+				return nil, fmt.Errorf("%w: operator adoption confirmation does not match the current base and candidate", errStructuralPublicationRefused)
+			}
+			installAuthority = topologyInstallOperator
+		case topologyUpdateUserCapture:
+			if attachment.Status != AttachmentReady ||
+				attachment.ReconcileStatus != TopologyReconcileReady ||
+				attachment.AppliedTopologyGeneration != workspace.Topology.Generation ||
+				attachment.AppliedTopologyDigest != workspace.Topology.Digest {
+				return nil, fmt.Errorf("%w: attachment %s is not ready at the current topology", errStructuralPublicationRefused, attachment.ID)
+			}
+			if req.BaseTopologyGeneration != 0 && req.BaseTopologyGeneration != workspace.Topology.Generation {
+				return nil, fmt.Errorf("%w: have %d, captured %d", errTopologyGenerationChanged, workspace.Topology.Generation, req.BaseTopologyGeneration)
+			}
+			if req.BaseTopologyDigest != "" && req.BaseTopologyDigest != workspace.Topology.Digest {
+				return nil, fmt.Errorf("%w: topology digest changed before structural capture commit", errStructuralPublicationRefused)
+			}
+			if explicitIntent && (req.BaseTopologyGeneration == 0 || req.BaseTopologyDigest == "" ||
+				req.SourceStatus != AttachmentReady || req.SourceReconcileStatus != TopologyReconcileReady ||
+				req.SourceAppliedGeneration != workspace.Topology.Generation ||
+				req.SourceAppliedDigest != workspace.Topology.Digest) {
+				return nil, fmt.Errorf("%w: capture did not carry a current ready source declaration", errStructuralPublicationRefused)
+			}
+			installAuthority = topologyInstallUserCapture
+		case topologyUpdateVerify:
+			return nil, fmt.Errorf("%w: reconciliation verification changed structure", errStructuralPublicationRefused)
+		default:
+			return nil, fmt.Errorf("%w: capture has no publication authority", errStructuralPublicationRefused)
+		}
+	}
 	before := workspace.Clone()
-	topologyChanged, err := installDesiredTopology(workspace, stableTopology)
+	topologyChanged, err := installDesiredTopology(workspace, stableTopology, installAuthority)
 	if err != nil {
 		// installDesiredTopology validates before it mutates, but restore the
 		// snapshot anyway so this path matches every other failure exit.
@@ -1841,6 +1996,8 @@ func (d *Daemon) updateManifest(req manifestUpdateRequest) (*Workspace, error) {
 		candidate.AppliedTopologyGeneration = workspace.Topology.Generation
 		candidate.AppliedTopologyDigest = workspace.Topology.Digest
 		candidate.ReconcileStatus = TopologyReconcileReady
+		candidate.ReconcileFailures = 0
+		candidate.ReconcileFailureGeneration = workspace.Topology.Generation
 		candidate.AppliedRevision = nextRevision
 	} else {
 		candidate.Status = AttachmentPreparing
@@ -2018,6 +2175,33 @@ func topologyPaneIDs(topology []Node) map[string]bool {
 	}
 	visit(topology)
 	return result
+}
+
+// projectTopologyPanes removes every pane not named by keep and prunes the
+// containers made empty as a result. It is the proof primitive for admission:
+// a capture may add proposed panes only when projecting them away reproduces a
+// topology the attachment had already verified.
+func projectTopologyPanes(nodes []Node, keep map[string]bool) []Node {
+	projected := cloneNodes(nodes)
+	var visit func([]Node) []Node
+	visit = func(children []Node) []Node {
+		result := make([]Node, 0, len(children))
+		for index := range children {
+			node := children[index]
+			if node.Kind == "pane" {
+				if keep[node.PaneID] {
+					result = append(result, node)
+				}
+				continue
+			}
+			node.Children = visit(node.Children)
+			if len(node.Children) != 0 {
+				result = append(result, node)
+			}
+		}
+		return result
+	}
+	return canonicalTopology(visit(projected))
 }
 
 func (d *Daemon) commitMove(req moveCommitRequest) (moveCommitResponse, error) {

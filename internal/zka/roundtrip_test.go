@@ -23,7 +23,7 @@ func roundTripWorkspace(t *testing.T, tabs []Node, panes []string) *Workspace {
 			Backend: BackendRef{Kind: "zmx", Ref: paneID}, CreatedAt: now, UpdatedAt: now,
 		}
 	}
-	if _, err := installDesiredTopology(workspace, []Node{{Kind: "os-window", Children: tabs}}); err != nil {
+	if _, err := installDesiredTopology(workspace, []Node{{Kind: "os-window", Children: tabs}}, topologyInstallSystem); err != nil {
 		t.Fatalf("install desired topology: %v", err)
 	}
 	return workspace

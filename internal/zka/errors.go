@@ -17,18 +17,20 @@ var (
 	errPaneAdmissionPending      = errors.New("pane admission is pending")
 
 	// Retry with backoff: a transient condition outside our control.
-	errKittyNotQuiescent        = errors.New("kitty tree is not quiescent")
-	errPanesNotReady            = errors.New("kitty panes did not become ready")
-	errWorkspaceRevisionChanged = errors.New("workspace revision changed")
-	errAttachmentTopologyStale  = errors.New("attachment topology is stale")
-	errNoVerifiedBaseline       = errors.New("attachment has no verified topology baseline")
-	errUnknownCapturedPane      = errors.New("kitty window references an unknown pane")
-	errKittyCommand             = errors.New("kitty remote control command failed")
-	errViewsNotReady            = errors.New("kitty views are not ready")
-	errTopologyPaneSetMismatch  = errors.New("captured pane set does not match the workspace")
+	errKittyNotQuiescent            = errors.New("kitty tree is not quiescent")
+	errPanesNotReady                = errors.New("kitty panes did not become ready")
+	errWorkspaceRevisionChanged     = errors.New("workspace revision changed")
+	errAttachmentTopologyStale      = errors.New("attachment topology is stale")
+	errNoVerifiedBaseline           = errors.New("attachment has no verified topology baseline")
+	errUnknownCapturedPane          = errors.New("kitty window references an unknown pane")
+	errKittyCommand                 = errors.New("kitty remote control command failed")
+	errViewsNotReady                = errors.New("kitty views are not ready")
+	errTopologyPaneSetMismatch      = errors.New("captured pane set does not match the workspace")
+	errStructuralPublicationRefused = errors.New("structural topology publication refused")
+	errStructuralApplyFailed        = errors.New("structural topology apply failed")
 
-	// Adoption candidate: enforcement is not converging, so the observed tree
-	// should become the desired one rather than being fought forever.
+	// Persistent enforcement mismatch: automatic retries eventually stall for
+	// this generation without changing the desired tree.
 	errStructureNotConverged = errors.New("kitty structure did not converge")
 
 	// Fatal: the desired state itself is malformed and retrying cannot help.
@@ -40,14 +42,14 @@ type reconcileClass int
 const (
 	reconcileRetryFast reconcileClass = iota
 	reconcileRetryBackoff
-	reconcileAdopt
+	reconcileStall
 	reconcileFatal
 )
 
 // classifyReconcileError decides what to do with a failed reconcile pass.
 // attempts is how many consecutive passes have already failed for the current
 // endpoint and generation; it is what converts persistent non-convergence into
-// adoption instead of an endless rebuild.
+// a layout stall instead of an endless rebuild or automatic adoption.
 func classifyReconcileError(err error, attempts, maxEnforceAttempts int) reconcileClass {
 	switch {
 	case err == nil:
@@ -58,7 +60,12 @@ func classifyReconcileError(err error, attempts, maxEnforceAttempts int) reconci
 		return reconcileRetryFast
 	case errors.Is(err, errStructureNotConverged):
 		if attempts >= maxEnforceAttempts {
-			return reconcileAdopt
+			return reconcileStall
+		}
+		return reconcileRetryBackoff
+	case errors.Is(err, errStructuralApplyFailed):
+		if attempts >= maxEnforceAttempts {
+			return reconcileStall
 		}
 		return reconcileRetryBackoff
 	case errors.Is(err, context.DeadlineExceeded):

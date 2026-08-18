@@ -51,6 +51,8 @@ func (t kittyTab) namedTitle() string {
 	return canonicalStrippedValue(stripStateMarker(t.Title))
 }
 
+func (t kittyTab) namedTitleKnown() bool { return t.TitleOverridden != nil }
+
 type kittyWindow struct {
 	ID        int64             `json:"id"`
 	Title     string            `json:"title"`
@@ -280,6 +282,15 @@ func (k KittyClient) SetPaneReady(ctx context.Context, endpoint string, windowID
 	return err
 }
 
+func (k KittyClient) SetTopologyIdentity(ctx context.Context, endpoint string, windowID int64, tabNodeID, osWindowNodeID string) error {
+	if endpoint == "" || windowID <= 0 || tabNodeID == "" || osWindowNodeID == "" {
+		return fmt.Errorf("current Kitty topology identity is unavailable")
+	}
+	_, err := k.rc(ctx, endpoint, "set-user-vars", "--match", "id:"+strconv.FormatInt(windowID, 10),
+		"zka_tab="+tabNodeID, "zka_os_window="+osWindowNodeID)
+	return err
+}
+
 // SetTabTitle names a tab, or clears the name when title is empty so the tab
 // falls back to reporting its active window's title. Like set-window-title,
 // kitten expands ANSI-C escapes in the positional argument.
@@ -388,7 +399,8 @@ func topologyFromKitty(tree []kittyOSWindow, workspaceID string) ([]Node, error)
 			if err != nil {
 				return nil, fmt.Errorf("normalize Kitty tab %d layout state: %w", tab.ID, err)
 			}
-			tabNode := Node{Kind: "tab", Title: tab.namedTitle(), Layout: tab.Layout, EnabledLayouts: append([]string(nil), tab.Enabled...), LayoutState: layoutState, Active: tab.IsActive, Focused: tab.IsFocused}
+			titleKnown := tab.namedTitleKnown()
+			tabNode := Node{Kind: "tab", Title: tab.namedTitle(), Layout: tab.Layout, EnabledLayouts: append([]string(nil), tab.Enabled...), LayoutState: layoutState, Active: tab.IsActive, Focused: tab.IsFocused, TitleKnown: &titleKnown}
 			tabIdentityConflict := false
 			for _, window := range tab.Windows {
 				paneID := window.UserVars["zka_pane"]

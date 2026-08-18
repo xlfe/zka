@@ -437,7 +437,7 @@ func TestForgetDetachedRemoteWorkspaceCleansOnlyLocalState(t *testing.T) {
 }
 
 func TestForgetRemoteWorkspaceRequiresEveryLocalAttachmentDetached(t *testing.T) {
-	for _, status := range []AttachmentStatus{AttachmentPreparing, AttachmentReady, AttachmentUnhealthy} {
+	for _, status := range []AttachmentStatus{AttachmentPreparing, AttachmentReady, AttachmentLayoutStalled, AttachmentUnhealthy} {
 		t.Run(string(status), func(t *testing.T) {
 			d, err := newTestDaemon(t, testRoot(t), quietRunner())
 			if err != nil {

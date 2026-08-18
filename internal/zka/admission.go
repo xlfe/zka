@@ -51,6 +51,9 @@ func (d *Daemon) schedulePaneAdmission(endpoint string) {
 				d.schedulePaneAdmission(endpoint)
 			}
 		}()
+		operation := d.endpointTopologyOperation(endpoint)
+		operation.Lock()
+		defer operation.Unlock()
 		if err := d.admitPendingPanes(ctx, endpoint); err != nil && ctx.Err() == nil {
 			// Admission is best effort and self-healing; the retry is what
 			// makes it converge, not an error report.
@@ -125,12 +128,15 @@ func (d *Daemon) admitPendingPanes(ctx context.Context, endpoint string) error {
 	}
 	request := manifestUpdateRequest{
 		Workspace: workspace.ID, Attachment: attachment.ID,
-		ExpectedRevision:       workspace.Revision,
-		BaseTopologyGeneration: attachment.AppliedTopologyGeneration,
-		Manifest:               manifest, Views: views,
+		ExpectedRevision: workspace.Revision,
+		Manifest:         manifest, Views: views,
 	}
+	populateManifestSource(&request, workspace, attachment, topologyUpdateAdmission)
+	request.BaseTopologyGeneration = attachment.AppliedTopologyGeneration
+	request.BaseTopologyDigest = attachment.AppliedTopologyDigest
 	if request.BaseTopologyGeneration == 0 {
 		request.BaseTopologyGeneration = workspace.Topology.Generation
+		request.BaseTopologyDigest = workspace.Topology.Digest
 	}
 	if workspace.RemoteHost != "" {
 		remoteCtx, remoteCancel := context.WithTimeout(ctx, 10*time.Second)

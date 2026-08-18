@@ -148,8 +148,20 @@ func (d *Daemon) beginPaneClosure(req closePanesRequest) (*Workspace, bool, erro
 	if attachment == nil {
 		return nil, false, fmt.Errorf("unknown attachment %q", req.Attachment)
 	}
-	if attachment.Status != AttachmentReady || attachment.Revoked || attachment.AppliedRevision != workspace.Revision {
+	if !attachmentOperational(attachment) {
 		return nil, false, fmt.Errorf("attachment %s is not a current ready attachment", attachment.ID)
+	}
+	if workspace.Topology.Generation != 0 &&
+		(attachment.AppliedTopologyGeneration != workspace.Topology.Generation ||
+			attachment.AppliedTopologyDigest != workspace.Topology.Digest) {
+		return nil, false, fmt.Errorf("attachment %s has not verified the current topology", attachment.ID)
+	}
+	if req.BaseTopologyGeneration != 0 && req.BaseTopologyGeneration != workspace.Topology.Generation {
+		return nil, false, fmt.Errorf("%w: have %d, captured %d", errTopologyGenerationChanged,
+			workspace.Topology.Generation, req.BaseTopologyGeneration)
+	}
+	if req.BaseTopologyDigest != "" && req.BaseTopologyDigest != workspace.Topology.Digest {
+		return nil, false, fmt.Errorf("%w: topology digest changed before pane closure commit", errTopologyGenerationChanged)
 	}
 	for paneID := range requested {
 		pane := workspace.Panes[paneID]
@@ -187,18 +199,12 @@ func (d *Daemon) beginPaneClosure(req closePanesRequest) (*Workspace, bool, erro
 	}
 	captured := topologyPaneIDs(req.Manifest.Topology)
 	if !samePaneSet(captured, remaining) {
-		return nil, false, fmt.Errorf("captured topology does not equal the workspace after the requested pane closure")
+		return nil, false, fmt.Errorf("%w: captured topology does not equal the workspace after the requested pane closure",
+			errTopologyPaneSetMismatch)
 	}
 	temporary := attachment.Clone()
 	temporary.Views = req.Views
 	if err := validateViewsReady(temporary, remaining); err != nil {
-		return nil, false, err
-	}
-	if attachment.Transport.Kind == "ssh" {
-		preserveOriginPaneCWD(workspace, req.Manifest.Topology)
-	}
-	stableTopology, err := stabilizeTopologyIDs(workspace.ID, workspace.Topology.Roots, req.Manifest.Topology)
-	if err != nil {
 		return nil, false, err
 	}
 	for paneID := range requested {
@@ -207,7 +213,11 @@ func (d *Daemon) beginPaneClosure(req closePanesRequest) (*Workspace, bool, erro
 		pane.RemovalError = ""
 		pane.UpdatedAt = now
 	}
-	topologyChanged, err := installDesiredTopology(workspace, stableTopology)
+	// Closure is a pane-id delta over the current desired tree. The capture is
+	// evidence that the panes disappeared; its arrangement of survivors is not
+	// authoritative and may be a half-applied reconcile.
+	remainingTopology := projectTopologyPanes(workspace.Topology.Roots, remaining)
+	topologyChanged, err := installDesiredTopology(workspace, remainingTopology, topologyInstallClosure)
 	if err != nil {
 		d.state.Workspaces[workspace.ID] = before
 		return nil, false, err
@@ -216,7 +226,13 @@ func (d *Daemon) beginPaneClosure(req closePanesRequest) (*Workspace, bool, erro
 		d.state.Workspaces[workspace.ID] = before
 		return nil, false, fmt.Errorf("pane closure did not change canonical topology")
 	}
-	applyCapturedPaneMetadata(workspace, workspace.Topology.Roots, attachment.Transport.Kind != "ssh")
+	capturedTopology, err := stabilizeTopologyIDs(workspace.ID, workspace.Topology.Roots, req.Manifest.Topology)
+	if err != nil {
+		d.state.Workspaces[workspace.ID] = before
+		return nil, false, err
+	}
+	sourceMatchesDesired := topologyMatchesDesired(workspace, capturedTopology)
+	applyCapturedPaneMetadata(workspace, capturedTopology, attachment.Transport.Kind != "ssh")
 	req.Manifest.CapturedAt = now
 	req.Manifest.Topology = cloneNodes(workspace.Topology.Roots)
 	applyManifestLaunchOptions(workspace, req.Manifest.Session)
@@ -229,15 +245,23 @@ func (d *Daemon) beginPaneClosure(req closePanesRequest) (*Workspace, bool, erro
 	workspace.Revision++
 	workspace.UpdatedAt = now
 	attachment.Views = cloneViews(req.Views)
-	attachment.AppliedRevision = workspace.Revision
-	attachment.AppliedTopologyGeneration = workspace.Topology.Generation
-	attachment.AppliedTopologyDigest = workspace.Topology.Digest
-	attachment.ObservedTopology = topologyIdentity(workspace.Topology.Roots)
+	attachment.ObservedTopology = topologyIdentity(capturedTopology)
 	attachment.ReconcileTargetGeneration = workspace.Topology.Generation
-	attachment.ReconcileStatus = "ready"
 	attachment.LastError = ""
 	attachment.UpdatedAt = now
 	annotateRuntimeViews(attachment.ObservedTopology, attachment.Views)
+	if sourceMatchesDesired {
+		attachment.Status = AttachmentReady
+		attachment.AppliedRevision = workspace.Revision
+		attachment.AppliedTopologyGeneration = workspace.Topology.Generation
+		attachment.AppliedTopologyDigest = workspace.Topology.Digest
+		attachment.ReconcileStatus = TopologyReconcileReady
+		attachment.ReconcileFailures = 0
+		attachment.ReconcileFailureGeneration = workspace.Topology.Generation
+	} else {
+		attachment.Status = AttachmentPreparing
+		attachment.ReconcileStatus = TopologyReconcilePending
+	}
 	for id, other := range workspace.Attachments {
 		if id == attachment.ID || other.Status == AttachmentDetached || other.Revoked {
 			continue
@@ -250,7 +274,7 @@ func (d *Daemon) beginPaneClosure(req closePanesRequest) (*Workspace, bool, erro
 		return nil, false, err
 	}
 	for id, other := range workspace.Attachments {
-		if id == attachment.ID || !isLocalUnixAttachment(other, d.state.Node.ID) ||
+		if (id == attachment.ID && sourceMatchesDesired) || !isLocalUnixAttachment(other, d.state.Node.ID) ||
 			other.Status == AttachmentDetached || other.Revoked {
 			continue
 		}

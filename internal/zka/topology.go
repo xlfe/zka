@@ -37,6 +37,10 @@ func desiredPaneIDs(workspace *Workspace) map[string]bool {
 // Kitty silently deletes an intermediate empty tab and fills a trailing one
 // with an unmanaged shell, which then breaks capture permanently.
 func canonicalTopology(nodes []Node) []Node {
+	return canonicalTopologyAt(nodes, true)
+}
+
+func canonicalTopologyAt(nodes []Node, roots bool) []Node {
 	result := cloneNodes(nodes)
 	var normalize func([]Node) []Node
 	normalize = func(children []Node) []Node {
@@ -57,7 +61,16 @@ func canonicalTopology(nodes []Node) []Node {
 		}
 		return kept
 	}
-	return normalize(result)
+	result = normalize(result)
+	// Independent OS windows have no commandable order. Store them in stable
+	// identity order as well as ignoring their observed ls order in the digest,
+	// otherwise compositor churn causes needless state rewrites.
+	if roots {
+		slices.SortFunc(result, func(left, right Node) int {
+			return strings.Compare(left.ID, right.ID)
+		})
+	}
+	return result
 }
 
 // Captured Kitty layout state is rewritten to stable pane-derived IDs before
@@ -99,13 +112,24 @@ func stableLayoutState(raw json.RawMessage) json.RawMessage {
 // Tab Title and Layout are enforceable, so they are pushed when they differ --
 // they are simply not part of identity.
 func topologyStructuralIdentity(nodes []Node) []Node {
+	return topologyStructuralIdentityAt(nodes, true)
+}
+
+func topologyStructuralIdentityAt(nodes []Node, roots bool) []Node {
 	result := make([]Node, 0, len(nodes))
 	for _, node := range nodes {
 		result = append(result, Node{
 			ID:       node.ID,
 			Kind:     node.Kind,
 			PaneID:   node.PaneID,
-			Children: topologyStructuralIdentity(node.Children),
+			Children: topologyStructuralIdentityAt(node.Children, false),
+		})
+	}
+	// Kitty exposes no operation for ordering independent OS windows. Its ls
+	// order is compositor/runtime state, not a reproducible part of the layout.
+	if roots {
+		slices.SortFunc(result, func(left, right Node) int {
+			return strings.Compare(left.ID, right.ID)
 		})
 	}
 	return result
@@ -164,6 +188,7 @@ func stabilizeTopologyIDs(workspaceID string, previous, captured []Node) ([]Node
 	}
 	collect(previous)
 	used := map[string]bool{}
+	genesis := len(previous) == 0
 	var assign func([]Node, string) ([]Node, error)
 	assign = func(nodes []Node, path string) ([]Node, error) {
 		result := cloneNodes(nodes)
@@ -178,7 +203,7 @@ func stabilizeTopologyIDs(workspaceID string, previous, captured []Node) ([]Node
 			case "tab", "os-window":
 				signature := paneSignature(*node)
 				bestID, bestScore := "", -1
-				if node.ID != "" && !used[node.ID] {
+				if genesis && node.ID != "" && !used[node.ID] {
 					bestID, bestScore = node.ID, 1<<21
 				}
 				for _, candidate := range available[node.Kind] {
@@ -187,10 +212,10 @@ func stabilizeTopologyIDs(workspaceID string, previous, captured []Node) ([]Node
 					}
 					score := paneOverlap(*node, candidate)
 					if paneSignature(candidate) == signature {
-						score += 1 << 20
+						score += 1 << 24
 					}
 					if node.ID != "" && candidate.ID == node.ID {
-						score += 1 << 22
+						score += 1 << 12
 					}
 					if score > bestScore || (score == bestScore && candidate.ID < bestID) {
 						bestID, bestScore = candidate.ID, score
@@ -537,7 +562,19 @@ func setDesiredTopology(workspace *Workspace, roots []Node) bool {
 // back, so one rejected capture could leave a pane marked canonical while
 // absent from Roots -- a state in which the workspace can never be rendered
 // into a session again, i.e. permanently unattachable.
-func installDesiredTopology(workspace *Workspace, nodes []Node) (bool, error) {
+type topologyInstallAuthority string
+
+const (
+	topologyInstallSystem      topologyInstallAuthority = "system"
+	topologyInstallVerify      topologyInstallAuthority = "verify"
+	topologyInstallGenesis     topologyInstallAuthority = "genesis"
+	topologyInstallUserCapture topologyInstallAuthority = "user-capture"
+	topologyInstallAdmission   topologyInstallAuthority = "pane-admission"
+	topologyInstallClosure     topologyInstallAuthority = "pane-closure"
+	topologyInstallOperator    topologyInstallAuthority = "operator-adopt"
+)
+
+func installDesiredTopology(workspace *Workspace, nodes []Node, authority topologyInstallAuthority) (bool, error) {
 	stable, err := stabilizeTopologyIDs(workspace.ID, workspace.Topology.Roots, nodes)
 	if err != nil {
 		return false, err
@@ -554,7 +591,29 @@ func installDesiredTopology(workspace *Workspace, nodes []Node) (bool, error) {
 	if err := validateTopology(workspace, stable, expected); err != nil {
 		return false, err
 	}
-	if topologyStructuralDigest(stable) == workspace.Topology.Digest && len(promote) == 0 {
+	structuralChanged := topologyStructuralDigest(stable) != workspace.Topology.Digest
+	if structuralChanged {
+		switch authority {
+		case topologyInstallVerify:
+			return false, fmt.Errorf("refusing structural topology publication from reconciliation verification")
+		case topologyInstallGenesis:
+			if len(workspace.Topology.Roots) != 0 {
+				return false, fmt.Errorf("refusing genesis topology over an existing desired layout")
+			}
+		case topologyInstallAdmission:
+			if len(promote) == 0 {
+				return false, fmt.Errorf("pane admission did not add a proposed pane")
+			}
+		case topologyInstallClosure:
+			if len(promote) != 0 {
+				return false, fmt.Errorf("pane closure cannot admit proposed panes")
+			}
+		case topologyInstallSystem, topologyInstallUserCapture, topologyInstallOperator:
+		default:
+			return false, fmt.Errorf("structural topology publication has no authority")
+		}
+	}
+	if !structuralChanged && len(promote) == 0 {
 		// Presentation may still have moved; keep Roots current so restores
 		// replay the latest titles and split geometry.
 		workspace.Topology.Roots = stable

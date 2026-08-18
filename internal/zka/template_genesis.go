@@ -257,7 +257,7 @@ func installGenesisTopology(workspace *Workspace, req createWorkspaceRequest, pa
 		}
 		nodes = append(nodes, osNode)
 	}
-	if _, err := installDesiredTopology(workspace, nodes); err != nil {
+	if _, err := installDesiredTopology(workspace, nodes, topologyInstallGenesis); err != nil {
 		return err
 	}
 	if req.FocusPane != nil {

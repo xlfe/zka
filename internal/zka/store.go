@@ -294,21 +294,19 @@ func decodeLegacyPanePhases(data []byte) map[string]map[string]PaneLifecycle {
 	return result
 }
 
-// enforceTopologyInvariants is a last line of defence on the way to disk. The
-// digest must always be derivable from the stored tree; the previous code let
-// callers rewrite Roots after the digest had been computed, which could persist
-// a convergence target that was unreachable by construction. Repairing here
-// costs one tree walk against an already O(state) marshal.
-func (s *Store) enforceTopologyInvariants(state StateData) {
+// enforceTopologyInvariants is a last line of defence on the way to disk.
+// Save must never silently publish new structure by repairing a digest at the
+// same generation; startup migration is the only place allowed to rewrite it.
+func (s *Store) enforceTopologyInvariants(state StateData) error {
 	for _, workspace := range state.Workspaces {
 		if len(workspace.Topology.Roots) == 0 {
 			continue
 		}
 		if digest := topologyStructuralDigest(workspace.Topology.Roots); digest != workspace.Topology.Digest {
-			s.logf("workspace %s: repairing topology digest that disagreed with its roots", workspace.ID)
-			workspace.Topology.Digest = digest
+			return fmt.Errorf("workspace %s topology digest disagrees with its roots", workspace.ID)
 		}
 	}
+	return nil
 }
 
 func (s *Store) logf(format string, args ...any) {
@@ -412,7 +410,9 @@ func (s *Store) Save(state StateData) error {
 	if err := s.Ensure(); err != nil {
 		return err
 	}
-	s.enforceTopologyInvariants(state)
+	if err := s.enforceTopologyInvariants(state); err != nil {
+		return err
+	}
 	state.SchemaVersion = stateSchemaVersion
 	b, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {

@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const Version = "0.10.0"
+const Version = "0.10.1"
 
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
@@ -325,6 +325,8 @@ func runWorkspace(args []string, paths Paths, stdout, stderr io.Writer) (int, er
 		return runWorkspaceInspect(args[1:], paths, stdout, stderr)
 	case "reconcile":
 		return runWorkspaceReconcile(args[1:], paths, stdout, stderr)
+	case "adopt-layout":
+		return runWorkspaceAdoptLayout(args[1:], paths, stdout, stderr)
 	case "create":
 		return runWorkspaceCreate(args[1:], paths, stdout, stderr)
 	case "attach":
@@ -357,6 +359,7 @@ func printWorkspaceUsage(w io.Writer) {
   list [--origin SSH_ALIAS] [--json]
   inspect [SSH_ALIAS:]REF [--json]
   reconcile [SSH_ALIAS:]REF [--attachment ID] [--recreate-backends]
+  adopt-layout REF [--attachment ID] [--confirm TOKEN]
   create [SSH_ALIAS:]NAME [--template FILE] [--cwd DIR] [--attach] [--credential-bundle NAME] [--credential-window DUR] [--no-credentials]
   attach [SSH_ALIAS:]REF [--pane PANE] [--claim-credentials] [--credential-bundle NAME] [--credential-window DUR]
   move [SSH_ALIAS:]REF [--pane PANE]
@@ -862,6 +865,38 @@ func runWorkspaceReconcile(args []string, paths Paths, stdout, stderr io.Writer)
 	return 0, nil
 }
 
+func runWorkspaceAdoptLayout(args []string, paths Paths, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("workspace adopt-layout", stderr)
+	attachmentID := fs.String("attachment", "", "local attachment id")
+	confirm := fs.String("confirm", "", "confirmation token from a prior preview")
+	if err := parseInterspersed(fs, args); err != nil {
+		return 2, err
+	}
+	if fs.NArg() != 1 {
+		return 2, fmt.Errorf("workspace adopt-layout requires one local workspace reference")
+	}
+	if host, _ := splitWorkspaceRef(fs.Arg(0)); host != "" {
+		return 2, fmt.Errorf("workspace adopt-layout must run on the machine whose Kitty layout is being adopted")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	response, err := NewAPI(paths).AdoptLayout(ctx, topologyAdoptRequest{
+		Workspace: fs.Arg(0), Attachment: *attachmentID, Confirm: *confirm,
+	})
+	if err != nil {
+		return 1, err
+	}
+	if !response.Applied {
+		fmt.Fprintf(stdout, "desired=%s candidate=%s\n- desired %s\n+ observed %s\nconfirm=%s\n",
+			shortDigest(response.DesiredDigest), shortDigest(response.CandidateDigest),
+			response.DesiredShape, response.CandidateShape, response.ConfirmToken)
+		return 0, nil
+	}
+	fmt.Fprintf(stdout, "%s\tgeneration=%d\tdigest=%s\n", response.Workspace.ID,
+		response.Workspace.Topology.Generation, shortDigest(response.Workspace.Topology.Digest))
+	return 0, nil
+}
+
 func shortDigest(digest string) string {
 	if len(digest) > 12 {
 		return digest[:12]
@@ -1198,14 +1233,14 @@ func credentialOwnerAttachment(workspace *Workspace, nodeID, explicit string) (s
 	}
 	if explicit != "" {
 		attachment := workspace.Attachments[explicit]
-		if attachment == nil || attachment.Node.ID != nodeID || attachment.Status != AttachmentReady || attachment.Revoked {
+		if attachment == nil || attachment.Node.ID != nodeID || !attachmentOperational(attachment) {
 			return "", fmt.Errorf("attachment %s is not an active attachment owned by this node", explicit)
 		}
 		return explicit, nil
 	}
 	var candidates []string
 	for id, attachment := range workspace.Attachments {
-		if attachment != nil && attachment.Node.ID == nodeID && attachment.Status == AttachmentReady && !attachment.Revoked {
+		if attachment != nil && attachment.Node.ID == nodeID && attachmentOperational(attachment) {
 			candidates = append(candidates, id)
 		}
 	}
@@ -1253,7 +1288,7 @@ func refreshCredentialSessionForCLI(api API, bundle, action, workspace string, s
 }
 
 func attachmentUsable(attachment *Attachment) bool {
-	return attachment != nil && attachment.Status == AttachmentReady && strings.HasPrefix(attachment.Endpoint, "unix:") && !attachment.Revoked
+	return attachmentOperational(attachment) && strings.HasPrefix(attachment.Endpoint, "unix:")
 }
 
 func attachmentTopologyCurrent(workspace *Workspace, attachment *Attachment) bool {
