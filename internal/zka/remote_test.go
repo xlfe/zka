@@ -291,6 +291,49 @@ func TestRemoteCachePreservesLocalRuntimeMapping(t *testing.T) {
 	}
 }
 
+func TestRemoteCachePreservesLocalProposedPaneAdmissionBinding(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &Workspace{
+		ID: remoteWorkspaceIDForTest, Name: "example-project", Origin: Host{ID: "devbox.example", Name: "devbox.example"},
+		Panes: map[string]*Pane{
+			"pane": {
+				ID: "pane", Phase: PaneProposed,
+				Admission: PaneAdmission{RequestedAt: time.Now().UTC()},
+			},
+		},
+		Attachments: map[string]*Attachment{},
+	}
+	if _, err := d.cacheRemoteWorkspace("devbox.example", remote); err != nil {
+		t.Fatal(err)
+	}
+	endpoint := "unix:/kitty"
+	d.mu.Lock()
+	cached := d.state.Workspaces[remote.ID]
+	cached.Attachments["local"] = &Attachment{
+		ID: "local", Endpoint: endpoint, Node: d.state.Node, Status: AttachmentReady,
+	}
+	cached.Panes["pane"].Admission.Endpoint = endpoint
+	cached.Panes["pane"].Admission.AttachmentID = "local"
+	d.mu.Unlock()
+
+	// The next origin snapshot still cannot contain the local endpoint.
+	remote.Revision++
+	remote.Attachments["local"] = &Attachment{
+		ID: "local", Endpoint: "ssh:provider:local", Status: AttachmentPreparing,
+	}
+	updated, err := d.cacheRemoteWorkspace("devbox.example", remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := updated.Panes["pane"].Admission
+	if admission.Endpoint != endpoint || admission.AttachmentID != "local" {
+		t.Fatalf("origin snapshot erased local admission binding: %#v", admission)
+	}
+}
+
 func TestRemoteCacheKeepsDetachedAttachmentDetached(t *testing.T) {
 	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {

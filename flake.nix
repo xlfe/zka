@@ -11,7 +11,7 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      releaseVersion = "0.10.1";
+      releaseVersion = "0.10.2";
     in
     {
       # kitty and python3 are what the differential session-parser oracle in
@@ -77,6 +77,15 @@
             checkPhase = ''
               runHook preCheck
               go test -tags nox11 ./...
+              # Seed execution alone would make this look fuzz-tested while
+              # exploring no new event orderings. Keep a bounded mutation
+              # campaign in the normal package gate; one worker avoids
+              # oversubscribing the process-level origin/provider harness.
+              go test -tags nox11 ./internal/zka \
+                -run='^$' \
+                -fuzz='^FuzzRemotePaneLifecycle$' \
+                -fuzztime=100x \
+                -parallel=1
               runHook postCheck
             '';
 

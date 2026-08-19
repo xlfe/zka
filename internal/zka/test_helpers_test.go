@@ -317,42 +317,55 @@ func testPreparePane(d *Daemon, workspace, pane, cwd string) (preparePaneRespons
 	return d.preparePane(workspacePaneRequest{Workspace: workspace, Pane: pane, CWD: cwd})
 }
 
-// kittyTreeForTabs builds a realistic Kitty tree: one OS window, one tab per
-// group, with the enabled_layouts and layout_state a real Kitty always reports.
-// Fixtures that omit those fields hide exactly the class of bug this package
-// exists to prevent.
+// kittyTreeForTabs builds a realistic single-OS-window Kitty tree. See
+// kittyTreeForOSWindows for the general form.
 func kittyTreeForTabs(workspaceID string, tabs [][]string) []kittyOSWindow {
+	return kittyTreeForOSWindows(workspaceID, [][][]string{tabs})
+}
+
+// kittyTreeForOSWindows builds a realistic Kitty tree from
+// OS-window -> tab -> pane ids. In particular, every tab carries the
+// enabled_layouts and layout_state fields a real Kitty always reports.
+// Fixtures that omit those fields hide exactly the class of structural
+// publication bug this package exists to prevent.
+func kittyTreeForOSWindows(workspaceID string, roots [][][]string) []kittyOSWindow {
 	// Tabs are unnamed unless something explicitly named them, which is what
 	// Kitty reports via title_overridden. An unnamed tab echoes its active
 	// window's title, and capturing that as a desired name is precisely the
 	// mistake that pins transient program titles into the topology.
 	unnamed := false
-	osWindow := kittyOSWindow{ID: 1, WMClass: "managed-kitty"}
 	windowID := int64(10)
-	for index, panes := range tabs {
-		tab := kittyTab{
-			ID: int64(100 + index), Layout: "splits", IsActive: index == 0,
-			Enabled:         []string{"fat", "grid", "horizontal", "splits", "stack", "tall", "vertical"},
-			TitleOverridden: &unnamed, Title: "shell",
+	tabID := int64(100)
+	var tree []kittyOSWindow
+	for rootIndex, tabs := range roots {
+		osWindow := kittyOSWindow{ID: int64(rootIndex + 1), WMClass: "managed-kitty"}
+		for tabIndex, panes := range tabs {
+			tab := kittyTab{
+				ID: tabID, Layout: "splits", IsActive: tabIndex == 0,
+				Enabled:         []string{"fat", "grid", "horizontal", "splits", "stack", "tall", "vertical"},
+				TitleOverridden: &unnamed, Title: "shell",
+			}
+			tabID++
+			var groups []string
+			for offset, paneID := range panes {
+				windowID++
+				tab.Windows = append(tab.Windows, kittyWindow{
+					ID: windowID, Title: "shell", IsActive: offset == 0,
+					UserVars: map[string]string{
+						"zka_workspace": workspaceID, "zka_pane": paneID, "zka_ready": "1",
+					},
+					Cmdline: []string{"zka", "pane", "--workspace", workspaceID},
+				})
+				groups = append(groups, fmt.Sprintf(`{"id":%d,"window_ids":[%d]}`, windowID, windowID))
+			}
+			tab.LayoutState = json.RawMessage(fmt.Sprintf(
+				`{"all_windows":{"active_group_idx":0,"active_group_history":[],"window_groups":[%s]},"class":"Splits","opts":{}}`,
+				strings.Join(groups, ",")))
+			osWindow.Tabs = append(osWindow.Tabs, tab)
 		}
-		var groups []string
-		for offset, paneID := range panes {
-			windowID++
-			tab.Windows = append(tab.Windows, kittyWindow{
-				ID: windowID, Title: "shell", IsActive: offset == 0,
-				UserVars: map[string]string{
-					"zka_workspace": workspaceID, "zka_pane": paneID, "zka_ready": "1",
-				},
-				Cmdline: []string{"zka", "pane", "--workspace", workspaceID},
-			})
-			groups = append(groups, fmt.Sprintf(`{"id":%d,"window_ids":[%d]}`, windowID, windowID))
-		}
-		tab.LayoutState = json.RawMessage(fmt.Sprintf(
-			`{"all_windows":{"active_group_idx":0,"active_group_history":[],"window_groups":[%s]},"class":"Splits","opts":{}}`,
-			strings.Join(groups, ",")))
-		osWindow.Tabs = append(osWindow.Tabs, tab)
+		tree = append(tree, osWindow)
 	}
-	return []kittyOSWindow{osWindow}
+	return tree
 }
 
 // kittyResponse answers the three `kitten @` calls a capture makes.

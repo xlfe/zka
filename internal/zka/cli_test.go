@@ -15,6 +15,35 @@ import (
 	"time"
 )
 
+func TestWaitForRemotePaneAdmissionRetriesUntilDaemonOwnsProposal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error)
+	attempts := 0
+	runErr, exited, err := waitForRemotePaneAdmission(ctx, done, func(context.Context) error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("local daemon temporarily unavailable")
+		}
+		return nil
+	})
+	if err != nil || exited || runErr != nil || attempts != 3 {
+		t.Fatalf("retry result = runErr %v, exited %v, err %v, attempts %d", runErr, exited, err, attempts)
+	}
+}
+
+func TestWaitForRemotePaneAdmissionStopsWhenPaneProcessExits(t *testing.T) {
+	wantRunErr := errors.New("remote pane exited")
+	done := make(chan error, 1)
+	done <- wantRunErr
+	runErr, exited, err := waitForRemotePaneAdmission(context.Background(), done, func(context.Context) error {
+		return errors.New("local daemon unavailable")
+	})
+	if err != nil || !exited || !errors.Is(runErr, wantRunErr) {
+		t.Fatalf("exit result = runErr %v, exited %v, err %v", runErr, exited, err)
+	}
+}
+
 func TestLocalAndRemotePaneBackendCommandsUseStableCredentialEnvironment(t *testing.T) {
 	t.Setenv("SSH_AUTH_SOCK", "/tmp/local-agent.sock")
 	t.Setenv("GNUPGHOME", "/tmp/local-gnupg")

@@ -238,8 +238,71 @@ func (d *Daemon) admitPane(ctx context.Context, req admitPaneRequest) (*Workspac
 	if endpoint == "" {
 		return workspace, nil
 	}
-	if err := d.admitPendingPanes(ctx, endpoint); err != nil {
+	operation := d.endpointTopologyOperation(endpoint)
+	operation.Lock()
+	defer operation.Unlock()
+	if err := d.bindProposedPaneAdmission(workspace.ID, req.Pane, endpoint); err != nil {
 		return nil, err
 	}
+	if err := d.admitPendingPanes(ctx, endpoint); err != nil {
+		// The explicit pane callback is advisory. Once it has supplied the
+		// provider-local endpoint, the background worker owns retries even if
+		// this synchronous capture or its remote commit loses a race.
+		d.schedulePaneAdmission(endpoint)
+		return d.getWorkspace(req.Workspace)
+	}
 	return d.getWorkspace(req.Workspace)
+}
+
+// bindProposedPaneAdmission completes the local half of a remote allocation.
+// The origin deliberately strips a provider's Unix Kitty endpoint from the
+// allocate_pane request; after that response is cached, admit_pane is the first
+// authenticated local callback that can safely associate the tagged window
+// with its attachment.
+func (d *Daemon) bindProposedPaneAdmission(workspaceRef, paneID, endpoint string) error {
+	if endpoint == "" {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	workspace, err := d.resolveWorkspaceLocked(workspaceRef)
+	if err != nil {
+		return err
+	}
+	pane := workspace.Panes[paneID]
+	if pane == nil {
+		return fmt.Errorf("unknown pane %q", paneID)
+	}
+	if !pane.Proposed() {
+		return nil
+	}
+	attachmentID := attachmentIDForEndpointLocked(workspace, endpoint)
+	if attachmentID == "" {
+		return fmt.Errorf("pane admission endpoint %q is not an attachment of workspace %s", endpoint, shortID(workspace.ID))
+	}
+	attachment := workspace.Attachments[attachmentID]
+	if !isLocalUnixAttachment(attachment, d.state.Node.ID) {
+		return fmt.Errorf("pane admission endpoint %q is not a local Kitty attachment", endpoint)
+	}
+	if pane.Admission.AttachmentID != "" && pane.Admission.AttachmentID != attachmentID {
+		return fmt.Errorf("pane %s belongs to attachment %s, not %s", shortID(pane.ID), shortID(pane.Admission.AttachmentID), shortID(attachmentID))
+	}
+	if pane.Admission.Endpoint == endpoint && pane.Admission.AttachmentID == attachmentID {
+		return nil
+	}
+	before := workspace.Clone()
+	now := time.Now().UTC()
+	pane.Admission.Endpoint = endpoint
+	pane.Admission.AttachmentID = attachmentID
+	if pane.Admission.RequestedAt.IsZero() {
+		pane.Admission.RequestedAt = now
+	}
+	pane.Admission.MissingSince = time.Time{}
+	pane.UpdatedAt = now
+	workspace.UpdatedAt = now
+	if err := d.store.Save(d.state); err != nil {
+		d.state.Workspaces[workspace.ID] = before
+		return err
+	}
+	return nil
 }

@@ -2,6 +2,7 @@ package zka
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -133,6 +134,82 @@ func TestPaneAdmissionCommitsFromRealCapture(t *testing.T) {
 		if strings.Contains(strings.Join(call.Args, " "), "goto_session") {
 			t.Fatalf("admission rebuilt the session: %#v", call.Args)
 		}
+	}
+}
+
+// A pane allocated by a remote attachment is created at the origin without
+// the provider's local Kitty endpoint. Once the provider reports that the
+// tagged window is ready, admit_pane must bind that local endpoint before
+// running admission. Otherwise no worker owns the proposal and the origin
+// retires the still-visible pane at paneAdmissionDeadline.
+func TestAdmitPaneBindsEndpointForRemoteAllocatedProposal(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	workspace, attachment := readyWorkspaceAttachment(t, d, workspace, "local")
+	first := firstPane(workspace)
+	allocated, err := d.allocatePane(allocatePaneRequest{
+		Workspace: workspace.ID,
+		Key:       attachment.ID + ":remote-allocation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocated.Pane.Admission.Endpoint != "" {
+		t.Fatalf("remote-style allocation unexpectedly had an endpoint: %#v", allocated.Pane.Admission)
+	}
+
+	tree := kittyTreeForTabs(workspace.ID, [][]string{{first.ID, allocated.Pane.ID}})
+	current, _ := d.getWorkspace(workspace.ID)
+	d.kitty.Runner = &fakeRunner{handler: func(_ context.Context, _ string, args ...string) (string, string, error) {
+		return kittyResponse(t, args, tree, current)
+	}}
+	d.kitty.Command = "kitten-test"
+
+	if _, err := d.admitPane(context.Background(), admitPaneRequest{
+		Workspace: workspace.ID, Pane: allocated.Pane.ID, Endpoint: attachment.Endpoint,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.getWorkspace(workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pane := got.Panes[allocated.Pane.ID]; pane == nil || !pane.Admitted() {
+		t.Fatalf("endpoint-less remote proposal was not admitted: %#v", pane)
+	}
+}
+
+func TestAdmitPaneReturnsAfterDurableBindingWhenCaptureIsTemporarilyUnavailable(t *testing.T) {
+	d, err := newTestDaemon(t, testRoot(t), quietRunner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	workspace, attachment := readyWorkspaceAttachment(t, d, workspace, "local")
+	allocated, err := d.allocatePane(allocatePaneRequest{
+		Workspace: workspace.ID,
+		Key:       attachment.ID + ":remote-allocation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.kitty.Runner = &fakeRunner{handler: func(context.Context, string, ...string) (string, string, error) {
+		return "", "", errors.New("temporary Kitty outage")
+	}}
+	d.kitty.Command = "kitten-test"
+
+	got, err := d.admitPane(context.Background(), admitPaneRequest{
+		Workspace: workspace.ID, Pane: allocated.Pane.ID, Endpoint: attachment.Endpoint,
+	})
+	if err != nil {
+		t.Fatalf("advisory admission returned a capture error after binding: %v", err)
+	}
+	pane := got.Panes[allocated.Pane.ID]
+	if pane == nil || !pane.Proposed() || pane.Admission.Endpoint != attachment.Endpoint || pane.Admission.AttachmentID != attachment.ID {
+		t.Fatalf("durably bound proposal = %#v", pane)
 	}
 }
 

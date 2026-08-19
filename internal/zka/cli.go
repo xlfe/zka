@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const Version = "0.10.1"
+const Version = "0.10.2"
 
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(args) == 0 {
@@ -2746,8 +2746,32 @@ func runRemotePane(args []string, paths Paths, stdin io.Reader, stdout, stderr i
 				<-done
 				return 1, fmt.Errorf("mark remote Kitty pane ready: %w", readyErr)
 			}
+			// Remote allocation happens at the origin, which must not retain this
+			// machine's Unix Kitty endpoint. Bind it back onto the provider's
+			// cached proposal only after the tagged window and zmx client are ready,
+			// then let the ordinary admission proof commit it at the origin.
+			admissionRunErr, admissionExited, admissionErr := waitForRemotePaneAdmission(ctx, done, func(attemptCtx context.Context) error {
+				admitCtx, admitCancel := context.WithTimeout(attemptCtx, 3*time.Second)
+				_, admitErr := api.AdmitPane(admitCtx, *workspace, *pane, endpoint)
+				admitCancel()
+				return admitErr
+			})
+			if admissionErr != nil {
+				_ = cmd.Process.Kill()
+				if !admissionExited {
+					<-done
+				}
+				if ctx.Err() != nil {
+					return 130, nil
+				}
+				return 1, fmt.Errorf("bind remote pane to local Kitty attachment: %w", admissionErr)
+			}
 			backoff = 250 * time.Millisecond
-			runErr = <-done
+			if admissionExited {
+				runErr = admissionRunErr
+			} else {
+				runErr = <-done
+			}
 			markCtx, markCancel = context.WithTimeout(context.Background(), time.Second)
 			_ = kitty.SetPaneReady(markCtx, endpoint, windowID, false)
 			markCancel()
@@ -2771,6 +2795,46 @@ func runRemotePane(args []string, paths Paths, stdin io.Reader, stdout, stderr i
 			backoff *= 2
 			if backoff > 30*time.Second {
 				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+// waitForRemotePaneAdmission retries until the local daemon confirms it has
+// durably associated the origin-created proposal with this provider's Kitty
+// endpoint. Once that callback reaches admitPane, capture/remote-commit
+// failures are background work and the RPC succeeds. Transport failures still
+// need retrying: without any successful callback, no worker owns the
+// endpoint-less proposal and the origin can retire it after sixty seconds.
+func waitForRemotePaneAdmission(
+	ctx context.Context,
+	done <-chan error,
+	admit func(context.Context) error,
+) (runErr error, exited bool, err error) {
+	backoff := 100 * time.Millisecond
+	var lastErr error
+	for {
+		if lastErr = admit(ctx); lastErr == nil {
+			return nil, false, nil
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case runErr := <-done:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return runErr, true, nil
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, false, fmt.Errorf("%w (last admission error: %v)", ctx.Err(), lastErr)
+		case <-timer.C:
+		}
+		if backoff < 2*time.Second {
+			backoff *= 2
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
 			}
 		}
 	}

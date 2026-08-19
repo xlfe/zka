@@ -1388,6 +1388,7 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 	var revokedEndpoints []string
 	var deletingEndpoints []string
 	var topologyEndpoints []string
+	var admissionEndpoints []string
 	existing := d.state.Workspaces[clone.ID]
 	if err := validateRemoteWorkspaceCollision(host, clone.ID, existing); err != nil {
 		d.mu.Unlock()
@@ -1411,6 +1412,20 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 					changedKittyPanes = append(changedKittyPanes, paneID)
 				} else if previous.Title != pane.Title {
 					changedKittyPanes = append(changedKittyPanes, paneID)
+				}
+				// The origin cannot persist a provider's Unix Kitty endpoint.
+				// Preserve the binding supplied locally by admit_pane while the
+				// same proposal is still pending, or a routine origin snapshot can
+				// orphan it again before its admission capture commits.
+				if pane.Proposed() && previous.Proposed() && previous.Admission.Endpoint != "" {
+					attachmentID := attachmentIDForEndpointLocked(existing, previous.Admission.Endpoint)
+					if localAttachment := existing.Attachments[attachmentID]; attachmentID != "" && isLocalUnixAttachment(localAttachment, d.state.Node.ID) {
+						pane.Admission.Endpoint = previous.Admission.Endpoint
+						pane.Admission.AttachmentID = attachmentID
+						pane.Admission.WindowID = previous.Admission.WindowID
+						pane.Admission.MissingSince = previous.Admission.MissingSince
+						admissionEndpoints = append(admissionEndpoints, pane.Admission.Endpoint)
+					}
 				}
 			}
 		}
@@ -1523,6 +1538,9 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 		}
 		for _, endpoint := range sortedEndpointSet(topologyEndpoints) {
 			d.scheduleTopologyReconcile(endpoint)
+		}
+		for _, endpoint := range sortedEndpointSet(admissionEndpoints) {
+			d.schedulePaneAdmission(endpoint)
 		}
 	}
 	return result, nil
