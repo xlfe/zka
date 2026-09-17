@@ -67,6 +67,49 @@ func TestWatcherBurstDebouncesToOneAuthoritativeCapture(t *testing.T) {
 	}
 }
 
+func TestPresentationWatcherFeedbackDoesNotCapture(t *testing.T) {
+	var d *Daemon
+	runner := &fakeRunner{handler: func(_ context.Context, name string, args ...string) (string, string, error) {
+		joined := strings.Join(args, " ")
+		if name == "kitten" && (strings.Contains(joined, " set-user-vars ") || strings.Contains(joined, " set-window-title ")) {
+			kind := "user-var"
+			if strings.Contains(joined, " set-window-title ") {
+				kind = "title"
+			}
+			d.events <- WatcherEvent{Version: 1, Endpoint: "unix:/kitty", Kind: kind}
+			d.events <- WatcherEvent{Version: 1, Endpoint: "unix:/kitty", Kind: "tab-bar"}
+		}
+		if name == "kitten" && strings.Contains(joined, " ls") {
+			return "[]", "", nil
+		}
+		return "", "", nil
+	}}
+	var err error
+	d, err = newTestDaemon(t, testRoot(t), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	pane := firstPane(workspace)
+	d.mu.Lock()
+	actual := d.state.Workspaces[workspace.ID]
+	actual.Attachments["local"] = &Attachment{
+		ID: "local", Node: d.state.Node, Endpoint: "unix:/kitty", Status: AttachmentReady,
+		Views: readyView(pane.ID, 7),
+	}
+	workspace = actual.Clone()
+	d.mu.Unlock()
+	serveTestDaemon(t, d)
+
+	d.updateKittyState(context.Background(), workspace, pane.ID)
+	time.Sleep(presentationCaptureSettle + 200*time.Millisecond)
+	for _, call := range runner.Calls() {
+		if call.Name == "kitten" && strings.Contains(strings.Join(call.Args, " "), " ls") {
+			t.Fatalf("presentation watcher feedback triggered a capture: %#v", runner.Calls())
+		}
+	}
+}
+
 func TestWatcherCloseRemovesPaneAndKillsItsZMXSession(t *testing.T) {
 	var mu sync.Mutex
 	var workspaceID, closedPaneID, remainingPaneID string

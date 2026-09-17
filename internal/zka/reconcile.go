@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -180,6 +181,28 @@ func (d *Daemon) attachmentEndpoints() []string {
 			}
 		}
 	}
+	return endpoints
+}
+
+func (d *Daemon) workspaceAttachmentEndpoints(workspaceID string) []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	workspace := d.state.Workspaces[workspaceID]
+	if workspace == nil || workspace.DeletionPending {
+		return nil
+	}
+	seen := map[string]bool{}
+	var endpoints []string
+	for _, attachment := range workspace.Attachments {
+		if !strings.HasPrefix(attachment.Endpoint, "unix:") || attachment.Status == AttachmentDetached || attachment.Node.ID != d.state.Node.ID {
+			continue
+		}
+		if !seen[attachment.Endpoint] {
+			seen[attachment.Endpoint] = true
+			endpoints = append(endpoints, attachment.Endpoint)
+		}
+	}
+	sort.Strings(endpoints)
 	return endpoints
 }
 
@@ -485,9 +508,14 @@ func (d *Daemon) markRevocationClosed(workspaceRef, attachmentID string) {
 	}
 }
 
-// reconcile is retained as a synchronous diagnostic hook.
-func (d *Daemon) reconcile(ctx context.Context) {
-	for _, endpoint := range d.attachmentEndpoints() {
+// reconcileWorkspace refreshes only the Kitty views that can affect one
+// attention transition. A transition in one workspace must never recapture
+// every managed Kitty process on the machine.
+func (d *Daemon) reconcileWorkspace(ctx context.Context, workspaceID string) {
+	for _, endpoint := range d.workspaceAttachmentEndpoints(workspaceID) {
+		operation := d.endpointTopologyOperation(endpoint)
+		operation.Lock()
 		d.captureEndpoint(ctx, endpoint)
+		operation.Unlock()
 	}
 }

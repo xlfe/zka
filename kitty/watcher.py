@@ -10,7 +10,12 @@ import datetime
 import json
 import os
 import socket
+import time
 from typing import Any
+
+
+_presentation_write_until = 0.0
+_PRESENTATION_WRITE_SETTLE_SECONDS = 0.5
 
 
 def _window(args: tuple[Any, ...]) -> Any | None:
@@ -89,14 +94,31 @@ def on_focus_change(*args: Any) -> None:
 
 
 def on_title_change(*args: Any) -> None:
+    global _presentation_write_until
+    data = _event_data(args)
+    # ZKA owns the temporary state-decorated title. Kitty identifies those
+    # control-originated writes with from_child=False; only child OSC title
+    # changes describe presentation that should be captured.
+    if data.get("from_child") is False:
+        # The title update also dirties the tab bar, and a following ZKA tab
+        # title write has no source metadata of its own. Suppress that immediate
+        # presentation-only burst without silencing later user topology edits.
+        _presentation_write_until = time.monotonic() + _PRESENTATION_WRITE_SETTLE_SECONDS
+        return
     _emit("title", *args)
 
 
 def on_set_user_var(*args: Any) -> None:
+    # zka_state is presentation, not topology. Identity and readiness vars still
+    # emit because they participate in pane admission and attachment capture.
+    if str(_event_data(args).get("key", "")) == "zka_state":
+        return
     _emit("user-var", *args)
 
 
 def on_tab_bar_dirty(*args: Any) -> None:
+    if time.monotonic() <= _presentation_write_until:
+        return
     _emit("tab-bar", *args)
 
 

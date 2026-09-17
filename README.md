@@ -24,7 +24,7 @@ and provider socket paths on the provider.
 </p>
 
 > [!NOTE]
-> zka 0.10.2 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
+> zka 0.10.3 is pre-1.0 software for NixOS on Linux/Wayland. It deliberately
 > builds on Kitty, zmx, OpenSSH, systemd user services, and coding-agent hooks
 > instead of replacing them.
 
@@ -1399,7 +1399,7 @@ routing the new pane through zka.
 
 ## Project status
 
-Version 0.10.2 combines three systems: durable Kitty-native workspaces, Codex and
+Version 0.10.3 combines three systems: durable Kitty-native workspaces, Codex and
 Claude Code attention routing, and reconnect-safe remote credential bundles.
 The current tree extends those bundles with workspace-owned PIVB routes while
 preserving the fixed-alias sandbox ABI. It also includes remote mirrors and two-phase
@@ -1410,10 +1410,14 @@ reconciliation is fenced from the canonical layout, runtime Kitty identities
 are re-resolved after moves, and deliberate recovery uses a two-capture
 operator confirmation. Version 0.10.2 additionally makes the provider-side
 admission of new remote panes durable, including across authoritative cache
-refreshes. It speaks PIVB forwarding protocol 3 and daemon/remote protocol 16,
-so pivb 0.5.0 and zka 0.10.2 must be deployed together. Upgrades from an older
+refreshes. Version 0.10.3 bounds attention-driven Kitty remote control to the
+affected workspace and visibly changed panes, coalesces duplicate presentation
+writes, and ignores watcher feedback from those writes. Existing managed Kitty
+processes must be restarted to load the updated watcher. It speaks PIVB
+forwarding protocol 3 and daemon/remote protocol 16, so pivb 0.5.0 and zka
+0.10.3 must be deployed together. Upgrades from an older
 protocol still require every PIVB bundle to be released and re-claimed and zka
-daemons to be upgraded as one fleet; 0.10.1 to 0.10.2 changes neither protocol
+daemons to be upgraded as one fleet; 0.10.2 to 0.10.3 changes neither protocol
 nor persisted state.
 Repeated local activation of an existing claim remains a true no-op unless it
 carries a window, which is always a fresh grant, and endpoint health is still

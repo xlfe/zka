@@ -127,7 +127,7 @@ func (d *Daemon) afterTransition(ctx context.Context, before AgentState, workspa
 		return
 	}
 	if d.attentionStateEnabled(pane.State) {
-		d.reconcile(ctx)
+		d.reconcileWorkspace(ctx, workspace.ID)
 		if fresh, err := d.getWorkspace(workspace.ID); err == nil {
 			workspace = fresh
 			pane = fresh.Panes[paneID]
@@ -136,7 +136,7 @@ func (d *Daemon) afterTransition(ctx context.Context, before AgentState, workspa
 			return
 		}
 	}
-	d.updateKittyState(ctx, workspace, paneID)
+	d.scheduleKittyState(workspace, paneID)
 	_, focused := attentionPaneView(workspace, paneID)
 	if !d.attentionStateEnabled(pane.State) || (pane.State == StateDone && focused) {
 		d.closeDesktopNotifications(ctx, workspace, paneID)
@@ -155,7 +155,7 @@ func (d *Daemon) afterTransition(ctx context.Context, before AgentState, workspa
 }
 
 func (d *Daemon) afterRemoteTransition(ctx context.Context, workspace *Workspace, paneID string) {
-	d.updateKittyState(ctx, workspace, paneID)
+	d.scheduleKittyState(workspace, paneID)
 	d.afterRemoteTransitionNotification(ctx, workspace, paneID)
 }
 
@@ -269,27 +269,147 @@ func (d *Daemon) updateKittyState(ctx context.Context, workspace *Workspace, pan
 		if !isReadyLocalKittyAttachment(attachment, localNodeID) {
 			continue
 		}
-		updated := false
-		for paneID, view := range attachment.Views {
-			if selected != nil && !selected[paneID] {
-				continue
+		operation := d.endpointTopologyOperation(attachment.Endpoint)
+		operation.Lock()
+		func() {
+			defer operation.Unlock()
+			releaseCapture := d.beginPresentationCaptureSuppression(attachment.Endpoint)
+			defer releaseCapture()
+			updated := false
+			for paneID, view := range attachment.Views {
+				if selected != nil && !selected[paneID] {
+					continue
+				}
+				pane := workspace.Panes[paneID]
+				if pane == nil || !view.Ready {
+					continue
+				}
+				updated = true
+				callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				err := d.kitty.SetPaneState(callCtx, attachment.Endpoint, view, workspace, pane)
+				cancel()
+				if err != nil {
+					d.logger.Printf("update kitty state workspace=%s pane=%s: %v", workspace.ID, paneID, err)
+				}
 			}
-			pane := workspace.Panes[paneID]
-			if pane == nil || !view.Ready {
-				continue
+			if updated {
+				d.applyTabTitles(ctx, attachment.Endpoint, workspace)
 			}
-			updated = true
-			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			err := d.kitty.SetPaneState(callCtx, attachment.Endpoint, view, workspace, pane)
-			cancel()
-			if err != nil {
-				d.logger.Printf("update kitty state workspace=%s pane=%s: %v", workspace.ID, paneID, err)
-			}
-		}
-		if updated {
-			d.applyTabTitles(ctx, attachment.Endpoint, workspace)
+		}()
+	}
+}
+
+func kittyPaneProjectionFingerprint(pane *Pane) string {
+	if pane == nil {
+		return ""
+	}
+	return string(pane.State) + "\x00" + pane.Title
+}
+
+// scheduleKittyState coalesces identical presentation requests while a
+// workspace projection is queued or in flight. A state that changes again
+// during a write remains pending and is projected from a fresh workspace
+// snapshot on the next drain.
+func (d *Daemon) scheduleKittyState(workspace *Workspace, paneIDs ...string) {
+	if workspace == nil || workspace.ID == "" {
+		return
+	}
+	if len(paneIDs) == 0 {
+		paneIDs = make([]string, 0, len(workspace.Panes))
+		for paneID := range workspace.Panes {
+			paneIDs = append(paneIDs, paneID)
 		}
 	}
+	sort.Strings(paneIDs)
+	d.projectionMu.Lock()
+	pending := d.projectionPending[workspace.ID]
+	if pending == nil {
+		pending = map[string]string{}
+		d.projectionPending[workspace.ID] = pending
+	}
+	inFlight := d.projectionInFlight[workspace.ID]
+	for _, paneID := range paneIDs {
+		fingerprint := kittyPaneProjectionFingerprint(workspace.Panes[paneID])
+		if fingerprint == "" || pending[paneID] == fingerprint || inFlight[paneID] == fingerprint {
+			continue
+		}
+		pending[paneID] = fingerprint
+	}
+	start := len(pending) != 0 && !d.projectionRunning[workspace.ID]
+	if start {
+		d.projectionRunning[workspace.ID] = true
+	}
+	d.projectionMu.Unlock()
+	if !start {
+		return
+	}
+	if !d.startWorker(func(ctx context.Context) { d.runKittyStateProjection(ctx, workspace.ID) }) {
+		d.projectionMu.Lock()
+		delete(d.projectionPending, workspace.ID)
+		delete(d.projectionInFlight, workspace.ID)
+		delete(d.projectionRunning, workspace.ID)
+		d.projectionMu.Unlock()
+	}
+}
+
+func (d *Daemon) runKittyStateProjection(ctx context.Context, workspaceID string) {
+	for ctx.Err() == nil {
+		d.projectionMu.Lock()
+		batch := d.projectionPending[workspaceID]
+		if len(batch) == 0 {
+			delete(d.projectionPending, workspaceID)
+			delete(d.projectionInFlight, workspaceID)
+			delete(d.projectionRunning, workspaceID)
+			d.projectionMu.Unlock()
+			return
+		}
+		batch = cloneStringMap(batch)
+		d.projectionPending[workspaceID] = map[string]string{}
+		d.projectionInFlight[workspaceID] = cloneStringMap(batch)
+		d.projectionMu.Unlock()
+
+		workspace, err := d.getWorkspace(workspaceID)
+		actual := map[string]string{}
+		var paneIDs []string
+		if err == nil {
+			for paneID := range batch {
+				if pane := workspace.Panes[paneID]; pane != nil {
+					paneIDs = append(paneIDs, paneID)
+					actual[paneID] = kittyPaneProjectionFingerprint(pane)
+				}
+			}
+			sort.Strings(paneIDs)
+			if len(paneIDs) != 0 {
+				d.updateKittyState(ctx, workspace, paneIDs...)
+			}
+		}
+
+		d.projectionMu.Lock()
+		pending := d.projectionPending[workspaceID]
+		for paneID, fingerprint := range actual {
+			// A duplicate request that arrived during the write is already
+			// satisfied. A newer state/title has a different fingerprint and
+			// must survive for the next drain.
+			if pending[paneID] == fingerprint {
+				delete(pending, paneID)
+			}
+		}
+		delete(d.projectionInFlight, workspaceID)
+		d.projectionMu.Unlock()
+	}
+	d.projectionMu.Lock()
+	delete(d.projectionPending, workspaceID)
+	delete(d.projectionInFlight, workspaceID)
+	delete(d.projectionRunning, workspaceID)
+	d.projectionMu.Unlock()
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	copy := make(map[string]string, len(source))
+	for key, value := range source {
+		copy[key] = value
+	}
+	return copy
 }
 
 // desiredTabName is the single formula for a managed tab's Kitty name: the

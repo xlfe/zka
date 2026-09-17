@@ -11,7 +11,7 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      releaseVersion = "0.10.2";
+      releaseVersion = "0.10.3";
     in
     {
       # kitty and python3 are what the differential session-parser oracle in
@@ -288,6 +288,12 @@
             test ! -e ${self.packages.${system}.zka-headless}/bin/zka-launch
             test -x ${self.packages.${system}.zka-headless}/libexec/zka/hooks/zka
             test -f ${self.packages.${system}.zka-headless}/share/zka/kitty-watcher.py
+            touch "$out"
+          '';
+          watcher = pkgs.runCommand "zka-watcher-check" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+            cp ${./kitty/watcher.py} watcher.py
+            cp ${./kitty/watcher_test.py} watcher_test.py
+            python3 -m unittest watcher_test.py
             touch "$out"
           '';
         }

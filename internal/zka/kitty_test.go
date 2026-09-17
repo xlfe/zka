@@ -33,6 +33,11 @@ func TestKittyPaneStateTitleRemainsChildControlled(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("calls = %#v", calls)
 	}
+	state := strings.Join(calls[0].Args, "|")
+	if !strings.Contains(state, "set-user-vars|--match|id:17|zka_state=unknown") ||
+		strings.Contains(state, "zka_workspace=") || strings.Contains(state, "zka_pane=") {
+		t.Fatalf("pane state projection rewrote identity: %#v", calls[0].Args)
+	}
 	joined := strings.Join(calls[1].Args, "|")
 	if !strings.Contains(joined, "set-window-title|--temporary|--match|id:17|--|[?] shell") {
 		t.Fatalf("pane title is not a temporary Kitty override: %#v", calls[1].Args)

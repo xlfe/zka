@@ -23,6 +23,7 @@ type Daemon struct {
 	lifeMu                   sync.Mutex
 	attentionMu              sync.Mutex
 	captureMu                sync.Mutex
+	projectionMu             sync.Mutex
 	topologyMu               sync.Mutex
 	cleanupMu                sync.Mutex
 	credentialMu             sync.Mutex
@@ -67,6 +68,9 @@ type Daemon struct {
 	deferredReconcile     map[string]bool
 	captureHold           map[string]int
 	captureHoldUntil      map[string]time.Time
+	projectionPending     map[string]map[string]string
+	projectionInFlight    map[string]map[string]string
+	projectionRunning     map[string]bool
 	backoff               map[string]*endpointBackoff
 	topologyOps           map[string]*sync.Mutex
 	cleaning              map[string]bool
@@ -184,6 +188,9 @@ func NewDaemon(paths Paths, runner CommandRunner, logger *log.Logger) (*Daemon, 
 		deferredReconcile:         map[string]bool{},
 		captureHold:               map[string]int{},
 		captureHoldUntil:          map[string]time.Time{},
+		projectionPending:         map[string]map[string]string{},
+		projectionInFlight:        map[string]map[string]string{},
+		projectionRunning:         map[string]bool{},
 		backoff:                   map[string]*endpointBackoff{},
 		topologyOps:               map[string]*sync.Mutex{},
 		cleaning:                  map[string]bool{},
@@ -2464,6 +2471,7 @@ func (d *Daemon) markSeen(workspaceRef, paneRef string) (*Workspace, error) {
 		}
 	}
 	changed := false
+	var changedKittyPanes []string
 	if paneRef != "" && workspace.RestoreFocusPaneID != paneRef {
 		workspace.RestoreFocusPaneID = paneRef
 		changed = true
@@ -2476,6 +2484,7 @@ func (d *Daemon) markSeen(workspaceRef, paneRef string) (*Workspace, error) {
 			pane.Evidence = Evidence{Source: "zka", Event: "seen", Timestamp: time.Now().UTC()}
 			pane.UpdatedAt = pane.Evidence.Timestamp
 			changed = true
+			changedKittyPanes = append(changedKittyPanes, pane.ID)
 		case StateBlocked, StateError:
 			identity := attentionEventIdentity(pane)
 			if pane.AttentionSeen != identity {
@@ -2496,7 +2505,10 @@ func (d *Daemon) markSeen(workspaceRef, paneRef string) (*Workspace, error) {
 	d.mu.Unlock()
 	if err == nil && changed {
 		d.startWorker(func(ctx context.Context) { d.closeDesktopNotifications(ctx, copy, paneRef) })
-		d.startWorker(func(ctx context.Context) { d.updateKittyState(ctx, copy) })
+		if len(changedKittyPanes) != 0 {
+			sort.Strings(changedKittyPanes)
+			d.scheduleKittyState(copy, changedKittyPanes...)
+		}
 	}
 	return copy, err
 }

@@ -120,6 +120,279 @@ func TestKittyStateProjectionDoesNothingWithoutLocalAttachment(t *testing.T) {
 	}
 }
 
+func TestMarkSeenProjectsOnlyVisibleStateChanges(t *testing.T) {
+	t.Run("focus and attention metadata are silent", func(t *testing.T) {
+		runner := quietRunner()
+		d, err := newTestDaemon(t, testRoot(t), runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		workspace := createTestWorkspace(t, d, 1)
+		workspace, _ = readyWorkspaceAttachment(t, d, workspace, "local")
+		pane := firstPane(workspace)
+		d.mu.Lock()
+		actual := d.state.Workspaces[workspace.ID]
+		actual.Panes[pane.ID].State = StateBlocked
+		actual.Panes[pane.ID].LastTurnID = "blocked-turn"
+		actual.RecomputeAttention()
+		if err := d.store.Save(d.state); err != nil {
+			d.mu.Unlock()
+			t.Fatal(err)
+		}
+		d.mu.Unlock()
+
+		if _, err := d.markSeen(workspace.ID, pane.ID); err != nil {
+			t.Fatal(err)
+		}
+		d.waitBackground()
+		if calls := runner.Calls(); len(calls) != 0 {
+			t.Fatalf("metadata-only markSeen invoked Kitty: %#v", calls)
+		}
+	})
+
+	t.Run("done to idle projects only the changed pane", func(t *testing.T) {
+		runner := quietRunner()
+		d, err := newTestDaemon(t, testRoot(t), runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		workspace := createTestWorkspace(t, d, 2)
+		workspace, _ = readyWorkspaceAttachment(t, d, workspace, "local")
+		panes := workspace.SortedPanes()
+		d.mu.Lock()
+		actual := d.state.Workspaces[workspace.ID]
+		actual.Panes[panes[0].ID].State = StateDone
+		actual.Panes[panes[0].ID].LastTurnID = "done-turn"
+		actual.RecomputeAttention()
+		if err := d.store.Save(d.state); err != nil {
+			d.mu.Unlock()
+			t.Fatal(err)
+		}
+		d.mu.Unlock()
+
+		if _, err := d.markSeen(workspace.ID, panes[0].ID); err != nil {
+			t.Fatal(err)
+		}
+		d.waitBackground()
+		var stateWrites, titleWrites int
+		for _, call := range runner.Calls() {
+			joined := strings.Join(call.Args, " ")
+			if strings.Contains(joined, " set-user-vars ") {
+				stateWrites++
+			}
+			if strings.Contains(joined, " set-window-title ") {
+				titleWrites++
+			}
+			if (strings.Contains(joined, " set-user-vars ") || strings.Contains(joined, " set-window-title ")) &&
+				!strings.Contains(joined, "id:1") {
+				t.Fatalf("markSeen projected an unchanged pane: %#v", call.Args)
+			}
+		}
+		if stateWrites != 1 || titleWrites != 1 {
+			t.Fatalf("visible markSeen writes: state=%d title=%d, calls=%#v", stateWrites, titleWrites, runner.Calls())
+		}
+	})
+}
+
+func TestKittyStateProjectionCoalescesAnIdenticalInflightRequest(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	runner := &fakeRunner{handler: func(_ context.Context, name string, args ...string) (string, string, error) {
+		joined := strings.Join(args, " ")
+		if name == "kitten" && strings.Contains(joined, " set-user-vars ") {
+			once.Do(func() {
+				close(entered)
+				<-release
+			})
+		}
+		if name == "kitten" && strings.Contains(joined, " ls") {
+			return "[]", "", nil
+		}
+		return "", "", nil
+	}}
+	d, err := newTestDaemon(t, testRoot(t), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	workspace, _ = readyWorkspaceAttachment(t, d, workspace, "local")
+	pane := firstPane(workspace)
+	d.scheduleKittyState(workspace, pane.ID)
+	<-entered
+	d.scheduleKittyState(workspace.Clone(), pane.ID)
+	close(release)
+	d.waitBackground()
+
+	var stateWrites, titleWrites int
+	for _, call := range runner.Calls() {
+		joined := strings.Join(call.Args, " ")
+		if strings.Contains(joined, " set-user-vars ") {
+			stateWrites++
+		}
+		if strings.Contains(joined, " set-window-title ") {
+			titleWrites++
+		}
+	}
+	if stateWrites != 1 || titleWrites != 1 {
+		t.Fatalf("coalesced writes: state=%d title=%d, calls=%#v", stateWrites, titleWrites, runner.Calls())
+	}
+}
+
+func TestKittyStateProjectionKeepsANewerInflightState(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	runner := &fakeRunner{handler: func(_ context.Context, name string, args ...string) (string, string, error) {
+		joined := strings.Join(args, " ")
+		if name == "kitten" && strings.Contains(joined, " set-user-vars ") {
+			once.Do(func() {
+				close(entered)
+				<-release
+			})
+		}
+		if name == "kitten" && strings.Contains(joined, " ls") {
+			return "[]", "", nil
+		}
+		return "", "", nil
+	}}
+	d, err := newTestDaemon(t, testRoot(t), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createTestWorkspace(t, d, 1)
+	workspace, _ = readyWorkspaceAttachment(t, d, workspace, "local")
+	pane := firstPane(workspace)
+	d.mu.Lock()
+	d.state.Workspaces[workspace.ID].Panes[pane.ID].State = StateBlocked
+	blocked := d.state.Workspaces[workspace.ID].Clone()
+	d.mu.Unlock()
+	d.scheduleKittyState(blocked, pane.ID)
+	<-entered
+	d.mu.Lock()
+	d.state.Workspaces[workspace.ID].Panes[pane.ID].State = StateWorking
+	working := d.state.Workspaces[workspace.ID].Clone()
+	d.mu.Unlock()
+	d.scheduleKittyState(working, pane.ID)
+	close(release)
+	d.waitBackground()
+
+	var states []string
+	for _, call := range runner.Calls() {
+		joined := strings.Join(call.Args, " ")
+		if strings.Contains(joined, " set-user-vars ") {
+			states = append(states, call.Args[len(call.Args)-1])
+		}
+	}
+	want := []string{"zka_state=blocked", "zka_state=working"}
+	if !reflect.DeepEqual(states, want) {
+		t.Fatalf("projected states = %#v, want %#v; calls=%#v", states, want, runner.Calls())
+	}
+}
+
+func TestAttentionTransitionKittyCallsAreWorkspaceAndPaneBounded(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		affectedPanes   int
+		decoyWorkspaces int
+		panesPerDecoy   int
+	}{
+		{name: "small", affectedPanes: 1},
+		{name: "nine panes with decoys", affectedPanes: 9, decoyWorkspaces: 5, panesPerDecoy: 4},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			endpointWorkspaces := map[string]string{}
+			var d *Daemon
+			runner := &fakeRunner{handler: func(_ context.Context, name string, args ...string) (string, string, error) {
+				joined := strings.Join(args, " ")
+				if name != "kitten" {
+					return "", "", nil
+				}
+				if joined == "--version" {
+					return "kitten 0.47.4\n", "", nil
+				}
+				endpoint := ""
+				for index, arg := range args {
+					if arg == "--to" && index+1 < len(args) {
+						endpoint = args[index+1]
+						break
+					}
+				}
+				workspaceID := endpointWorkspaces[endpoint]
+				workspace, err := d.getWorkspace(workspaceID)
+				if err != nil {
+					return "", "", err
+				}
+				if strings.Contains(joined, "--output-format=session") {
+					return workspace.Manifest.Session, "", nil
+				}
+				if strings.Contains(joined, " ls") {
+					var paneIDs []string
+					for _, pane := range workspace.SortedPanes() {
+						paneIDs = append(paneIDs, pane.ID)
+					}
+					tree, marshalErr := json.Marshal(kittyTreeForTabs(workspace.ID, [][]string{paneIDs}))
+					return string(tree), "", marshalErr
+				}
+				return "", "", nil
+			}}
+			var err error
+			d, err = newTestDaemon(t, testRoot(t), runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.config.Notifications.DesktopEnabled = false
+			d.config.Notifications.NtfyEnabled = false
+			createAttached := func(name string, panes int) *Workspace {
+				specs := make([]PaneSpec, panes)
+				for index := range specs {
+					specs[index] = PaneSpec{CWD: "/work", Title: "pane"}
+				}
+				workspace, createErr := d.createWorkspace(createWorkspaceRequest{Name: name, Shell: []string{"fish"}, Panes: specs})
+				if createErr != nil {
+					t.Fatal(createErr)
+				}
+				workspace, attachment := readyWorkspaceAttachment(t, d, workspace, name)
+				endpointWorkspaces[attachment.Endpoint] = workspace.ID
+				return workspace
+			}
+
+			affected := createAttached("affected", test.affectedPanes)
+			for index := 0; index < test.decoyWorkspaces; index++ {
+				createAttached("decoy-"+string(rune('a'+index)), test.panesPerDecoy)
+			}
+			affectedEndpoint := affected.Attachments["affected"].Endpoint
+			affected, pane := setPaneForNotification(t, d, affected, StateBlocked, "bounded-turn")
+			d.afterTransition(context.Background(), StateWorking, affected, pane.ID)
+			d.waitBackground()
+
+			var targeted, stateWrites, titleWrites, listCalls int
+			for _, call := range runner.Calls() {
+				joined := strings.Join(call.Args, " ")
+				if strings.Contains(joined, "--to ") && !strings.Contains(joined, "--to "+affectedEndpoint) {
+					t.Fatalf("attention transition targeted an unrelated endpoint: %#v", call.Args)
+				}
+				if strings.Contains(joined, "--to "+affectedEndpoint) {
+					targeted++
+				}
+				if strings.Contains(joined, " set-user-vars ") {
+					stateWrites++
+				}
+				if strings.Contains(joined, " set-window-title ") {
+					titleWrites++
+				}
+				if strings.Contains(joined, " ls") {
+					listCalls++
+				}
+			}
+			if targeted != 5 || stateWrites != 1 || titleWrites != 1 || listCalls != 3 {
+				t.Fatalf("bounded Kitty calls: targeted=%d state=%d title=%d ls=%d, calls=%#v",
+					targeted, stateWrites, titleWrites, listCalls, runner.Calls())
+			}
+		})
+	}
+}
+
 func TestEndpointLookupIgnoresNonLocalAttachments(t *testing.T) {
 	d, err := newTestDaemon(t, testRoot(t), quietRunner())
 	if err != nil {

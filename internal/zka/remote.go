@@ -1507,11 +1507,11 @@ func (d *Daemon) cacheRemoteWorkspace(host string, remote *Workspace) (*Workspac
 	if existing != nil {
 		sort.Strings(changedKittyPanes)
 		sort.Strings(transitionedPanes)
-		if len(changedKittyPanes) != 0 || len(transitionedPanes) != 0 {
+		if len(changedKittyPanes) != 0 {
+			d.scheduleKittyState(result, changedKittyPanes...)
+		}
+		if len(transitionedPanes) != 0 {
 			d.startWorker(func(ctx context.Context) {
-				if len(changedKittyPanes) != 0 {
-					d.updateKittyState(ctx, result, changedKittyPanes...)
-				}
 				for _, paneID := range transitionedPanes {
 					d.afterRemoteTransitionNotification(ctx, result, paneID)
 				}

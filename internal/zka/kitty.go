@@ -221,7 +221,7 @@ func (k KittyClient) LaunchPane(ctx context.Context, endpoint string, workspace 
 func (k KittyClient) SetPaneState(ctx context.Context, endpoint string, view RuntimeView, workspace *Workspace, pane *Pane) error {
 	match := "id:" + strconv.FormatInt(view.WindowID, 10)
 	if _, err := k.rc(ctx, endpoint, "set-user-vars", "--match", match,
-		"zka_workspace="+workspace.ID, "zka_pane="+pane.ID, "zka_state="+string(pane.State)); err != nil {
+		"zka_state="+string(pane.State)); err != nil {
 		return err
 	}
 	title := strings.TrimSpace(stateMarker(pane.State) + " " + pane.Title)
