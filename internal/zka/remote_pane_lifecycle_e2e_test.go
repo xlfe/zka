@@ -11,6 +11,31 @@ import (
 	"time"
 )
 
+func TestRemotePaneLifecycleInitialAttachmentSurvivesReconcile(t *testing.T) {
+	rig := newRemotePaneLifecycleRig(t)
+	workspace, attachment := rig.attachedWorkspace(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	operation := rig.provider.endpointTopologyOperation(attachment.Endpoint)
+	operation.Lock()
+	defer operation.Unlock()
+	if err := rig.provider.reconcileEndpointTopology(ctx, attachment.Endpoint); err != nil {
+		t.Fatalf("reconcile initial ready attachment: %v", err)
+	}
+	for side, daemon := range map[string]*Daemon{"origin": rig.origin, "provider": rig.provider} {
+		current, err := daemon.getWorkspace(workspace.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := current.Attachments[attachment.ID]; got == nil || got.Status != AttachmentReady {
+			t.Fatalf("%s attachment after initial reconciliation = %#v", side, got)
+		}
+		if !samePaneSet(topologyPaneIDs(current.Topology.Roots), topologyPaneIDs(workspace.Topology.Roots)) {
+			t.Fatalf("%s initial reconciliation changed the topology panes", side)
+		}
+	}
+}
+
 // This is the complete lifecycle that the smaller remote tests deliberately
 // do not model: the origin sanitises provider-local Kitty identity from an
 // allocation, the provider caches that endpoint-less proposal, Kitty creates
@@ -483,6 +508,10 @@ func (r *remotePaneLifecycleRig) attachedWorkspace(t *testing.T) (*Workspace, *A
 	// the projection a real remote attach receives.
 	var authoritative Workspace
 	r.remoteCall(t, "get", refRequest{Ref: workspace.ID}, &authoritative)
+	// Origin snapshots can schedule reconciliation as soon as the local
+	// attachment is registered. Its initial ready pane must already exist in
+	// Kitty, or that worker can undo the readiness update below.
+	r.setKittyTree(workspace.ID, kittyTreeForTabs(workspace.ID, [][]string{{pane.ID}}), nil)
 	localEndpoint := "unix:" + filepath.Join(r.provider.paths.AttachmentDir, attachmentID+".sock")
 	providerAPI := NewAPI(r.provider.paths)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -518,6 +547,23 @@ func (r *remotePaneLifecycleRig) attachedWorkspace(t *testing.T) (*Workspace, *A
 	if got := originReady.Attachments[attachmentID]; got == nil || got.Status != AttachmentReady {
 		t.Fatalf("origin attachment after readiness = %#v", got)
 	}
+	// A reconciliation queued during registration can still be running after
+	// the explicit ready update. Let it verify the initial tree before the
+	// scenario replaces that tree with newly allocated panes.
+	waitFor(t, func() bool {
+		r.provider.topologyMu.Lock()
+		busy := r.provider.reconciling[localEndpoint]
+		r.provider.topologyMu.Unlock()
+		if busy {
+			return false
+		}
+		current, err := r.provider.getWorkspace(workspace.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := current.Attachments[attachmentID]
+		return local != nil && local.Status == AttachmentReady
+	})
 	providerReady, err := r.provider.getWorkspace(workspace.ID)
 	if err != nil {
 		t.Fatal(err)
