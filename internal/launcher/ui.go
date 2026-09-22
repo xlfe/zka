@@ -89,7 +89,9 @@ type ui struct {
 	selected              int
 	credentialsEnabled    bool
 	defaultBundle         string
+	credentialBundles     map[string]bool
 	localLoading          bool
+	nextLocalRefresh      time.Time
 	localError            string
 	busy                  bool
 	status                string
@@ -175,14 +177,19 @@ func newUI(backend Backend) *ui {
 	}
 	credentialsEnabled := false
 	defaultBundle := ""
+	credentialBundles := map[string]bool{}
 	if cfg, err := zka.LoadConfig(); err == nil {
 		credentialsEnabled = len(cfg.Credentials.Bundles) != 0
 		defaultBundle = cfg.Credentials.DefaultBundle
+		for name := range cfg.Credentials.Bundles {
+			credentialBundles[name] = true
+		}
 	}
 	application := &ui{
 		backend: backend, theme: theme, colors: colors,
 		credentialsEnabled: credentialsEnabled, defaultBundle: defaultBundle,
-		results: make(chan asyncResult, 8), rows: map[string]*widget.Clickable{},
+		credentialBundles: credentialBundles,
+		results:           make(chan asyncResult, 8), rows: map[string]*widget.Clickable{},
 		selectables: map[string]*widget.Selectable{},
 	}
 	application.localList.Axis = layout.Vertical
@@ -217,6 +224,10 @@ func (ui *ui) run(w *app.Window) error {
 			ui.handleKeys(gtx)
 			ui.handleEditorEvents(gtx)
 			ui.handleClicks(gtx)
+			ui.refreshLocal(gtx.Now)
+			if ui.screen == screenHome {
+				gtx.Execute(op.InvalidateCmd{At: gtx.Now.Add(2 * time.Second)})
+			}
 			if ui.focusPending != nil {
 				gtx.Execute(key.FocusCmd{Tag: ui.focusPending})
 				ui.focusPending = nil
@@ -229,7 +240,11 @@ func (ui *ui) run(w *app.Window) error {
 }
 
 func (ui *ui) loadLocal() {
+	if ui.localLoading {
+		return
+	}
 	ui.localLoading = true
+	ui.nextLocalRefresh = time.Now().Add(2 * time.Second)
 	go func() {
 		ctx, cancel := context.WithTimeout(ui.ctx, 10*time.Second)
 		defer cancel()
@@ -241,6 +256,14 @@ func (ui *ui) loadLocal() {
 		workspaces, err := ui.backend.Workspaces(ctx, "")
 		ui.deliver(asyncResult{kind: resultLocal, node: node, workspaces: workspaces, err: err})
 	}()
+}
+
+// Only query the local daemon. Refreshing ownership must not open SSH or
+// acquire credentials, and must not interrupt an operation already in flight.
+func (ui *ui) refreshLocal(now time.Time) {
+	if ui.screen == screenHome && !ui.busy && !ui.localLoading && !now.Before(ui.nextLocalRefresh) {
+		ui.loadLocal()
+	}
 }
 
 func (ui *ui) loadRemote(host string) {
@@ -301,35 +324,22 @@ func (ui *ui) confirmForget() {
 }
 
 func (ui *ui) toggleWorkspaceCredentials(workspace *zka.Workspace) {
-	if workspace.RemoteHost == "" {
-		if workspace.CredentialClaim == nil {
-			return
-		}
-		releaseArgs, _ := workspaceCredentialAction(workspace, ui.localNodeID)
-		if !workspaceAttachedToNode(workspace, ui.localNodeID) {
-			ui.launchAll(
-				[][]string{releaseArgs, attachArgs("", workspace)},
-				"Releasing remote credentials and attaching to "+workspace.Name+"…",
-			)
-			return
-		}
-		ui.execute(
-			resultCredentials,
-			workspace.ID,
-			releaseArgs,
-			"Releasing credentials from "+workspace.Name+"…",
-		)
+	if ui.busy || !ui.workspaceCredentialControlVisible(workspace) {
 		return
 	}
+	bundle := ui.workspaceCredentialBundle(workspace)
 	if !workspaceAttachedToNode(workspace, ui.localNodeID) &&
 		!workspaceCredentialsClaimedByNode(workspace, ui.localNodeID) {
 		ui.launch(
-			remoteAttachArgs(workspace.RemoteHost, workspace, true, ui.defaultBundle),
-			"Attaching to "+workspace.Name+" and claiming "+ui.defaultBundle+" credentials…",
+			remoteAttachArgs(workspace.RemoteHost, workspace, true, bundle),
+			"Attaching to "+workspace.Name+" and claiming "+bundle+" credentials…",
 		)
 		return
 	}
 	args, action := workspaceCredentialAction(workspace, ui.localNodeID)
+	if !workspaceCredentialsClaimedByNode(workspace, ui.localNodeID) {
+		args = append(args, "--bundle", bundle)
+	}
 	ui.execute(resultCredentials, workspace.ID, args, action+" "+workspace.Name+"…")
 }
 
@@ -390,11 +400,15 @@ func (ui *ui) drainResults() {
 					continue
 				}
 				ui.localNodeID = result.node.ID
+				selection := ui.selectOnLoad
+				if selection == "" && ui.screen == screenHome && ui.selected >= 2 && ui.selected-2 < len(ui.local) {
+					selection = ui.local[ui.selected-2].ID
+				}
 				ui.local, ui.remoteHosts = splitWorkspaces(result.workspaces, ui.localNodeID)
 				ui.localError = ""
-				if ui.selectOnLoad != "" {
+				if selection != "" {
 					for index, workspace := range ui.local {
-						if workspace.ID == ui.selectOnLoad {
+						if workspace.ID == selection {
 							ui.selected = index + 2
 							break
 						}
@@ -775,22 +789,16 @@ func workspaceCredentialAction(workspace *zka.Workspace, nodeID string) ([]strin
 	if workspace.RemoteHost != "" {
 		ref = workspace.RemoteHost + ":" + ref
 	}
-	if workspace.RemoteHost == "" {
-		return []string{"workspace", "credentials", "release", ref}, "Releasing credentials from"
-	}
 	if workspaceCredentialsClaimedByNode(workspace, nodeID) {
 		return []string{"workspace", "credentials", "release", ref}, "Releasing credentials from"
+	}
+	if workspace.RemoteHost == "" {
+		return []string{"workspace", "credentials", "activate-local", ref}, "Claiming credentials for"
 	}
 	return []string{"workspace", "credentials", "claim", ref}, "Claiming credentials for"
 }
 
 func workspaceCredentialButtonLabel(workspace *zka.Workspace, nodeID string) string {
-	if workspace.RemoteHost == "" && workspace.CredentialClaim != nil {
-		if !workspaceAttachedToNode(workspace, nodeID) {
-			return "Attach + release credentials"
-		}
-		return "Release credentials"
-	}
 	if workspaceCredentialsClaimedByNode(workspace, nodeID) {
 		return "Release credentials"
 	}
@@ -804,23 +812,25 @@ func (ui *ui) workspaceCredentialControlVisible(workspace *zka.Workspace) bool {
 	if workspace == nil {
 		return false
 	}
-	if workspace.RemoteHost == "" {
-		return workspace.CredentialClaim != nil
-	}
 	if workspaceCredentialsClaimedByNode(workspace, ui.localNodeID) {
 		return true
 	}
-	return ui.credentialsEnabled && ui.defaultBundle != "" && workspaceKnownToNode(workspace, ui.localNodeID)
+	return ui.credentialsEnabled && ui.workspaceCredentialBundle(workspace) != "" &&
+		(workspace.RemoteHost == "" || workspaceKnownToNode(workspace, ui.localNodeID))
 }
 
-func workspaceCredentialSummary(workspace *zka.Workspace, remoteHost, localNodeID string) string {
+func (ui *ui) workspaceCredentialBundle(workspace *zka.Workspace) string {
+	if claim := workspace.CredentialClaim; claim != nil && ui.credentialBundles[claim.Bundle] {
+		return claim.Bundle
+	}
+	return ui.defaultBundle
+}
+
+func workspaceCredentialSummary(workspace *zka.Workspace, localNodeID string) string {
 	if workspace == nil {
 		return ""
 	}
 	if workspace.CredentialClaim == nil {
-		if remoteHost == "" {
-			return ""
-		}
 		return "Credentials: unclaimed"
 	}
 	claim := workspace.CredentialClaim
@@ -850,7 +860,11 @@ func workspaceCredentialSummary(workspace *zka.Workspace, remoteHost, localNodeI
 	if len(capabilities) != 0 {
 		detail += " (" + strings.Join(capabilities, ", ") + ")"
 	}
-	return "Credentials: " + detail + " · " + owner
+	ownership := "claimed remotely by " + owner
+	if workspaceCredentialsClaimedByNode(workspace, localNodeID) {
+		ownership = "claimed on this machine"
+	}
+	return "Credentials: " + ownership + " · " + detail
 }
 
 func (ui *ui) back() {
@@ -1037,13 +1051,19 @@ func (ui *ui) layoutHome(gtx layout.Context) layout.Dimensions {
 				return ui.actionRow(gtx, "home:remote-workspace", &ui.remoteButton, "Remote workspace", "Connect through an SSH host alias", ui.selected == 1)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.operationMessage(gtx) }),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				if len(ui.local) == 0 || ui.localError == "" {
+					return layout.Dimensions{}
+				}
+				return ui.message(gtx, "home:refresh-error", ui.localError, true)
+			}),
 			layout.Flexed(1, ui.layoutLocalList),
 		)
 	})
 }
 
 func (ui *ui) layoutLocalList(gtx layout.Context) layout.Dimensions {
-	if ui.localLoading {
+	if ui.localLoading && len(ui.local) == 0 {
 		return ui.centeredMessage(gtx, "Loading local workspaces…")
 	}
 	if len(ui.local) == 0 {
@@ -1363,15 +1383,8 @@ func (ui *ui) workspaceRow(gtx layout.Context, button, detachButton, credentialB
 		return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 				key := "workspace:" + workspace.RemoteHost + ":" + workspace.ID
-				remoteHost := workspace.RemoteHost
-				if remoteHost == "" && ui.screen == screenRemoteList {
-					remoteHost = ui.remoteHost
-				}
-				summary := workspaceSummary(workspace)
-				if credentials := workspaceCredentialSummary(workspace, remoteHost, ui.localNodeID); credentials != "" {
-					summary += "  ·  " + credentials
-				}
-				return ui.actionCard(gtx, key, button, workspace.Name, summary, action, selected)
+				credentials := workspaceCredentialSummary(workspace, ui.localNodeID)
+				return ui.actionCard(gtx, key, button, workspace.Name, workspaceSummary(workspace), action, selected, credentials)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				if detachButton == nil && credentialButton == nil && forgetButton == nil {
@@ -1419,7 +1432,7 @@ func (ui *ui) actionRow(gtx layout.Context, key string, button *widget.Clickable
 	})
 }
 
-func (ui *ui) actionCard(gtx layout.Context, key string, button *widget.Clickable, title, subtitle, action string, selected bool) layout.Dimensions {
+func (ui *ui) actionCard(gtx layout.Context, key string, button *widget.Clickable, title, subtitle, action string, selected bool, details ...string) layout.Dimensions {
 	background := ui.colors.surface
 	if selected {
 		background = ui.colors.selected
@@ -1445,6 +1458,16 @@ func (ui *ui) actionCard(gtx layout.Context, key string, button *widget.Clickabl
 								label := material.Caption(ui.theme, subtitle)
 								label.Color = ui.colors.muted
 								return ui.selectableLabel(gtx, key+":subtitle", label)
+							})
+						}),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							if len(details) == 0 || details[0] == "" {
+								return layout.Dimensions{}
+							}
+							return layout.Inset{Top: 6}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								label := material.Caption(ui.theme, details[0])
+								label.Color = ui.colors.accent
+								return ui.selectableLabel(gtx, key+":credentials", label)
 							})
 						}),
 					)

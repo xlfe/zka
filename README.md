@@ -214,6 +214,16 @@ an attached workspace switches to its existing Sway window; selecting a detached
 one reconstructs its Kitty view. Each row shows workspace-level agent state,
 hook-reported agent types, and pane/tab/window counts.
 
+Each workspace also shows whether credentials are unclaimed, claimed on this
+machine, or claimed remotely and by which machine. The list refreshes while
+the popup is open. **Claim credentials here** transfers the bundle back to the
+local provider; for a detached workspace, **Attach + claim credentials** opens
+its view and claims the bundle. On the origin this activates local credentials
+directly, preserving the remote claim if preparation fails. The existing bundle
+is reused when configured locally, otherwise the local default is selected.
+The **A** shortcut invokes the same action; an existing local claim offers
+**Release credentials**.
+
 ## How it works
 
 ```text

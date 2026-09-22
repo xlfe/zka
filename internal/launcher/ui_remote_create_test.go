@@ -182,11 +182,11 @@ func TestRemoteWorkspaceCredentialOwnershipAndActions(t *testing.T) {
 			"other": {ID: "other", Node: zka.Host{ID: "other-node", Name: "desktop"}},
 		},
 	}
-	if got, want := workspaceCredentialSummary(workspace, workspace.RemoteHost, "local-node"), "Credentials: unclaimed"; got != want {
+	if got, want := workspaceCredentialSummary(workspace, "local-node"), "Credentials: unclaimed"; got != want {
 		t.Fatalf("origin summary = %q, want %q", got, want)
 	}
 	workspace.CredentialClaim = &zka.CredentialClaim{Bundle: "work", OwnerNodeID: "local-node", Capabilities: map[string]zka.CredentialCapabilityStatus{"ssh-agent": {State: "ready", Available: true}}}
-	if got, want := workspaceCredentialSummary(workspace, workspace.RemoteHost, "local-node"), "Credentials: work (ssh-agent ready) · this machine"; got != want {
+	if got, want := workspaceCredentialSummary(workspace, "local-node"), "Credentials: claimed on this machine · work (ssh-agent ready)"; got != want {
 		t.Fatalf("local summary = %q, want %q", got, want)
 	}
 	if args, status := workspaceCredentialAction(workspace, "local-node"); !reflect.DeepEqual(args,
@@ -194,7 +194,7 @@ func TestRemoteWorkspaceCredentialOwnershipAndActions(t *testing.T) {
 		t.Fatalf("release action = %#v, %q", args, status)
 	}
 	workspace.CredentialClaim.OwnerNodeID = "other-node"
-	if got, want := workspaceCredentialSummary(workspace, workspace.RemoteHost, "local-node"), "Credentials: work (ssh-agent ready) · desktop"; got != want {
+	if got, want := workspaceCredentialSummary(workspace, "local-node"), "Credentials: claimed remotely by desktop · work (ssh-agent ready)"; got != want {
 		t.Fatalf("other summary = %q, want %q", got, want)
 	}
 	if args, status := workspaceCredentialAction(workspace, "local-node"); !reflect.DeepEqual(args,
@@ -247,7 +247,7 @@ func TestDetachedRemoteWorkspaceCanAttachAndClaimCredentialsInOneAction(t *testi
 	}
 }
 
-func TestOriginWorkspaceCanAttachAndReleaseCredentialsInOneAction(t *testing.T) {
+func TestOriginWorkspaceCanAttachAndReclaimCredentialsInOneAction(t *testing.T) {
 	const originNode = "origin-node"
 	workspace := &zka.Workspace{
 		ID: "0123456789abcdef", Name: "api",
@@ -271,21 +271,20 @@ func TestOriginWorkspaceCanAttachAndReleaseCredentialsInOneAction(t *testing.T) 
 	ui.credentialsEnabled = true
 	ui.defaultBundle = "work"
 
-	if got, want := workspaceCredentialSummary(workspace, "", originNode), "Credentials: work (openpgp ready) · machine-a"; got != want {
+	if got, want := workspaceCredentialSummary(workspace, originNode), "Credentials: claimed remotely by machine-a · work (openpgp ready)"; got != want {
 		t.Fatalf("origin summary = %q, want %q", got, want)
 	}
 	if !ui.workspaceCredentialControlVisible(workspace) {
 		t.Fatal("origin workspace did not offer a credential action for a remote claim")
 	}
-	if got, want := workspaceCredentialButtonLabel(workspace, originNode), "Attach + release credentials"; got != want {
+	if got, want := workspaceCredentialButtonLabel(workspace, originNode), "Attach + claim credentials"; got != want {
 		t.Fatalf("origin credential button label = %q, want %q", got, want)
 	}
 
 	ui.toggleCredentialSelection()
 
 	for index, want := range [][]string{
-		{"workspace", "credentials", "release", "0123456789abcdef"},
-		{"workspace", "attach", "0123456789abcdef"},
+		{"workspace", "attach", "0123456789abcdef", "--claim-credentials", "--credential-bundle", "work"},
 	} {
 		select {
 		case got := <-backend.executed:
