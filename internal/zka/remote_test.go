@@ -691,7 +691,7 @@ func TestInitialSSHExit255ReturnsDiagnostic(t *testing.T) {
 	if !strings.Contains(logs.String(), "Permission denied (publickey)") {
 		t.Fatalf("daemon log = %q", logs.String())
 	}
-	if status := d.remotes.credentialTransportStatusForHost("devbox.example"); status.State != "terminal" || !strings.Contains(status.LastError, "Permission denied") {
+	if status := d.remotes.credentialTransportStatusForHost("devbox.example"); status.State != "authentication_required" || !strings.Contains(status.LastError, "Permission denied") {
 		t.Fatalf("terminal transport status = %#v", status)
 	}
 	if retryErr := api.RemoteCall(ctx, "devbox.example", "list", nil, new([]*Workspace)); retryErr == nil {
@@ -802,6 +802,8 @@ func TestCredentialProviderIdentityBindsNodeToSSHSource(t *testing.T) {
 
 func TestZKASSHHelperProcess(t *testing.T) {
 	switch os.Getenv("GO_WANT_ZKA_SSH_HELPER") {
+	case "authentication":
+		runAuthenticationSSHHelper()
 	case "exit255":
 		_, _ = io.WriteString(os.Stderr, "sign_and_send_pubkey: signing failed: agent refused operation\nPermission denied (publickey).\n")
 		os.Exit(255)

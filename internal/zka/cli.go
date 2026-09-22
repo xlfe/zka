@@ -439,7 +439,7 @@ func runWorkspaceCredentials(args []string, paths Paths, stdout, stderr io.Write
 			return 1, err
 		}
 		var refreshed Workspace
-		_ = api.RemoteCall(ctx, host, "get", refRequest{Ref: workspace.ID}, &refreshed)
+		_ = api.RemoteCallBackground(ctx, host, "get", refRequest{Ref: workspace.ID}, &refreshed)
 		warnClampedCredentialWindow(stderr, status, windowSeconds)
 		writeWorkspaceCredentialStatus(stdout, status)
 		return 0, nil
@@ -1403,7 +1403,7 @@ func (o liveWorkspaceAttachOperations) rollback(ctx context.Context, host, works
 		steps = append(steps, workspaceAttachRollbackStep{
 			name: "detach origin attachment state",
 			run: func(ctx context.Context) error {
-				return o.api.RemoteCall(ctx, host, "detach_attachment", attachmentRefRequest{
+				return o.api.RemoteCallBackground(ctx, host, "detach_attachment", attachmentRefRequest{
 					Workspace: workspaceID, Attachment: attachment.ID,
 				}, nil)
 			},
@@ -1514,7 +1514,7 @@ func rollbackLaunchedAttachment(operations workspaceAttachOperations, host, work
 func rollbackRemoteAttachment(api API, host, workspaceID, attachmentID string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), workspaceAttachRollbackTimeout)
 	defer cancel()
-	if err := api.RemoteCall(ctx, host, "detach_attachment", attachmentRefRequest{
+	if err := api.RemoteCallBackground(ctx, host, "detach_attachment", attachmentRefRequest{
 		Workspace: workspaceID, Attachment: attachmentID,
 	}, nil); err != nil {
 		return fmt.Errorf("detach origin attachment state: %w", err)
@@ -1909,7 +1909,7 @@ func focusAttachment(ctx context.Context, paths Paths, workspace *Workspace, att
 	}
 	api := NewAPI(paths)
 	if workspace.RemoteHost != "" {
-		_ = api.RemoteCall(ctx, workspace.RemoteHost, "seen", workspacePaneRequest{Workspace: workspace.ID, Pane: paneID}, nil)
+		_ = api.RemoteCallBackground(ctx, workspace.RemoteHost, "seen", workspacePaneRequest{Workspace: workspace.ID, Pane: paneID}, nil)
 	} else {
 		_, _ = api.Seen(ctx, workspace.ID, paneID)
 	}
@@ -2857,7 +2857,7 @@ func waitForRemotePaneReady(ctx context.Context, api API, host, workspaceID, att
 		case <-ticker.C:
 			callCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 			var readiness paneReadinessResponse
-			err := api.RemoteCall(callCtx, host, "pane_readiness", paneReadinessRequest{
+			err := api.RemoteCallBackground(callCtx, host, "pane_readiness", paneReadinessRequest{
 				Workspace: workspaceID, Attachment: attachmentID, Pane: paneID,
 			}, &readiness)
 			cancel()

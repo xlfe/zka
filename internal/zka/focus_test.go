@@ -21,6 +21,16 @@ const (
 )
 
 func TestMain(m *testing.M) {
+	// SSH options precede the test selection flags. Dispatch helpers before
+	// testing parses argv so they see the real SSH argument ordering.
+	if len(os.Args) > 1 && os.Args[len(os.Args)-1] == "remote-control" {
+		if os.Getenv("GO_WANT_ZKA_SSH_HELPER") != "" {
+			TestZKASSHHelperProcess(nil)
+		}
+		if os.Getenv(remoteAttachRegressionHelperEnv) != "" {
+			TestRemoteAttachRegressionSSHHelperProcess(nil)
+		}
+	}
 	if os.Getenv(swaymsgHelperEnv) == "1" {
 		want := []string{
 			"--socket",

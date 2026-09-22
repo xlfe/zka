@@ -33,10 +33,11 @@ type remoteEnvelope struct {
 }
 
 type remoteDaemonRequest struct {
-	Host              string          `json:"host"`
-	Op                string          `json:"op"`
-	Payload           json.RawMessage `json:"payload,omitempty"`
-	CallerSSHAuthSock string          `json:"caller_ssh_auth_sock,omitempty"`
+	Host                string          `json:"host"`
+	Op                  string          `json:"op"`
+	Payload             json.RawMessage `json:"payload,omitempty"`
+	CallerSSHAuthSock   string          `json:"caller_ssh_auth_sock,omitempty"`
+	AllowAuthentication bool            `json:"allow_authentication,omitempty"`
 }
 
 type paneReadinessRequest struct {
@@ -67,8 +68,9 @@ func (m *RemoteManager) credentialTransportStatus() credentialTransportView {
 		return status
 	}
 	for _, failure := range m.terminalFailures {
-		status = failure
-		break
+		if credentialTransportSeverity(failure.State) > credentialTransportSeverity(status.State) {
+			status = failure
+		}
 	}
 	for _, client := range m.clients {
 		client.mu.Lock()
@@ -82,7 +84,7 @@ func (m *RemoteManager) credentialTransportStatus() credentialTransportView {
 			}
 		}
 		if client.terminal != nil {
-			candidate.State = "terminal"
+			candidate.State = remoteFailureState(client.terminal)
 			candidate.LastError = client.terminal.Error()
 		} else if client.lastFailure != nil {
 			candidate.LastError = client.lastFailure.Error()
@@ -118,7 +120,7 @@ func (m *RemoteManager) credentialTransportStatusForHost(host string) credential
 		}
 	}
 	if client.terminal != nil {
-		status.State = "terminal"
+		status.State = remoteFailureState(client.terminal)
 		status.LastError = client.terminal.Error()
 	} else if client.lastFailure != nil {
 		status.LastError = client.lastFailure.Error()
@@ -127,7 +129,7 @@ func (m *RemoteManager) credentialTransportStatusForHost(host string) credential
 }
 
 func credentialTransportSeverity(state string) int {
-	return map[string]int{"idle": 0, "ready": 1, "retrying": 2, "degraded": 3, "terminal": 4}[state]
+	return map[string]int{"idle": 0, "ready": 1, "retrying": 2, "degraded": 3, "authentication_required": 4, "terminal": 5}[state]
 }
 
 func NewRemoteManager(daemon *Daemon) *RemoteManager {
@@ -143,7 +145,7 @@ func (m *RemoteManager) Close() {
 	m.mu.Unlock()
 }
 
-func (m *RemoteManager) client(host string) (*remoteClient, error) {
+func (m *RemoteManager) client(host string, allowAuthentication bool) (*remoteClient, error) {
 	if err := validateSSHHost(host); err != nil {
 		return nil, err
 	}
@@ -154,13 +156,24 @@ func (m *RemoteManager) client(host string) (*remoteClient, error) {
 	}
 	if client := m.clients[host]; client != nil {
 		client.mu.Lock()
-		client.activeCalls++
-		client.mu.Unlock()
+		if allowAuthentication && client.terminal != nil && client.activeCalls == 0 {
+			delete(m.clients, host)
+			client.mu.Unlock()
+			client.stop()
+		} else {
+			client.activeCalls++
+			client.mu.Unlock()
+			m.mu.Unlock()
+			return client, nil
+		}
+	}
+	if failure, ok := m.terminalFailures[host]; ok && !allowAuthentication {
 		m.mu.Unlock()
-		return client, nil
+		return nil, errors.New(failure.LastError)
 	}
 	delete(m.terminalFailures, host)
 	client := newRemoteClient(m, host)
+	client.allowAuthentication = allowAuthentication
 	client.activeCalls = 1
 	m.clients[host] = client
 	m.mu.Unlock()
@@ -169,15 +182,24 @@ func (m *RemoteManager) client(host string) (*remoteClient, error) {
 }
 
 func (m *RemoteManager) Call(ctx context.Context, host, op string, payload any) (result json.RawMessage, resultErr error) {
-	client, err := m.client(host)
-	if err != nil {
+	return m.call(ctx, host, op, payload, false)
+}
+
+// call grants at most one fresh SSH authentication attempt to an explicit
+// user request. Recovery and internal callers use Call, which only reuses SSH.
+func (m *RemoteManager) call(ctx context.Context, host, op string, payload any, allowAuthentication bool) (result json.RawMessage, resultErr error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer func() { m.releaseClient(host, client, resultErr) }()
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("encode remote request: %w", err)
 	}
+	client, err := m.client(host, allowAuthentication)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { m.releaseClient(host, client, resultErr) }()
 	for {
 		result, callErr := client.call(ctx, op, raw)
 		if !errors.Is(callErr, errRemoteDisconnected) {
@@ -202,9 +224,12 @@ func (m *RemoteManager) releaseClient(host string, client *remoteClient, callErr
 		(errors.Is(callErr, client.terminal) || callErr.Error() == client.terminal.Error())
 	abandonInitial := client.activeCalls == 0 && !client.everConnected &&
 		(errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded))
-	if m.clients[host] == client && (terminalFailure || abandonInitial) {
+	if m.clients[host] == client && client.activeCalls == 0 && (terminalFailure || abandonInitial) {
 		if terminalFailure {
-			m.terminalFailures[host] = credentialTransportView{State: "terminal", LastError: client.terminal.Error()}
+			m.terminalFailures[host] = credentialTransportView{State: remoteFailureState(client.terminal), LastError: client.terminal.Error()}
+		} else {
+			failure := remoteAuthenticationRequired(host, callErr)
+			m.terminalFailures[host] = credentialTransportView{State: "authentication_required", LastError: failure.Error()}
 		}
 		delete(m.clients, host)
 	}
@@ -294,6 +319,18 @@ func (m *RemoteManager) cacheEvent(host, op string, payload json.RawMessage) {
 }
 
 var errRemoteDisconnected = errors.New("remote SSH control connection disconnected")
+var errRemoteAuthenticationRequired = errors.New("remote SSH authentication required")
+
+func remoteAuthenticationRequired(host string, cause error) error {
+	return fmt.Errorf("%w for %s; reconnect explicitly with `zka workspace list --origin %s`: %v", errRemoteAuthenticationRequired, host, host, cause)
+}
+
+func remoteFailureState(err error) string {
+	if errors.Is(err, errRemoteAuthenticationRequired) {
+		return "authentication_required"
+	}
+	return "terminal"
+}
 
 const maxSSHStderr = 8 << 10
 
@@ -335,26 +372,27 @@ type remoteClient struct {
 	manager *RemoteManager
 	host    string
 
-	mu              sync.Mutex
-	writeMu         sync.Mutex
-	stdin           io.WriteCloser
-	encoder         *json.Encoder
-	session         *yamux.Session
-	process         *exec.Cmd
-	connected       bool
-	credentialReady bool
-	credentialError string
-	everConnected   bool
-	activeCalls     int
-	terminal        error
-	lastFailure     error
-	retryAttempts   int
-	nextRetryAt     time.Time
-	stateCh         chan struct{}
-	pending         map[string]chan remoteEnvelope
-	sequence        atomic.Uint64
-	stopCh          chan struct{}
-	stopOnce        sync.Once
+	mu                  sync.Mutex
+	writeMu             sync.Mutex
+	stdin               io.WriteCloser
+	encoder             *json.Encoder
+	session             *yamux.Session
+	process             *exec.Cmd
+	connected           bool
+	credentialReady     bool
+	credentialError     string
+	everConnected       bool
+	allowAuthentication bool
+	activeCalls         int
+	terminal            error
+	lastFailure         error
+	retryAttempts       int
+	nextRetryAt         time.Time
+	stateCh             chan struct{}
+	pending             map[string]chan remoteEnvelope
+	sequence            atomic.Uint64
+	stopCh              chan struct{}
+	stopOnce            sync.Once
 }
 
 func newRemoteClient(manager *RemoteManager, host string) *remoteClient {
@@ -379,6 +417,7 @@ func (c *remoteClient) signalStateLocked() {
 
 func (c *remoteClient) supervise(ctx context.Context) {
 	backoff := 250 * time.Millisecond
+	allowAuthentication := c.allowAuthentication
 	for {
 		select {
 		case <-ctx.Done():
@@ -387,7 +426,9 @@ func (c *remoteClient) supervise(ctx context.Context) {
 			return
 		default:
 		}
-		cmd, stdin, stdout, stderr, err := c.startSSH(ctx)
+		freshAuthentication := allowAuthentication
+		allowAuthentication = false
+		cmd, stdin, stdout, stderr, err := c.startSSH(ctx, freshAuthentication)
 		if err != nil {
 			failure := fmt.Errorf("start SSH control connection to %s: %w", c.host, err)
 			if remoteStartTerminal(err) {
@@ -406,25 +447,17 @@ func (c *remoteClient) supervise(ctx context.Context) {
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 			failure := fmt.Errorf("start remote multiplexed session to %s: %w", c.host, err)
-			c.disconnected(failure)
-			if !c.waitToRetry(ctx, backoff) {
-				return
-			}
-			backoff = nextRemoteBackoff(backoff)
-			continue
+			c.setTerminal(failure)
+			return
 		}
 		control, err := session.Open()
 		if err != nil {
 			_ = session.Close()
 			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			failure := fmt.Errorf("open remote control stream to %s: %w", c.host, err)
-			c.disconnected(failure)
-			if !c.waitToRetry(ctx, backoff) {
-				return
-			}
-			backoff = nextRemoteBackoff(backoff)
-			continue
+			waitErr := cmd.Wait()
+			failure := fmt.Errorf("open remote control stream to %s: %w; %v", c.host, err, sshConnectionError(c.host, waitErr, stderr.String()))
+			c.setTerminal(remoteAuthenticationRequired(c.host, failure))
+			return
 		}
 		c.mu.Lock()
 		c.process, c.stdin, c.session = cmd, control, session
@@ -466,6 +499,10 @@ func (c *remoteClient) supervise(ctx context.Context) {
 		default:
 		}
 		c.manager.daemon.logger.Printf("%v", failure)
+		if !wasConnected && (!freshAuthentication || remoteSSHAuthenticationFailure(stderr.String())) {
+			c.setTerminal(remoteAuthenticationRequired(c.host, failure))
+			return
+		}
 		if remoteSSHTerminal(waitErr, stderr.String()) {
 			c.setTerminal(failure)
 			return
@@ -525,16 +562,29 @@ func remoteSSHTerminal(waitErr error, stderr string) bool {
 	if sshExitCode(waitErr) == 127 || strings.Contains(detail, "zka: command not found") || strings.Contains(detail, "zka: not found") {
 		return true
 	}
-	return strings.Contains(detail, "permission denied") ||
-		strings.Contains(detail, "authentication failed") ||
-		strings.Contains(detail, "no supported authentication methods") ||
+	return remoteSSHAuthenticationFailure(stderr) ||
 		strings.Contains(detail, "host key verification failed") ||
 		strings.Contains(detail, "remote host identification has changed") ||
 		strings.Contains(detail, "no matching host key type")
 }
 
-func (c *remoteClient) startSSH(ctx context.Context) (*exec.Cmd, io.WriteCloser, io.ReadCloser, *boundedTailBuffer, error) {
-	args := append([]string(nil), c.manager.daemon.config.SSH.Options...)
+func remoteSSHAuthenticationFailure(stderr string) bool {
+	detail := strings.ToLower(stderr)
+	return strings.Contains(detail, "permission denied") ||
+		strings.Contains(detail, "authentication failed") ||
+		strings.Contains(detail, "no supported authentication methods") ||
+		strings.Contains(detail, "sign_and_send_pubkey: signing failed")
+}
+
+func (c *remoteClient) startSSH(ctx context.Context, allowAuthentication bool) (*exec.Cmd, io.WriteCloser, io.ReadCloser, *boundedTailBuffer, error) {
+	var args []string
+	if !allowAuthentication {
+		// OpenSSH tries ControlPath before ProxyCommand. Fail closed if the
+		// master is absent (or disappears), including for ProxyJump hosts.
+		// These must precede user options: SSH uses the first value supplied.
+		args = append(args, "-o", "ControlMaster=no", "-o", "ProxyCommand=false")
+	}
+	args = append(args, c.manager.daemon.config.SSH.Options...)
 	args = append(args, "-T", "--", c.host, "exec", "zka", "remote-control")
 	cmd := exec.CommandContext(ctx, c.manager.daemon.config.SSH.Command, args...)
 	stderr := &boundedTailBuffer{}
@@ -550,6 +600,14 @@ func (c *remoteClient) startSSH(ctx context.Context) (*exec.Cmd, io.WriteCloser,
 	if err := cmd.Start(); err != nil {
 		return nil, nil, nil, nil, err
 	}
+	c.mu.Lock()
+	c.process = cmd
+	select {
+	case <-c.stopCh:
+		_ = cmd.Process.Kill()
+	default:
+	}
+	c.mu.Unlock()
 	return cmd, stdin, stdout, stderr, nil
 }
 
@@ -681,6 +739,7 @@ func (c *remoteClient) setTerminal(err error) {
 		process = c.process.Process
 	}
 	c.terminal = err
+	c.nextRetryAt = time.Time{}
 	c.lastFailure = err
 	c.connected = false
 	for id, waiter := range c.pending {

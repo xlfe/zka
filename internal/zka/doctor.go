@@ -168,7 +168,7 @@ func runDoctor(args []string, paths Paths, stdout, stderr io.Writer) (int, error
 		remoteErr := api.RemoteCall(ctx, *origin, "list", nil, &workspaces)
 		detail := fmt.Sprintf("%s (%d workspaces)", *origin, len(workspaces))
 		checks = append(checks, doctorCheck{Name: "remote-control", OK: remoteErr == nil, Detail: doctorDetail(remoteErr, detail)})
-		credentialStatusErr = api.RemoteCall(ctx, *origin, "credentials_status", nil, &credentialStatus)
+		credentialStatusErr = api.RemoteCallBackground(ctx, *origin, "credentials_status", nil, &credentialStatus)
 		localStatus, localStatusErr := api.CredentialStatus(ctx, "")
 		if localStatusErr == nil {
 			credentialStatus.Transport = localStatus.Transport

@@ -396,11 +396,22 @@ one-MiB-limited JSON-lines control protocol, and independent streams carry
 credential connections. Terminal traffic remains on separate SSH channels that
 attach directly to zmx on the origin.
 
-OpenSSH server-alive checks detect dead connections. Transient startup,
-transport, and handshake failures retry with jittered exponential backoff capped
-at 30 seconds. Authentication or host-key rejection, a missing local `ssh` or
-remote `zka`, protocol incompatibility, and credential node-pin failures stop
-that supervisor with an explicit diagnostic. Pane channels reconnect
+OpenSSH server-alive checks detect dead connections. Background control recovery
+reuses an authenticated SSH master; it never falls back to fresh authentication.
+If reuse fails, the host enters `authentication_required` and background callers
+cannot clear it. Cancelled or timed-out initial connections also retain this
+state. An explicit connection request, such as
+`zka workspace list --origin devbox.example`, permits one fresh SSH attempt.
+This prevents an unattended daemon from repeatedly requesting a security-key
+touch or PIN. SSH multiplexing must be configured for background recovery;
+without a reusable master, reconnect explicitly.
+
+Established control sessions can retry through an available master with jittered
+backoff capped at 30 seconds. Host-key rejection, a missing local `ssh` or remote
+`zka`, protocol incompatibility, and credential node-pin failures stop the
+supervisor with an explicit diagnostic. See the
+[control authentication notes](docs/remote-control-authentication.md) for
+configuration limits and regression coverage. Pane channels reconnect
 independently and reattach to the same zmx sessions. Mutating handoff requests
 are replay-safe if SSH drops after the origin acts but before the response
 arrives.

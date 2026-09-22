@@ -907,7 +907,7 @@ func (d *Daemon) dispatch(ctx context.Context, op string, raw json.RawMessage) (
 				return nil, err
 			}
 		}
-		result, err := d.remotes.Call(ctx, req.Host, req.Op, json.RawMessage(req.Payload))
+		result, err := d.remotes.call(ctx, req.Host, req.Op, json.RawMessage(req.Payload), req.AllowAuthentication)
 		if err == nil {
 			d.reconcileCredentialProviderSources(req, result)
 		}

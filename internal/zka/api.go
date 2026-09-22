@@ -270,7 +270,17 @@ func (a API) Seen(ctx context.Context, workspace, pane string) (*Workspace, erro
 	return &out, err
 }
 
+// RemoteCall is an explicit user request and may initiate SSH authentication.
+// Polling and recovery must use RemoteCallBackground instead.
 func (a API) RemoteCall(ctx context.Context, host, op string, payload, out any) error {
+	return a.remoteCall(ctx, host, op, payload, out, true)
+}
+
+func (a API) RemoteCallBackground(ctx context.Context, host, op string, payload, out any) error {
+	return a.remoteCall(ctx, host, op, payload, out, false)
+}
+
+func (a API) remoteCall(ctx context.Context, host, op string, payload, out any, allowAuthentication bool) error {
 	var raw json.RawMessage
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
@@ -280,7 +290,7 @@ func (a API) RemoteCall(ctx context.Context, host, op string, payload, out any) 
 		raw = encoded
 	}
 	var response json.RawMessage
-	if err := a.client.Call(ctx, "remote_call", remoteDaemonRequest{Host: host, Op: op, Payload: raw, CallerSSHAuthSock: os.Getenv("SSH_AUTH_SOCK")}, &response); err != nil {
+	if err := a.client.Call(ctx, "remote_call", remoteDaemonRequest{Host: host, Op: op, Payload: raw, CallerSSHAuthSock: os.Getenv("SSH_AUTH_SOCK"), AllowAuthentication: allowAuthentication}, &response); err != nil {
 		return err
 	}
 	if out != nil && len(response) > 0 {
